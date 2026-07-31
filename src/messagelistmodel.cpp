@@ -223,6 +223,17 @@ qint64 MessageListModel::uidAt(int row) const
     return (row >= 0 && row < m_headers.size()) ? m_headers.at(row).uid : -1;
 }
 
+int MessageListModel::rowForUid(qint64 uid) const
+{
+    if (uid < 0)
+        return -1;
+    for (int i = 0; i < m_headers.size(); ++i) {
+        if (m_headers.at(i).uid == uid)
+            return i;
+    }
+    return -1;
+}
+
 bool MessageListModel::seenAt(int row) const
 {
     return row >= 0 && row < m_headers.size() && m_headers.at(row).seen;

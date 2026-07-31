@@ -30,6 +30,18 @@ int main(int argc, char *argv[])
     // desktop entry's basename, not the application name. X11 uses the window
     // icon instead, so set both.
     QGuiApplication::setDesktopFileName(QStringLiteral("org.mailo.Mailo"));
+
+    // The UI asks for named icons (mail-attachment, arrow-down, …), which only
+    // resolve once an icon theme is set. A KDE session sets one; anything else
+    // — a bare Wayland/X11 session, or the AppImage, which bundles Breeze but
+    // has no session to announce it — leaves it unset and every icon renders
+    // as an empty square. Only overridden when nothing usable is configured,
+    // so a user's own theme still wins.
+    QIcon::setFallbackThemeName(QStringLiteral("breeze"));
+    if (QIcon::themeName().isEmpty()
+        || !QIcon::hasThemeIcon(QStringLiteral("mail-message-new"))) {
+        QIcon::setThemeName(QStringLiteral("breeze"));
+    }
     QGuiApplication::setWindowIcon(QIcon::fromTheme(QStringLiteral("org.mailo.Mailo")));
 
     if (qEnvironmentVariableIsEmpty("QT_QUICK_CONTROLS_STYLE"))

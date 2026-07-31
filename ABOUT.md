@@ -1,4 +1,4 @@
-Mailo - KDE-only email client
+KDE-only email client
 
 (c) 2026 Daniel Duris, dusoft@staznosti.sk
 

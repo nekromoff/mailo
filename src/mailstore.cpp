@@ -1180,6 +1180,74 @@ void MailStore::clearFolder(const QString &folder)
     m_db.commit();
 }
 
+void MailStore::renameFolderOn(QSqlDatabase &db, const QString &account,
+                               const QString &oldFolder, const QString &newFolder,
+                               QChar separator)
+{
+    if (!db.isOpen() || oldFolder.isEmpty() || newFolder.isEmpty()
+        || oldFolder == newFolder || separator.isNull())
+        return;
+
+    const auto key = [&account](const QString &folder) {
+        return account.isEmpty() ? folder : account + QChar(0x1f) + folder;
+    };
+    const QString oldKey = key(oldFolder);
+    const QString newKey = key(newFolder);
+
+    // The subtree is every key starting with "<oldKey><separator>". Written as
+    // a half-open range rather than a LIKE so SQLite can seek the (folder, uid)
+    // primary key instead of scanning tables that hold gigabytes of bodies.
+    const auto range = [separator](const QString &prefix) {
+        const QString lo = prefix + separator;
+        QString hi = lo;
+        hi[hi.size() - 1] = QChar(ushort(separator.unicode() + 1));
+        return std::pair<QString, QString>{lo, hi};
+    };
+    const auto [lo, hi] = range(oldKey);
+    const auto [boxLo, boxHi] = range(oldFolder);
+
+    db.transaction();
+    QSqlQuery q(db);
+    // fts rows are keyed by messages.rowid, which an UPDATE of a non-rowid
+    // column preserves — and its own folder column is UNINDEXED and never
+    // filtered on (search() joins on rowid), so the index needs no touching.
+    for (const char *table : {"messages", "bodies", "body_skipped", "message_parts"}) {
+        const QString name = QLatin1String(table);
+        // OR REPLACE: a folder of the same name may have been cached at the
+        // destination before; the moved rows are the current truth.
+        q.prepare(QStringLiteral("UPDATE OR REPLACE %1 SET folder = ? WHERE folder = ?").arg(name));
+        q.addBindValue(newKey);
+        q.addBindValue(oldKey);
+        q.exec();
+
+        q.prepare(QStringLiteral("UPDATE OR REPLACE %1 SET folder = ? || substr(folder, ?)"
+                                 " WHERE folder >= ? AND folder < ?").arg(name));
+        q.addBindValue(newKey);
+        q.addBindValue(oldKey.size() + 1);
+        q.addBindValue(lo);
+        q.addBindValue(hi);
+        q.exec();
+    }
+
+    // The per-account folder list stores bare mailbox paths, not scoped keys.
+    q.prepare(QStringLiteral("UPDATE OR REPLACE account_folders SET mailbox = ?"
+                             " WHERE account = ? AND mailbox = ?"));
+    q.addBindValue(newFolder);
+    q.addBindValue(account);
+    q.addBindValue(oldFolder);
+    q.exec();
+    q.prepare(QStringLiteral("UPDATE OR REPLACE account_folders"
+                             " SET mailbox = ? || substr(mailbox, ?)"
+                             " WHERE account = ? AND mailbox >= ? AND mailbox < ?"));
+    q.addBindValue(newFolder);
+    q.addBindValue(oldFolder.size() + 1);
+    q.addBindValue(account);
+    q.addBindValue(boxLo);
+    q.addBindValue(boxHi);
+    q.exec();
+    db.commit();
+}
+
 int MailStore::purgeChunkOn(QSqlDatabase &db, const QString &key, int limit)
 {
     if (!db.isOpen() || key.isEmpty() || limit <= 0)

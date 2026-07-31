@@ -73,6 +73,16 @@ public:
     /// Wipes every cached header/body/FTS row of a folder (UIDVALIDITY change).
     void clearFolder(const QString &folder);
 
+    /// Re-keys the cached rows of \a oldFolder — and of its whole subtree —
+    /// onto \a newFolder after a server-side RENAME, so a reparented folder
+    /// keeps its offline mail instead of having to sync again. \a separator is
+    /// the server's hierarchy delimiter; \a account scopes the folder keys.
+    /// Rewrites body blobs, so it blocks: MailClient drives it on a worker
+    /// connection, never on the GUI thread.
+    static void renameFolderOn(QSqlDatabase &db, const QString &account,
+                               const QString &oldFolder, const QString &newFolder,
+                               QChar separator);
+
     /// The account-scoped storage key for a folder ("account\x1ffolder"), for
     /// the off-thread helpers below which have no access to the account state.
     QString scopedKey(const QString &folder) const { return scoped(folder); }

@@ -48,9 +48,36 @@ Window {
                       subjectField.text, bodyEdit.text, attachments)
     }
 
+    /// Set while closing deliberately (sent, draft saved, discard confirmed),
+    /// so onClosing lets it through instead of asking again.
+    property bool closingConfirmed: false
+
+    function hasContent() {
+        return toField.text.trim() !== "" || ccField.text.trim() !== ""
+            || bccField.text.trim() !== "" || subjectField.text.trim() !== ""
+            || bodyEdit.text.trim() !== "" || attachments.length > 0
+    }
+
+    // Escape closes the window, which routes through onClosing below — so it
+    // asks for confirmation exactly like the title bar's X rather than being a
+    // second, silent way to lose a message.
+    Shortcut {
+        sequence: "Esc"
+        onActivated: sheet.close()
+    }
+
+    // The window's close button used to discard silently. It is now the only
+    // way to throw a message away, so it has to ask first.
+    onClosing: close => {
+        if (closingConfirmed || sending || !hasContent())
+            return
+        close.accepted = false
+        discardDialog.open()
+    }
+
     function present() {
         sending = false                  // never reopen stuck in "Sending…"
-        discardButton.confirming = false // never open showing a stale "Really?"
+        closingConfirmed = false
         show()
         raise()
         requestActivate()
@@ -63,6 +90,7 @@ Window {
     }
 
     function openNew() {
+        sourceDraftUid = -1
         title = "Compose"
         toField.text = ""
         ccField.text = ""
@@ -75,10 +103,33 @@ Window {
         present()
     }
 
+    /// uid of the Drafts message this composer was opened from, so the stale
+    /// copy can be removed once its replacement is stored. -1 for a new message.
+    property real sourceDraftUid: -1
+
+    /// d = Mail.draftData(): {to, cc, bcc, subject, body, uid}. Nothing is
+    /// quoted or prefixed — the draft is resumed exactly as it was saved.
+    function openDraft(d) {
+        if (!d || d.subject === undefined)
+            return
+        title = "Draft"
+        toField.text = d.to
+        ccField.text = d.cc
+        bccField.text = d.bcc
+        subjectField.text = d.subject
+        bodyEdit.text = d.body
+        attachments = []
+        sourceDraftUid = d.uid
+        content.ccExpanded = d.cc.length > 0 || d.bcc.length > 0
+        focusBodyOnOpen = true
+        present()
+    }
+
     /// r = Mail.replyData(): {to, cc, subject, body} — empty when no message.
     function openReply(r) {
         if (!r || r.to === undefined)
             return
+        sourceDraftUid = -1
         title = "Reply"
         toField.text = r.to
         ccField.text = r.cc
@@ -96,6 +147,7 @@ Window {
     function openForward(r) {
         if (!r || r.to === undefined)
             return
+        sourceDraftUid = -1
         title = "Forward"
         toField.text = r.to
         ccField.text = r.cc
@@ -220,8 +272,22 @@ Window {
     Connections {
         target: Mail
         function onMailSent() {
-            if (sheet.visible)
+            if (sheet.visible) {
+                // The draft this was resumed from is superseded — without
+                // this, sending an edited draft leaves the old one behind.
+                Mail.discardDraft(sheet.sourceDraftUid)
+                sheet.closingConfirmed = true
                 sheet.close()
+            }
+        }
+        function onDraftSaved() {
+            if (sheet.visible) {
+                // The superseded copy is removed by saveDraft() itself, in
+                // sequence with the append — doing it from here raced the
+                // refresh and briefly showed both.
+                sheet.closingConfirmed = true
+                sheet.close()
+            }
         }
         // Sending failed: revert the Send button, keep this window open, and
         // show the full server error in a dismissible dialog centered on it.
@@ -231,6 +297,60 @@ Window {
             sheet.sending = false
             sendErrorDialog.errorText = error
             sendErrorDialog.open()
+        }
+    }
+
+    QQC2.Dialog {
+        id: discardDialog
+        parent: QQC2.Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        title: "Discard this message?"
+
+        footer: QQC2.DialogButtonBox {
+            QQC2.Button {
+                text: "Discard"
+                icon.name: "edit-delete"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.DestructiveRole
+                onClicked: {
+                    // Discarding a resumed draft removes it outright — not to
+                    // Trash. Keeping it would mean "Discard" left the message
+                    // sitting in Drafts, which is the opposite of what it says.
+                    // A no-op for a message that was never a draft.
+                    Mail.discardDraft(sheet.sourceDraftUid)
+                    sheet.closingConfirmed = true
+                    discardDialog.close()
+                    sheet.close()
+                }
+            }
+            QQC2.Button {
+                text: "Save as draft"
+                icon.name: "document-save"
+                enabled: Mail.hasDraftsFolder
+                // No closingConfirmed here: the window closes on draftSaved,
+                // once the server has actually taken it. Closing first would
+                // throw the message away if the APPEND failed.
+                onClicked: {
+                    discardDialog.close()
+                    Mail.saveDraft(toField.text, ccField.text, bccField.text,
+                                   subjectField.text, bodyEdit.text, sheet.attachments,
+                                   sheet.sourceDraftUid)
+                }
+            }
+            QQC2.Button {
+                text: "Keep editing"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.RejectRole
+            }
+        }
+
+        contentItem: QQC2.Label {
+            // Deleting an existing draft is not the same act as abandoning an
+            // unsaved message, so it does not get the same wording.
+            text: sheet.sourceDraftUid > 0
+                ? "This draft will be deleted from the Drafts folder.\n"
+                  + "It does not go to Trash and cannot be recovered."
+                : "This message has not been sent."
+            wrapMode: Text.Wrap
         }
     }
 
@@ -310,9 +430,11 @@ Window {
         // Cc/Bcc are collapsed by default behind a single clickable row.
         property bool ccExpanded: false
         // Left inset the toggle arrow occupies — Bcc aligns to it so its field
-        // starts exactly under the Cc field.
+        // starts exactly under the Cc field. Measured from the button rather
+        // than from the icon size: a ToolButton is its icon *plus* padding, so
+        // assuming the icon alone left Bcc short by that padding.
         readonly property real ccArrowInset:
-            Kirigami.Units.iconSizes.small + Kirigami.Units.smallSpacing
+            ccToggleButton.width + Kirigami.Units.smallSpacing
 
         // Row 1: collapsed → "[>] Cc + Bcc" toggle; expanded → "[⌄] <Cc field>".
         // The arrow stays put on the left in both states and toggles on click.
@@ -490,22 +612,20 @@ Window {
             spacing: Kirigami.Units.smallSpacing
 
             QQC2.Button {
-                id: discardButton
-                property bool confirming: false
-                text: confirming ? "Really?" : "Discard"
-                onClicked: {
-                    if (confirming)
-                        sheet.close()
-                    else
-                        confirming = true
-                }
-                // Reset to "Discard" if the confirmation is left hanging.
-                Timer {
-                    id: discardResetTimer
-                    interval: 3000
-                    running: discardButton.confirming
-                    onTriggered: discardButton.confirming = false
-                }
+                id: saveDraftButton
+                // Discarding now lives on the window's close button, which
+                // closed without asking anyway — this slot is worth more as
+                // the action that keeps the message.
+                text: "Save as draft"
+                icon.name: "document-save"
+                enabled: Mail.hasDraftsFolder && !sheet.sending
+                QQC2.ToolTip.text: Mail.hasDraftsFolder
+                    ? "Store this message in the Drafts folder"
+                    : "No Drafts folder on this account"
+                QQC2.ToolTip.visible: hovered
+                onClicked: Mail.saveDraft(toField.text, ccField.text, bccField.text,
+                                          subjectField.text, bodyEdit.text, sheet.attachments,
+                                          sheet.sourceDraftUid)
             }
             Item { Layout.fillWidth: true } // spacer takes the remaining left space
 

@@ -98,68 +98,72 @@ Kirigami.ApplicationWindow {
     readonly property color panelColor: uiSettings.bgColor !== ""
         ? uiSettings.bgColor : Kirigami.Theme.backgroundColor
 
-    // The definable shortcuts only act while the message list has focus —
-    // they never conflict with typing in search, compose or settings fields.
-    function matchesShortcut(event, seq) {
-        if (!seq)
-            return false
-        const parts = seq.split("+")
-        let mods = 0
-        for (let i = 0; i < parts.length - 1; i++) {
-            const m = parts[i].trim().toLowerCase()
-            if (m === "ctrl") mods |= Qt.ControlModifier
-            else if (m === "shift") mods |= Qt.ShiftModifier
-            else if (m === "alt") mods |= Qt.AltModifier
-            else if (m === "meta") mods |= Qt.MetaModifier
-        }
-        if ((event.modifiers & ~Qt.KeypadModifier) !== mods)
-            return false
-        const keyName = parts[parts.length - 1].trim().toLowerCase()
-        const named = {
-            "del": Qt.Key_Delete, "delete": Qt.Key_Delete,
-            "backspace": Qt.Key_Backspace, "space": Qt.Key_Space,
-            "ins": Qt.Key_Insert, "insert": Qt.Key_Insert,
-            "home": Qt.Key_Home, "end": Qt.Key_End
-        }
-        if (keyName in named)
-            return event.key === named[keyName]
-        if (/^f\d{1,2}$/.test(keyName))
-            return event.key === Qt.Key_F1 + parseInt(keyName.substring(1)) - 1
-        if (keyName.length === 1)
-            return event.key === keyName.toUpperCase().charCodeAt(0)
-        return false
+    // True while a text field has focus. Single-letter shortcuts must not fire
+    // mid-word in the search box or a rename field — the old list-only wiring
+    // got that for free, window-wide Shortcut objects have to ask.
+    // Detected by properties only text editors carry: WebEngineView, buttons
+    // and list views have none of them, so the reading pane still gets
+    // shortcuts.
+    readonly property bool textFieldFocused: {
+        const item = root.activeFocusItem
+        return !!item && item.hasOwnProperty("cursorPosition")
+                      && item.hasOwnProperty("selectionStart")
     }
+    // Also off while Settings is open: its shortcut-capture buttons read raw
+    // key presses, and a window-wide Shortcut would run the very action being
+    // rebound.
+    /// Set when a click in Drafts starts a fetch, so the message opens in the
+    /// composer once it arrives rather than in the reader.
+    property bool draftEditPending: false
 
-    function handleMailShortcut(event) {
-        if (matchesShortcut(event, uiSettings.shortcutDelete))
-            messageList.requestDelete()
-        else if (matchesShortcut(event, uiSettings.shortcutJunk))
-            messageList.requestJunk()
-        else if (matchesShortcut(event, uiSettings.shortcutCompose) && Mail.hasAccount)
-            composeSheet().openNew()
-        else if (matchesShortcut(event, uiSettings.shortcutReply) && viewer.hasMessage)
-            composeSheet().openReply(Mail.replyData(false))
-        else if (matchesShortcut(event, uiSettings.shortcutForward) && viewer.hasMessage)
-            composeSheet().openForward(Mail.forwardData())
-        else if (matchesShortcut(event, uiSettings.shortcutSelect))
-            messageList.toggleSelectAndAdvance()
-        else if (!handleScaleShortcut(event))
-            return
-        event.accepted = true
+    readonly property bool shortcutsLive:
+        !textFieldFocused && !(accountDialog && accountDialog.visible)
+
+    // Window-wide rather than per-view: these used to be handled only by the
+    // folder and message lists' Keys.onPressed, so pressing Compose while the
+    // reading pane (or anything else) had focus did nothing at all.
+    Shortcut {
+        sequence: uiSettings.shortcutCompose
+        enabled: sequence !== "" && root.shortcutsLive && Mail.hasAccount
+        onActivated: composeSheet().openNew()
     }
-
-    // Color-scale shortcuts: mark the selection with the slot's color, or
-    // clear the mark when the slot has no color defined.
-    function handleScaleShortcut(event) {
-        for (let i = 1; i <= 5; i++) {
-            const seq = uiSettings["scaleKey" + i]
-            if (seq !== "" && matchesShortcut(event, seq)) {
-                Mail.markMessageColor(messageList.selectedIndexes(),
-                                      scaleColorOf(i) !== "" ? i : 0)
-                return true
-            }
+    Shortcut {
+        sequence: uiSettings.shortcutReply
+        enabled: sequence !== "" && root.shortcutsLive && viewer.hasMessage
+        onActivated: composeSheet().openReply(Mail.replyData(false))
+    }
+    Shortcut {
+        sequence: uiSettings.shortcutForward
+        enabled: sequence !== "" && root.shortcutsLive && viewer.hasMessage
+        onActivated: composeSheet().openForward(Mail.forwardData())
+    }
+    Shortcut {
+        sequence: uiSettings.shortcutDelete
+        enabled: sequence !== "" && root.shortcutsLive
+        onActivated: messageList.requestDelete()
+    }
+    Shortcut {
+        sequence: uiSettings.shortcutJunk
+        enabled: sequence !== "" && root.shortcutsLive
+        onActivated: messageList.requestJunk()
+    }
+    Shortcut {
+        sequence: uiSettings.shortcutSelect
+        enabled: sequence !== "" && root.shortcutsLive
+        onActivated: messageList.toggleSelectAndAdvance()
+    }
+    // Instantiator, not Repeater: Shortcut is not an Item and has nothing to
+    // lay out.
+    Instantiator {
+        model: 5
+        delegate: Shortcut {
+            required property int index
+            readonly property int slot: index + 1
+            sequence: uiSettings["scaleKey" + slot]
+            enabled: sequence !== "" && root.shortcutsLive
+            onActivated: Mail.markMessageColor(messageList.selectedIndexes(),
+                                               root.scaleColorOf(slot) !== "" ? slot : 0)
         }
-        return false
     }
 
     Component.onCompleted: {
@@ -181,6 +185,11 @@ Kirigami.ApplicationWindow {
         // shown as passive popups — the status line already carries them, kept
         // short. No onErrorOccurred handler on purpose.
         function onMessageLoaded(subject, from, to, cc, date, bodyUrl, authInfo) {
+            if (root.draftEditPending) {
+                root.draftEditPending = false
+                composeSheet().openDraft(Mail.draftData())
+                return
+            }
             viewer.showMessage(subject, from, to, cc, date, bodyUrl, authInfo)
         }
         // Once the server refresh lands, (re)load the selected message —
@@ -257,6 +266,147 @@ Kirigami.ApplicationWindow {
         if (!composeWindow)
             composeWindow = composeComponent.createObject(root)
         return composeWindow
+    }
+
+    // What is currently being dragged, and the pill that follows the cursor.
+    // One shared instance — only one drag can be in flight at a time. It lives
+    // in the overlay so it draws above both panes and can be positioned in
+    // scene coordinates from any delegate, wherever the drag started.
+    Item {
+        id: dragPayload
+        parent: QQC2.Overlay.overlay
+        z: 9999
+        visible: false
+        width: dragPill.width
+        height: dragPill.height
+
+        property string kind: ""    // "messages" | "folder" | ""
+        property var rows: []       // message rows, for kind "messages"
+        property string mailBox: "" // dragged folder, for kind "folder"
+        property string label: ""
+
+        Drag.active: false
+        Drag.source: dragPayload
+        // The pill sits just off the cursor (see moveTo), so the drop point
+        // is its top-left corner — i.e. the cursor itself.
+        Drag.hotSpot: Qt.point(0, 0)
+
+        /// Records what a press would drag, without starting a drag yet.
+        function prepare(dragKind, dragRows, box, text) {
+            kind = dragKind
+            rows = dragRows
+            mailBox = box
+            label = text
+        }
+        /// Places the pill at \a scenePos (overlay coordinates).
+        function moveTo(scenePos) {
+            x = scenePos.x + Kirigami.Units.smallSpacing
+            y = scenePos.y + Kirigami.Units.smallSpacing
+        }
+        function begin() {
+            visible = true
+            Drag.active = true
+        }
+        function finish() {
+            if (Drag.active)
+                Drag.drop()
+            Drag.active = false
+            visible = false
+            kind = ""
+            rows = []
+            mailBox = ""
+        }
+
+        Rectangle {
+            id: dragPill
+            width: pillLabel.implicitWidth + Kirigami.Units.largeSpacing * 2
+            height: pillLabel.implicitHeight + Kirigami.Units.smallSpacing * 2
+            radius: Kirigami.Units.smallSpacing
+            color: Kirigami.Theme.highlightColor
+            border.width: 1
+            border.color: Kirigami.Theme.textColor
+            opacity: 0.9
+
+            QQC2.Label {
+                id: pillLabel
+                anchors.centerIn: parent
+                text: dragPayload.label
+                color: Kirigami.Theme.highlightedTextColor
+            }
+        }
+    }
+
+    // Right-click menu of a folder in the sidebar.
+    QQC2.Menu {
+        id: folderMenu
+        property string mailBox: ""
+        property string name: ""
+
+        QQC2.MenuItem {
+            text: "Move to top level"
+            icon.name: "go-up"
+            enabled: Mail.canMoveFolder(folderMenu.mailBox, "")
+            onTriggered: Mail.moveFolder(folderMenu.mailBox, "")
+        }
+        QQC2.MenuItem {
+            text: Mail.folderDeleteIsPermanent(folderMenu.mailBox)
+                  ? "Delete folder…" : "Move folder to trash…"
+            icon.name: "edit-delete"
+            enabled: !Mail.folderProtected(folderMenu.mailBox)
+            onTriggered: {
+                confirmFolderDelete.mailBox = folderMenu.mailBox
+                confirmFolderDelete.name = folderMenu.name
+                confirmFolderDelete.permanent =
+                    Mail.folderDeleteIsPermanent(folderMenu.mailBox)
+                confirmFolderDelete.open()
+            }
+        }
+    }
+
+    QQC2.Dialog {
+        id: confirmFolderDelete
+        property string mailBox: ""
+        property string name: ""
+        property bool permanent: false
+
+        parent: QQC2.Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        title: permanent ? "Delete folder permanently?" : "Move folder to trash?"
+
+        footer: QQC2.DialogButtonBox {
+            QQC2.Button {
+                text: confirmFolderDelete.permanent ? "Delete permanently" : "Move to trash"
+                icon.name: "edit-delete"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.AcceptRole
+            }
+            QQC2.Button {
+                text: "Cancel"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.RejectRole
+            }
+        }
+        onAccepted: Mail.deleteFolder(confirmFolderDelete.mailBox)
+
+        // Wrapped in an Item because Text sizes itself to its content: a
+        // paragraph of explanation would otherwise make the dialog as wide as
+        // the sentence. The Item is what carries the width cap.
+        contentItem: Item {
+            implicitWidth: Kirigami.Units.gridUnit * 22
+            implicitHeight: folderDeleteText.implicitHeight
+
+            QQC2.Label {
+                id: folderDeleteText
+                anchors.fill: parent
+                text: confirmFolderDelete.permanent
+                      ? "“" + confirmFolderDelete.name + "” and everything in it "
+                        + "(including any subfolders) are removed from the server "
+                        + "permanently — this cannot be undone."
+                      : "“" + confirmFolderDelete.name + "” and its subfolders "
+                        + "are moved into the trash, with all the messages they hold. "
+                        + "Deleting it again from there removes it for good."
+                wrapMode: Text.Wrap
+            }
+        }
     }
 
     QQC2.Dialog {
@@ -340,7 +490,16 @@ Kirigami.ApplicationWindow {
             QQC2.Label {
                 id: statusLabel
                 Layout.fillWidth: true
-                text: Mail.statusText
+                // With no account there is no activity to report, so the
+                // status line would otherwise sit empty on every run until
+                // one is set up. Bold because it is the only prompt on screen.
+                text: Mail.hasAccount
+                    ? Mail.statusText
+                    // Named after the button's own tooltip rather than
+                    // described by shape — the icon is theme-supplied and is
+                    // not a gear.
+                    : "Welcome to Mailo! Add an account to get started — Settings, top right."
+                font.bold: !Mail.hasAccount
                 elide: Text.ElideRight
                 opacity: 0.8
                 // The label elides, so the older crumbs may be off-screen —
@@ -376,7 +535,7 @@ Kirigami.ApplicationWindow {
             QQC2.ToolButton {
                 icon.name: "settings-configure"
                 onClicked: accountSheet().open()
-                QQC2.ToolTip.text: "Account settings"
+                QQC2.ToolTip.text: "Settings"
                 QQC2.ToolTip.visible: hovered
             }
         }
@@ -509,6 +668,37 @@ Kirigami.ApplicationWindow {
                                     }
                                     onClicked: folderPane.setCollapsed(accountSection.modelData,
                                                                        accountSection.open)
+
+                                    // Dropping a folder on its account name
+                                    // moves it out to the top level — the one
+                                    // reparenting target that is not a row in
+                                    // the tree.
+                                    DropArea {
+                                        id: accountDrop
+                                        anchors.fill: parent
+
+                                        readonly property bool acceptable:
+                                            accountSection.isCurrent
+                                            && dragPayload.kind === "folder"
+                                            && Mail.canMoveFolder(dragPayload.mailBox, "")
+
+                                        onEntered: drag => drag.accepted = acceptable
+                                        onDropped: drop => {
+                                            if (!acceptable) {
+                                                drop.accepted = false
+                                                return
+                                            }
+                                            Mail.moveFolder(dragPayload.mailBox, "")
+                                        }
+                                    }
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        visible: accountDrop.containsDrag && accountDrop.acceptable
+                                        color: Qt.alpha(Kirigami.Theme.highlightColor, 0.25)
+                                        border.width: 2
+                                        border.color: Kirigami.Theme.highlightColor
+                                        radius: Kirigami.Units.smallSpacing
+                                    }
                                 }
 
                                 // Live folder list of the connected account
@@ -534,7 +724,9 @@ Kirigami.ApplicationWindow {
                                                 || event.key === Qt.Key_Home
                                                 || event.key === Qt.Key_End)
                                             folderOpenDebounce.restart()
-                                        root.handleMailShortcut(event)
+                                        // Mail shortcuts are window-wide
+                                        // Shortcut objects now; handling them
+                                        // here too would fire them twice.
                                     }
 
                                     property bool live: accountSection.isCurrent
@@ -608,6 +800,7 @@ Kirigami.ApplicationWindow {
                                         if (mailBox && mailBox !== Mail.selectedFolder
                                                 && Mail.folderModel.selectableAt(currentIndex)) {
                                             messageList.currentIndex = -1
+                                            messageList.openedUid = -1
                                             messageList.clearSelection()
                                             Mail.openFolder(mailBox)
                                         }
@@ -690,7 +883,12 @@ Kirigami.ApplicationWindow {
                                         // settling, which made INBOX flash as
                                         // selected on every account switch.
                                         highlighted: folderDelegate.mailBox === Mail.selectedFolder
-                                        onClicked: {
+
+                                        // Opening the folder — reached from the
+                                        // click handler below rather than from
+                                        // ItemDelegate.onClicked, because the
+                                        // drag source takes the press.
+                                        function activate() {
                                             if (!selectable) { // container-only folder: toggle instead
                                                 Mail.folderModel.toggleExpanded(index)
                                                 return
@@ -718,8 +916,100 @@ Kirigami.ApplicationWindow {
                                             // currentIndex change just armed.
                                             folderOpenDebounce.stop()
                                             messageList.currentIndex = -1
+                                            messageList.openedUid = -1
                                             messageList.clearSelection()
                                             Mail.openFolder(mailBox)
+                                        }
+
+                                        // Drop target: messages land in this
+                                        // folder, another folder is reparented
+                                        // under it. What a drop would mean is
+                                        // asked of the backend, so a row only
+                                        // lights up when the drop would work.
+                                        DropArea {
+                                            id: folderDrop
+                                            anchors.fill: parent
+
+                                            readonly property bool acceptable:
+                                                dragPayload.kind === "messages"
+                                                ? (folderDelegate.selectable
+                                                   && folderDelegate.mailBox !== Mail.selectedFolder)
+                                                : dragPayload.kind === "folder"
+                                                  && Mail.canMoveFolder(dragPayload.mailBox,
+                                                                        folderDelegate.mailBox)
+
+                                            onEntered: drag => drag.accepted = acceptable
+                                            onDropped: drop => {
+                                                if (!acceptable) {
+                                                    drop.accepted = false
+                                                    return
+                                                }
+                                                if (dragPayload.kind === "messages") {
+                                                    Mail.moveMessagesTo(dragPayload.rows,
+                                                                        folderDelegate.mailBox)
+                                                    messageList.clearSelection()
+                                                } else {
+                                                    Mail.moveFolder(dragPayload.mailBox,
+                                                                    folderDelegate.mailBox)
+                                                }
+                                            }
+                                        }
+
+                                        // Outline marking the row a drop would
+                                        // land in. Deliberately an outline plus
+                                        // a light fill rather than a color
+                                        // change: it has to read on top of the
+                                        // selection highlight as well.
+                                        Rectangle {
+                                            anchors.fill: parent
+                                            visible: folderDrop.containsDrag && folderDrop.acceptable
+                                            color: Qt.alpha(Kirigami.Theme.highlightColor, 0.25)
+                                            border.width: 2
+                                            border.color: Kirigami.Theme.highlightColor
+                                            radius: Kirigami.Units.smallSpacing
+                                        }
+
+                                        // Clicks and the folder drag both come
+                                        // from here: ItemDelegate.onClicked
+                                        // never fires once this takes the press.
+                                        MouseArea {
+                                            id: folderMouse
+                                            anchors.fill: parent
+                                            acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                            // Dragging a folder moves a whole
+                                            // mailbox — an easy accident with
+                                            // the default few pixels.
+                                            drag.threshold: Kirigami.Units.gridUnit
+                                            // INBOX and the special-use folders
+                                            // cannot be moved at all, so they
+                                            // never start a drag.
+                                            drag.target: Mail.folderProtected(folderDelegate.mailBox)
+                                                         ? null : dragPayload
+
+                                            onPressed: mouse => {
+                                                if (mouse.button !== Qt.LeftButton)
+                                                    return
+                                                dragPayload.prepare("folder", [],
+                                                                    folderDelegate.mailBox,
+                                                                    folderDelegate.name)
+                                                dragPayload.moveTo(folderDelegate.mapToItem(
+                                                    QQC2.Overlay.overlay, mouse.x, mouse.y))
+                                            }
+                                            drag.onActiveChanged: {
+                                                if (folderMouse.drag.active)
+                                                    dragPayload.begin()
+                                                else
+                                                    dragPayload.finish()
+                                            }
+                                            onClicked: mouse => {
+                                                if (mouse.button === Qt.RightButton) {
+                                                    folderMenu.mailBox = folderDelegate.mailBox
+                                                    folderMenu.name = folderDelegate.name
+                                                    folderMenu.popup()
+                                                    return
+                                                }
+                                                folderDelegate.activate()
+                                            }
                                         }
 
                                         Kirigami.Icon {
@@ -775,6 +1065,7 @@ Kirigami.ApplicationWindow {
                                             icon.color: Qt.alpha(Kirigami.Theme.textColor, 0.55)
                                             onClicked: {
                                                 messageList.currentIndex = -1
+                                                messageList.openedUid = -1
                                                 messageList.clearSelection()
                                                 Mail.openFolderInAccount(accountSection.index,
                                                                          modelData.mailBox)
@@ -1095,6 +1386,13 @@ Kirigami.ApplicationWindow {
                         keyNavigationEnabled: true
                         activeFocusOnTab: true
 
+                        // The message the cursor is on, tracked by uid so it
+                        // survives a model reset renumbering the rows. Uids are
+                        // only unique within a folder, so every folder change
+                        // clears this alongside currentIndex. "real", not
+                        // "int": IMAP uids run past 2^31.
+                        property real openedUid: -1
+
                         // Multi-selection (ctrl+click toggles, shift+click ranges)
                         property var selectedSet: ({})
                         property int selectionRev: 0
@@ -1173,8 +1471,6 @@ Kirigami.ApplicationWindow {
                                 clearSelection()
                             }
                         }
-                        Keys.onPressed: event => root.handleMailShortcut(event)
-
                         function requestJunk() {
                             const rows = selectedIndexes()
                             if (rows.length === 0)
@@ -1193,14 +1489,53 @@ Kirigami.ApplicationWindow {
                                 // now (search/filter/sort) — currentIndex often
                                 // keeps its old number, so no change signal
                                 // fires and the preview would show the previous
-                                // message. Re-anchor on the first row and fetch
-                                // it explicitly.
-                                if (messageList.count > 0) {
-                                    messageList.currentIndex = 0
-                                    fetchDebounce.restart()
-                                } else {
+                                // message.
+                                if (messageList.count <= 0) {
+                                    // openedUid deliberately survives: opening a
+                                    // folder clears the model and *then* fills
+                                    // it, so every refresh passes through an
+                                    // empty model. Forgetting the user's pick
+                                    // here made the restore below a no-op — the
+                                    // first reset wiped it, the second snapped
+                                    // to row 0. A real folder change clears it
+                                    // explicitly at the click instead.
                                     messageList.currentIndex = -1
+                                    console.info("mailo: msg reset: empty, keeping uid",
+                                                messageList.openedUid)
+                                    return
                                 }
+                                // A message the user opened is followed by uid,
+                                // not by row number. An account switch resets
+                                // this model again when the folder refresh
+                                // lands, and snapping to row 0 unconditionally
+                                // threw away a message clicked in between —
+                                // the click registered, then the reset moved
+                                // the cursor back to the top.
+                                const row = messageList.openedUid >= 0
+                                    ? Mail.messageModel.rowForUid(messageList.openedUid) : -1
+                                messageList.currentIndex = row >= 0 ? row : 0
+                                // Set explicitly: assigning the same number
+                                // fires no change signal, which would leave a
+                                // uid here that is no longer under the cursor.
+                                // Only when the restore actually failed — if
+                                // the message was found, the cursor is already
+                                // on it and its uid is the one to keep.
+                                if (row < 0) {
+                                    messageList.openedUid =
+                                        Mail.messageModel.uidAt(messageList.currentIndex)
+                                }
+                                console.info("mailo: msg reset: count", messageList.count,
+                                            "wanted uid", messageList.openedUid,
+                                            "-> row", row, "current", messageList.currentIndex)
+                                // Only when the cursor landed on a *different*
+                                // message than the viewer is showing. A
+                                // successful restore means the same mail is
+                                // still under the cursor, and re-fetching it
+                                // re-parsed the MIME and reloaded the web view
+                                // on every refresh — three times per message
+                                // during a reconnect, all on the GUI thread.
+                                if (row < 0)
+                                    fetchDebounce.restart()
                             }
                             // Incremental inserts (appendHeaders: search local
                             // merge, load-more) shift every row at/after the
@@ -1295,6 +1630,18 @@ Kirigami.ApplicationWindow {
                                 // moves the cursor without dropping the set.
                                 if (!preserveSelection)
                                     selectSingle(currentIndex)
+                                // Record the pick now, not when the debounced
+                                // fetch fires: a reset landing inside those
+                                // 150 ms is exactly the case this exists for.
+                                // Only when the row names a real message —
+                                // emptying the model drives the cursor to 0
+                                // with nothing behind it, and recording that
+                                // -1 threw away the uid this is meant to keep.
+                                const uid = Mail.messageModel.uidAt(currentIndex)
+                                if (uid >= 0)
+                                    openedUid = uid
+                                console.info("mailo: msg cursor ->", currentIndex,
+                                            "uid", uid, "kept", openedUid)
                                 fetchDebounce.restart()
                             }
                         }
@@ -1377,8 +1724,38 @@ Kirigami.ApplicationWindow {
                             }
 
                             MouseArea {
+                                id: msgMouse
                                 anchors.fill: parent
                                 acceptedButtons: Qt.LeftButton
+                                // Past this the press becomes a drag and the
+                                // list stops scrolling under it; short enough
+                                // to feel immediate, long enough that a click
+                                // with a shaky hand is still a click.
+                                drag.threshold: Kirigami.Units.gridUnit
+                                drag.target: dragPayload
+
+                                onPressed: mouse => {
+                                    // A drag carries the selection when the
+                                    // pressed row is part of it, and just that
+                                    // row otherwise — the selection itself is
+                                    // only changed on release (onClicked), so
+                                    // dragging never silently reselects.
+                                    const rows = messageList.isSelected(msgDelegate.index)
+                                               ? messageList.selectedIndexes()
+                                               : [msgDelegate.index]
+                                    dragPayload.prepare(
+                                        "messages", rows, "",
+                                        rows.length === 1 ? msgDelegate.subject
+                                                          : rows.length + " messages")
+                                    dragPayload.moveTo(msgDelegate.mapToItem(
+                                        QQC2.Overlay.overlay, mouse.x, mouse.y))
+                                }
+                                drag.onActiveChanged: {
+                                    if (msgMouse.drag.active)
+                                        dragPayload.begin()
+                                    else
+                                        dragPayload.finish()
+                                }
                                 onClicked: mouse => {
                                     messageList.forceActiveFocus()
                                     console.info("mailo: click row", msgDelegate.index,
@@ -1402,6 +1779,10 @@ Kirigami.ApplicationWindow {
                                     messageList.currentIndex = msgDelegate.index
                                     // Clicks are deliberate — skip the key-repeat debounce.
                                     fetchDebounce.stop()
+                                    // A draft is resumed, not read. Armed only
+                                    // by a real click, so arrow-keying through
+                                    // Drafts does not open a composer per row.
+                                    root.draftEditPending = Mail.viewingDrafts
                                     Mail.fetchMessage(msgDelegate.index)
                                 }
                             }

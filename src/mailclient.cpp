@@ -22,6 +22,7 @@
 
 #include <kimap/appendjob.h>
 #include <kimap/capabilitiesjob.h>
+#include <kimap/deletejob.h>
 #include <kimap/expungejob.h>
 #include <kimap/fetchjob.h>
 #include <kimap/idlejob.h>
@@ -29,6 +30,7 @@
 #include <kimap/loginjob.h>
 #include <kimap/logoutjob.h>
 #include <kimap/movejob.h>
+#include <kimap/renamejob.h>
 #include <kimap/searchjob.h>
 #include <kimap/selectjob.h>
 #include <kimap/session.h>
@@ -955,6 +957,15 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     m_pendingFolder = targetFolder;
     Q_EMIT selectedFolderChanged();
 
+    // Special-use folders belong to the account that advertised them. They are
+    // re-detected by the next listFolders(), but until then a stale path would
+    // point "Save as draft" (or the Sent copy) at the previous account's
+    // mailbox — which the new connection may not even have.
+    m_sentFolder.clear();
+    m_draftsFolder.clear();
+    m_allMailFolder.clear();
+    Q_EMIT draftsFolderChanged();
+
     teardownSession();
     m_folderModel.setFolders({});
     m_messageModel.clear();
@@ -991,29 +1002,28 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
         m_connectWhenReady = true;
 }
 
-void MailClient::sendMail(const QString &to, const QString &cc, const QString &bcc,
-                          const QString &subject, const QString &html,
-                          const QList<QUrl> &attachments)
+/// The MIME construction shared by sendMail() and saveDraft(). \a strict is
+/// what separates them: sending refuses a malformed recipient, while a draft
+/// is saved from whatever is on screen — including an address halfway through
+/// being typed — so it keeps the text as-is rather than throwing the draft away.
+std::shared_ptr<KMime::Message> MailClient::composeMessage(
+    const QString &to, const QString &cc, const QString &bcc, const QString &subject,
+    const QString &html, const QList<QUrl> &attachments, bool strict,
+    QStringList *toOut, QStringList *ccOut, QStringList *bccOut)
 {
-    const bool haveCredential = m_authType != 0 ? !m_accessToken.isEmpty()
-                                                : !m_password.isEmpty();
-    if (m_smtpHost.isEmpty() || m_user.isEmpty() || !haveCredential) {
-        Q_EMIT sendFailed(tr("SMTP is not configured (check account settings)."));
-        return;
-    }
     // Defense against header/SMTP-command injection: no CR/LF survives, and
     // every recipient must look like a bare address.
     static const QRegularExpression crlfRe(QStringLiteral("[\\r\\n]"));
     static const QRegularExpression addrRe(
         QStringLiteral("^[^@\\s<>,;\"]+@[^@\\s<>,;\"]+\\.[^@\\s<>,;\"]+$"));
-    auto parseAddresses = [this](QString raw, bool *ok) -> QStringList {
+    auto parseAddresses = [this, strict](QString raw, bool *ok) -> QStringList {
         raw.remove(crlfRe);
         QStringList out;
         *ok = true;
         const QStringList parts = raw.split(QLatin1Char(','), Qt::SkipEmptyParts);
         for (const QString &part : parts) {
             const QString addr = part.trimmed();
-            if (!addrRe.match(addr).hasMatch()) {
+            if (!addrRe.match(addr).hasMatch() && strict) {
                 Q_EMIT sendFailed(tr("Invalid recipient address: %1").arg(addr));
                 *ok = false;
                 return {};
@@ -1026,17 +1036,19 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
     bool ok = false;
     const QStringList toList = parseAddresses(to, &ok);
     if (!ok)
-        return;
-    if (toList.isEmpty()) {
-        Q_EMIT sendFailed(tr("No recipient given."));
-        return;
-    }
+        return {};
     const QStringList ccList = parseAddresses(cc, &ok);
     if (!ok)
-        return;
+        return {};
     const QStringList bccList = parseAddresses(bcc, &ok);
     if (!ok)
-        return;
+        return {};
+    if (toOut)
+        *toOut = toList;
+    if (ccOut)
+        *ccOut = ccList;
+    if (bccOut)
+        *bccOut = bccList;
     QString cleanSubject = subject;
     cleanSubject.remove(crlfRe);
 
@@ -1055,7 +1067,7 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
     msg->subject()->fromUnicodeString(cleanSubject);
     msg->date()->setDateTime(QDateTime::currentDateTime());
     msg->messageID()->generate(m_smtpHost.toUtf8());
-    msg->userAgent()->fromUnicodeString(QStringLiteral("mailo/0.9"));
+    msg->userAgent()->fromUnicodeString(QStringLiteral("mailo/" MAILO_VERSION));
 
     const QString plain = QTextDocumentFragment::fromHtml(html).toPlainText();
 
@@ -1094,7 +1106,7 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
             QFile file(url.toLocalFile());
             if (!file.open(QIODevice::ReadOnly)) {
                 Q_EMIT sendFailed(tr("Could not read attachment %1.").arg(url.toLocalFile()));
-                return;
+                return {};
             }
             const QString name = QFileInfo(file).fileName();
             auto part = std::make_unique<KMime::Content>();
@@ -1109,6 +1121,30 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
         }
     }
     msg->assemble();
+
+    return msg;
+}
+
+void MailClient::sendMail(const QString &to, const QString &cc, const QString &bcc,
+                          const QString &subject, const QString &html,
+                          const QList<QUrl> &attachments)
+{
+    const bool haveCredential = m_authType != 0 ? !m_accessToken.isEmpty()
+                                                : !m_password.isEmpty();
+    if (m_smtpHost.isEmpty() || m_user.isEmpty() || !haveCredential) {
+        Q_EMIT sendFailed(tr("SMTP is not configured (check account settings)."));
+        return;
+    }
+    QStringList toList, ccList, bccList;
+    auto msg = composeMessage(to, cc, bcc, subject, html, attachments, true,
+                              &toList, &ccList, &bccList);
+    if (!msg)
+        return;
+    if (toList.isEmpty()) {
+        Q_EMIT sendFailed(tr("No recipient given."));
+        return;
+    }
+    const QString fromAddr = ownAddress();
 
     // --- Ship it over SMTP ---
     // Sending is silent in the status log: success just closes the compose
@@ -1180,6 +1216,58 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
                 login->start();
             });
     session->open();
+}
+
+void MailClient::saveDraft(const QString &to, const QString &cc, const QString &bcc,
+                           const QString &subject, const QString &html,
+                           const QList<QUrl> &attachments, qint64 replacesUid)
+{
+    if (!m_connected || !m_session) {
+        Q_EMIT sendFailed(tr("Cannot save a draft while offline."));
+        return;
+    }
+    if (m_draftsFolder.isEmpty()) {
+        Q_EMIT sendFailed(tr("No Drafts folder found on the server."));
+        return;
+    }
+    // Bcc is a header here rather than an envelope field: a draft is not being
+    // delivered, and dropping it would lose it when the draft is reopened.
+    auto msg = composeMessage(to, cc, bcc, subject, html, attachments, false);
+    if (!msg)
+        return;
+    if (!bcc.trimmed().isEmpty()) {
+        msg->bcc()->fromUnicodeString(bcc.trimmed());
+        msg->assemble();
+    }
+
+    setBusy(true);
+    auto *append = new KIMAP::AppendJob(m_session);
+    append->setMailBox(m_draftsFolder);
+    append->setContent(msg->encodedContent(KMime::NewlineType::CRLF));
+    // \\Draft is what makes other clients treat it as editable rather than as
+    // received mail; \\Seen keeps it from showing up as unread.
+    append->setFlags({QByteArrayLiteral("\\Draft"), QByteArrayLiteral("\\Seen")});
+    append->setInternalDate(QDateTime::currentDateTime());
+    connect(append, &KJob::result, this, [this, replacesUid](KJob *job) {
+        setBusy(false);
+        if (job->error()) {
+            Q_EMIT sendFailed(tr("Saving the draft failed: %1").arg(job->errorString()));
+            return;
+        }
+        setStatus(tr("Draft saved to %1").arg(m_draftsFolder));
+        Q_EMIT draftSaved(); // the compose window closes on this
+        // IMAP cannot replace a message in place, so re-saving is append-new
+        // then delete-old. Both steps happen here, in that order, and the list
+        // is refreshed once at the end — refreshing in between showed the old
+        // and new copies side by side, and not refreshing at all left the new
+        // one invisible until the next background sync.
+        if (replacesUid > 0) {
+            discardDraft(replacesUid); // refreshes once the expunge lands
+        } else if (viewingDrafts()) {
+            refreshCurrentFolder();
+        }
+    });
+    append->start();
 }
 
 void MailClient::appendToSentFolder(const QByteArray &rawMessage)
@@ -1344,6 +1432,86 @@ QVariantMap MailClient::replyData(bool replyAll)
             {QStringLiteral("cc"), cc.join(QStringLiteral(", "))},
             {QStringLiteral("subject"), subject},
             {QStringLiteral("body"), body}};
+}
+
+/// The message as it stands, for reopening a draft in the composer. Unlike
+/// replyData/forwardData nothing is quoted or prefixed — a draft is resumed,
+/// not responded to.
+QVariantMap MailClient::draftData()
+{
+    if (!m_currentMessage)
+        return {};
+    const KMime::Message *msg = m_currentMessage.get();
+
+    auto addressesOf = [](const auto *header) {
+        QStringList out;
+        if (!header)
+            return out;
+        const auto mailboxes = header->mailboxes();
+        for (const auto &mb : mailboxes) {
+            const QString addr = QString::fromLatin1(mb.address());
+            if (addr.contains(QLatin1Char('@')))
+                out.append(addr);
+        }
+        return out;
+    };
+
+    // The HTML part when the draft has one, so formatting survives a
+    // save/reopen round trip; the plain part is the fallback.
+    const QString body = !m_currentHtmlBody.isEmpty()
+        ? m_currentHtmlBody
+        : m_currentTextBody.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
+
+    return {{QStringLiteral("to"), addressesOf(msg->to()).join(QStringLiteral(", "))},
+            {QStringLiteral("cc"), addressesOf(msg->cc()).join(QStringLiteral(", "))},
+            {QStringLiteral("bcc"), addressesOf(msg->bcc()).join(QStringLiteral(", "))},
+            {QStringLiteral("subject"),
+             msg->subject() ? msg->subject()->asUnicodeString() : QString()},
+            {QStringLiteral("body"), body},
+            {QStringLiteral("uid"), m_currentUid}};
+}
+
+/// Removes the draft a composer was opened from, once its replacement has been
+/// sent or re-saved — otherwise editing a draft would leave the old copy
+/// beside the new one every time.
+void MailClient::discardDraft(qint64 uid)
+{
+    if (uid <= 0 || m_draftsFolder.isEmpty() || !m_connected || !m_session)
+        return;
+    KIMAP::ImapSet set;
+    set.add(uid);
+
+    // Browsing SELECTs read-only (EXAMINE); STORE and EXPUNGE need read-write.
+    auto *select = new KIMAP::SelectJob(m_session);
+    select->setMailBox(m_draftsFolder);
+    connect(select, &KJob::result, this, [this, set, uid](KJob *job) {
+        if (job->error())
+            return;
+        m_folderReadWrite = true;
+        auto *store = new KIMAP::StoreJob(m_session);
+        store->setUidBased(true);
+        store->setSequenceSet(set);
+        store->setMode(KIMAP::StoreJob::AppendFlags);
+        store->setFlags({QByteArrayLiteral("\\Deleted")});
+        connect(store, &KJob::result, this, [this, uid](KJob *job) {
+            if (job->error())
+                return;
+            auto *expunge = new KIMAP::ExpungeJob(m_session);
+            connect(expunge, &KJob::result, this, [this, uid](KJob *) {
+                // Drop it from the open list too, when Drafts is on screen.
+                if (viewingDrafts()) {
+                    m_messageModel.removeByUids({uid});
+                    m_store.removeMessages(m_draftsFolder, {uid});
+                    // The replacement was APPENDed just before this; show it
+                    // in the same breath as the old row disappearing.
+                    refreshCurrentFolder();
+                }
+            });
+            expunge->start();
+        });
+        store->start();
+    });
+    select->start();
 }
 
 QVariantMap MailClient::forwardData()
@@ -1976,6 +2144,8 @@ MailClient::~MailClient()
     stopBodyWriter();
     qCDebug(logTrace, "shutdown: stopping purge");
     stopAllMailPurge();
+    qCDebug(logTrace, "shutdown: stopping folder maintenance");
+    stopFolderOps();
     qCDebug(logTrace, "shutdown: stopping attachment migration");
     stopAttachmentMigration();
     qCDebug(logTrace, "shutdown: joining reindex");
@@ -2147,6 +2317,12 @@ void MailClient::startAttachmentMigration()
             if (!finished)
                 return;
             m_store.sweepOrphanAttachments();
+            // Nothing moved means there was nothing to move — an empty or
+            // already-migrated cache. Announcing "0 bytes freed" on a first
+            // run reported housekeeping the user never asked for and could
+            // not act on.
+            if (savedTotal <= 0)
+                return;
             const QLocale loc;
             // The space is only handed back to the filesystem by a vacuum —
             // deleting from a SQLite table just marks pages reusable.
@@ -2239,6 +2415,10 @@ void MailClient::listFolders()
                     FolderModel::Folder f;
                     f.mailBox = d.name;
                     const QChar sep = d.separator;
+                    // The delimiter every folder path is built with; needed to
+                    // form destination paths when a folder is reparented.
+                    if (!sep.isNull())
+                        m_folderSeparator = sep;
                     f.level = sep.isNull() ? 0 : int(d.name.count(sep));
                     f.displayName = sep.isNull() ? d.name : d.name.section(sep, -1);
                     bool isAllMail = false;
@@ -2250,6 +2430,12 @@ void MailClient::listFolders()
                             // sent mail belongs.
                             if (flag.compare("\\Sent", Qt::CaseInsensitive) == 0)
                                 m_sentFolder = d.name;
+                            // Same mechanism for drafts. Servers that support
+                            // the LIST special-use extension tell us outright;
+                            // the name guess below is only for those that
+                            // do not.
+                            if (flag.compare("\\Drafts", Qt::CaseInsensitive) == 0)
+                                m_draftsFolder = d.name;
                             // ...and which mailbox is the "everything" archive.
                             if (flag.compare("\\All", Qt::CaseInsensitive) == 0)
                                 isAllMail = true;
@@ -2296,6 +2482,19 @@ void MailClient::listFolders()
                 }
             }
         }
+        // Fallback when the server doesn't advertise \\Drafts special-use.
+        if (m_draftsFolder.isEmpty()) {
+            static const QStringList draftNames = {
+                QStringLiteral("drafts"), QStringLiteral("draft"),
+                QStringLiteral("draft messages")};
+            for (const auto &f : std::as_const(*folders)) {
+                if (draftNames.contains(f.displayName.toLower())) {
+                    m_draftsFolder = f.mailBox;
+                    break;
+                }
+            }
+        }
+        Q_EMIT draftsFolderChanged();
         m_folderModel.setFolders(*folders);
         // A fresh folder list restarts the all-folders background sync pass.
         m_folderBackfillPassDone = false;
@@ -2525,6 +2724,330 @@ void MailClient::markAsJunk(const QVariantList &rows)
     select->start();
 }
 
+void MailClient::moveMessagesTo(const QVariantList &rows, const QString &targetFolder)
+{
+    if (!m_connected || !m_session) {
+        Q_EMIT errorOccurred(tr("Not connected — cannot move messages."));
+        return;
+    }
+    if (targetFolder.isEmpty() || targetFolder == m_selectedFolder)
+        return;
+
+    KIMAP::ImapSet set;
+    auto uids = std::make_shared<QList<qint64>>();
+    for (const QVariant &v : rows) {
+        const qint64 uid = m_messageModel.uidAt(v.toInt());
+        if (uid > 0) {
+            set.add(uid);
+            uids->append(uid);
+        }
+    }
+    if (uids->isEmpty())
+        return;
+
+    setBusy(true);
+    // The browsing SELECT is read-only (EXAMINE); MOVE needs read-write.
+    auto *select = new KIMAP::SelectJob(m_session);
+    select->setMailBox(m_selectedFolder);
+    connect(select, &KJob::result, this, [this, set, uids, targetFolder](KJob *job) {
+        if (job->error()) {
+            setBusy(false);
+            Q_EMIT errorOccurred(job->errorString());
+            return;
+        }
+        m_folderReadWrite = true;
+        auto *move = new KIMAP::MoveJob(m_session);
+        move->setUidBased(true);
+        move->setSequenceSet(set);
+        move->setMailBox(targetFolder);
+        connect(move, &KJob::result, this, [this, uids, targetFolder](KJob *job) {
+            setBusy(false);
+            if (job->error()) {
+                Q_EMIT errorOccurred(job->errorString());
+                return;
+            }
+            purgeDeleted(*uids);
+            // The destination's cached header list no longer matches what the
+            // server holds; its next open re-syncs it anyway, but the missing
+            // -bodies estimate is shared and would be stale immediately.
+            invalidateMissingBodies();
+            setStatus(tr("%1 moved to %2")
+                          .arg(uids->size())
+                          .arg(folderLeaf(targetFolder)));
+        });
+        move->start();
+    });
+    select->start();
+}
+
+QChar MailClient::folderSeparator() const
+{
+    if (!m_folderSeparator.isNull())
+        return m_folderSeparator;
+    // Before the first LIST lands, infer it the way the special-folder
+    // lookups do: '/' when any path uses it, '.' otherwise.
+    const QStringList boxes = m_folderModel.allMailBoxes();
+    for (const QString &box : boxes) {
+        if (box.contains(QLatin1Char('/')))
+            return QLatin1Char('/');
+    }
+    return QLatin1Char('.');
+}
+
+QString MailClient::folderLeaf(const QString &mailBox) const
+{
+    return mailBox.section(folderSeparator(), -1);
+}
+
+QString MailClient::folderParent(const QString &mailBox) const
+{
+    const QChar sep = folderSeparator();
+    const int cut = mailBox.lastIndexOf(sep);
+    return cut < 0 ? QString() : mailBox.left(cut);
+}
+
+QString MailClient::freeChildPath(const QString &parent, const QString &leaf) const
+{
+    const QChar sep = folderSeparator();
+    const QStringList boxes = m_folderModel.allMailBoxes();
+    const auto pathOf = [&](const QString &name) {
+        return parent.isEmpty() ? name : parent + sep + name;
+    };
+    QString candidate = pathOf(leaf);
+    for (int n = 2; boxes.contains(candidate); ++n)
+        candidate = pathOf(QStringLiteral("%1 (%2)").arg(leaf).arg(n));
+    return candidate;
+}
+
+QStringList MailClient::folderSubtree(const QString &mailBox) const
+{
+    const QString prefix = mailBox + folderSeparator();
+    QStringList out;
+    const QStringList boxes = m_folderModel.allMailBoxes();
+    for (const QString &box : boxes) {
+        if (box == mailBox || box.startsWith(prefix))
+            out.append(box);
+    }
+    // Deepest first: a server may refuse to DELETE a mailbox that still has
+    // children, and never the other way round.
+    std::sort(out.begin(), out.end(), [](const QString &a, const QString &b) {
+        return a.size() > b.size();
+    });
+    return out;
+}
+
+bool MailClient::folderProtected(const QString &mailBox) const
+{
+    if (mailBox.isEmpty())
+        return true;
+    if (mailBox.compare(QLatin1String("INBOX"), Qt::CaseInsensitive) == 0)
+        return true;
+    return mailBox == trashFolderName() || mailBox == junkFolderName()
+        || mailBox == m_sentFolder || mailBox == m_allMailFolder;
+}
+
+bool MailClient::canMoveFolder(const QString &mailBox, const QString &newParent) const
+{
+    if (!m_connected || mailBox.isEmpty() || mailBox == newParent)
+        return false;
+    if (folderProtected(mailBox))
+        return false;
+    const QChar sep = folderSeparator();
+    if (folderParent(mailBox) == newParent)
+        return false; // already sits there
+    if (newParent.startsWith(mailBox + sep))
+        return false; // a folder cannot become its own descendant
+    const QStringList boxes = m_folderModel.allMailBoxes();
+    if (!newParent.isEmpty() && !boxes.contains(newParent))
+        return false;
+    // Occupied destination: the server would reject the RENAME, and merging
+    // two mailboxes is not something a drop should be able to mean.
+    return !boxes.contains(newParent.isEmpty() ? folderLeaf(mailBox)
+                                               : newParent + sep + folderLeaf(mailBox));
+}
+
+void MailClient::moveFolder(const QString &mailBox, const QString &newParent)
+{
+    if (!m_connected || !m_session) {
+        Q_EMIT errorOccurred(tr("Not connected — cannot move folders."));
+        return;
+    }
+    if (!canMoveFolder(mailBox, newParent))
+        return;
+    const QChar sep = folderSeparator();
+    const QString leaf = folderLeaf(mailBox);
+    const QString dest = newParent.isEmpty() ? leaf : newParent + sep + leaf;
+    renameFolderOnServer(mailBox, dest,
+                         newParent.isEmpty()
+                             ? tr("%1 moved to the top level").arg(leaf)
+                             : tr("%1 moved into %2").arg(leaf, folderLeaf(newParent)));
+}
+
+bool MailClient::folderDeleteIsPermanent(const QString &mailBox) const
+{
+    const QString trash = trashFolderName();
+    if (trash.isEmpty())
+        return true; // nowhere to move it to
+    return mailBox == trash || mailBox.startsWith(trash + folderSeparator());
+}
+
+void MailClient::deleteFolder(const QString &mailBox)
+{
+    if (!m_connected || !m_session) {
+        Q_EMIT errorOccurred(tr("Not connected — cannot delete folders."));
+        return;
+    }
+    if (mailBox.isEmpty() || folderProtected(mailBox))
+        return;
+
+    const QString leaf = folderLeaf(mailBox);
+    if (!folderDeleteIsPermanent(mailBox)) {
+        renameFolderOnServer(mailBox, freeChildPath(trashFolderName(), leaf),
+                             tr("%1 moved to trash").arg(leaf));
+        return;
+    }
+
+    // Already in the trash: this really removes it. Subfolders go first —
+    // deepest first, one job at a time, since a server may refuse to delete a
+    // mailbox that still has children.
+    auto remaining = std::make_shared<QStringList>(folderSubtree(mailBox));
+    if (remaining->isEmpty())
+        return;
+    const auto deleted = std::make_shared<QStringList>();
+
+    setBusy(true);
+    // Chained rather than fired together: KIMAP runs one job at a time per
+    // session anyway, and this way the first failure stops the rest.
+    auto step = std::make_shared<std::function<void()>>();
+    *step = [this, remaining, deleted, step, leaf] {
+        if (remaining->isEmpty()) {
+            purgeCachedFolders(*deleted);
+            // Whatever was open inside the deleted subtree is gone; land on
+            // INBOX rather than on a mailbox the server no longer has.
+            if (deleted->contains(m_selectedFolder))
+                m_pendingFolder = QStringLiteral("INBOX");
+            setStatus(tr("%1 deleted").arg(leaf));
+            listFolders(); // clears busy when the new tree arrives
+            return;
+        }
+        const QString box = remaining->takeFirst();
+        auto *del = new KIMAP::DeleteJob(m_session);
+        del->setMailBox(box);
+        connect(del, &KJob::result, this, [this, box, deleted, step](KJob *job) {
+            if (job->error()) {
+                setBusy(false);
+                setStatus(tr("Deleting folder failed"));
+                Q_EMIT errorOccurred(job->errorString());
+                if (!deleted->isEmpty()) {
+                    purgeCachedFolders(*deleted); // whatever did go, goes from the cache too
+                    setBusy(true);
+                    listFolders();
+                }
+                return;
+            }
+            deleted->append(box);
+            (*step)();
+        });
+        del->start();
+    };
+    (*step)();
+}
+
+void MailClient::renameFolderOnServer(const QString &from, const QString &to,
+                                      const QString &doneStatus)
+{
+    setBusy(true);
+    auto *rename = new KIMAP::RenameJob(m_session);
+    rename->setSourceMailBox(from);
+    rename->setDestinationMailBox(to);
+    connect(rename, &KJob::result, this, [this, from, to, doneStatus](KJob *job) {
+        if (job->error()) {
+            setBusy(false);
+            setStatus(tr("Moving folder failed"));
+            Q_EMIT errorOccurred(job->errorString());
+            return;
+        }
+        // The mail did not change, only the path it is filed under — re-key
+        // the cache instead of making the user sync the folder again. It runs
+        // in the background: a header sync that lands on the new path while it
+        // is still going may lose a row or two to the re-key, which the next
+        // refresh puts back. Blocking the UI for a subtree rewrite would be a
+        // far worse trade.
+        renameCachedFolder(from, to);
+        // RENAME takes the subtree with it, so the open folder may be sitting
+        // at a path that no longer exists. Follow it to the new one.
+        const QString prefix = from + folderSeparator();
+        if (m_selectedFolder == from || m_selectedFolder.startsWith(prefix))
+            m_pendingFolder = to + m_selectedFolder.mid(from.size());
+        setStatus(doneStatus);
+        listFolders(); // clears busy when the new tree arrives
+    });
+    rename->start();
+}
+
+void MailClient::renameCachedFolder(const QString &from, const QString &to)
+{
+    stopFolderOps(); // one maintenance worker at a time
+    m_folderOpCancel.storeRelaxed(0);
+    const QString account = accountKey();
+    const QChar sep = folderSeparator();
+    m_folderOpThread = QThread::create([account, from, to, sep] {
+        QSqlDatabase db = MailStore::openWorkerConnection(QStringLiteral("mailstore-folderop"));
+        if (db.isOpen()) {
+            MailStore::renameFolderOn(db, account, from, to, sep);
+            db.close();
+        }
+        QSqlDatabase::removeDatabase(QStringLiteral("mailstore-folderop"));
+    });
+    connect(m_folderOpThread, &QThread::finished, this, [this] {
+        m_folderOpThread->deleteLater();
+        m_folderOpThread = nullptr;
+        // Header counts and the missing-body estimate were keyed by the old path.
+        invalidateMissingBodies();
+    });
+    // Below the UI's own work: a folder switch must never wait for this.
+    m_folderOpThread->start(QThread::LowestPriority);
+}
+
+void MailClient::purgeCachedFolders(const QStringList &folders)
+{
+    if (folders.isEmpty())
+        return;
+    stopFolderOps();
+    // Both purges open a connection under the same name, so they must not run
+    // at once. The archive one is restartable and picks up where it stopped on
+    // the next connect, so cancelling it here costs nothing.
+    stopAllMailPurge();
+    m_folderOpCancel.storeRelaxed(0);
+    QStringList keys;
+    keys.reserve(folders.size());
+    for (const QString &folder : folders)
+        keys.append(m_store.scopedKey(folder));
+    m_folderOpThread = QThread::create([this, keys] {
+        for (const QString &key : keys) {
+            if (m_folderOpCancel.loadRelaxed())
+                return;
+            // Chunked with a yield between chunks, so the GUI thread never
+            // queues behind this for a write lock (see MailStore::purgeFolder).
+            MailStore::purgeFolder(key, m_folderOpCancel, {});
+        }
+    });
+    connect(m_folderOpThread, &QThread::finished, this, [this] {
+        m_folderOpThread->deleteLater();
+        m_folderOpThread = nullptr;
+        invalidateMissingBodies();
+    });
+    m_folderOpThread->start(QThread::LowestPriority);
+}
+
+void MailClient::stopFolderOps()
+{
+    if (!m_folderOpThread)
+        return;
+    m_folderOpCancel.storeRelaxed(1);
+    m_folderOpThread->wait();
+}
+
 void MailClient::openFolder(const QString &mailBox)
 {
     qCDebug(logTrace, "openFolder(%s)  selected=%s pending=%s",
@@ -2545,16 +3068,25 @@ void MailClient::openFolder(const QString &mailBox)
     // click a folder in account A, a non-INBOX folder in account B, then
     // INBOX, and INBOX opened and was immediately replaced by the second one.
     m_pendingFolder.clear();
+    // Reopening the folder already on screen — which listFolders() does after
+    // every reconnect — used to empty the list and refill it from cache. That
+    // churn is what the view has to defend its selection against, and it buys
+    // nothing: the rows are already the right ones and the network refresh
+    // below merges into them either way. Only a real folder change rebuilds.
+    const bool reopening = mailBox == m_selectedFolder && m_messageModel.rowCount() > 0;
     m_selectedFolder = mailBox;
     Q_EMIT selectedFolderChanged();
     m_folderReadWrite = false;
-    m_messageModel.clear();
 
-    // Show the cache instantly; the network refresh merges into it.
-    const auto cached = m_store.cachedHeaders(mailBox);
-    updatePageAnchor(cached);
-    if (!cached.isEmpty())
-        m_messageModel.setHeaders(cached);
+    QList<MessageListModel::Header> cached;
+    if (!reopening) {
+        m_messageModel.clear();
+        // Show the cache instantly; the network refresh merges into it.
+        cached = m_store.cachedHeaders(mailBox);
+        updatePageAnchor(cached);
+        if (!cached.isEmpty())
+            m_messageModel.setHeaders(cached);
+    }
 
     if (!m_connected || !m_session) {
         // Not cached.size(): that is one page (max 1000 rows), not the folder.
@@ -2564,7 +3096,8 @@ void MailClient::openFolder(const QString &mailBox)
         return;
     }
     setBusy(true);
-    if (!cached.isEmpty())
+    // Reopening always means refreshing: the rows are already on screen.
+    if (reopening || !cached.isEmpty())
         setStatus(tr("%1 refreshing").arg(mailBox));
     else
         setStatus(tr("Opening %1").arg(mailBox));
@@ -3467,6 +4000,8 @@ void MailClient::fetchMessage(int row)
     const qint64 uid = m_messageModel.uidAt(row);
     if (uid < 0)
         return;
+    // Remembered so draftData() can name the message it came from.
+    m_currentUid = uid;
 
     // Previously read message → serve from cache, no network needed.
     const QByteArray cachedRaw = m_store.cachedBody(m_selectedFolder, uid);

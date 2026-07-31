@@ -59,7 +59,10 @@ public:
     /// Returns the number of rows actually inserted (uid duplicates skipped).
     int appendHeaders(const QList<Header> &headers);
     void clear();
-    qint64 uidAt(int row) const;
+    Q_INVOKABLE qint64 uidAt(int row) const;
+    /// Visible row showing \a uid, or -1 when it is not in the model. Lets the
+    /// view re-find the message the user picked after a reset renumbers rows.
+    Q_INVOKABLE int rowForUid(qint64 uid) const;
     bool seenAt(int row) const;
     void markSeen(int row);
     /// Refines a message's attachment kind in place (body-derived knowledge).

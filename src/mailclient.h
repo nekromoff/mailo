@@ -177,6 +177,19 @@ public:
     Q_INVOKABLE void sendMail(const QString &to, const QString &cc, const QString &bcc,
                               const QString &subject, const QString &html,
                               const QList<QUrl> &attachments);
+    /// APPENDs the same message to the Drafts folder instead of sending it.
+    /// Unlike sendMail this accepts an unfinished message — no recipient, or
+    /// an address still being typed — because that is the state a draft is
+    /// saved from. Emits draftSaved() or sendFailed().
+    /// \a replacesUid is the draft being re-saved (-1 for a new one); it is
+    /// removed only after the server has accepted the replacement.
+    Q_INVOKABLE void saveDraft(const QString &to, const QString &cc, const QString &bcc,
+                               const QString &subject, const QString &html,
+                               const QList<QUrl> &attachments, qint64 replacesUid = -1);
+    /// Whether a Drafts folder is known, so the UI can hide the action when
+    /// there is nowhere to put one.
+    Q_PROPERTY(bool hasDraftsFolder READ hasDraftsFolder NOTIFY draftsFolderChanged)
+    bool hasDraftsFolder() const { return !m_draftsFolder.isEmpty(); }
     /// Compose prefill for replying to the currently shown message:
     /// {to, cc, subject, body} — body is HTML with the original quoted.
     /// cc is filled only for \a replyAll. Empty map when nothing is shown.
@@ -187,6 +200,21 @@ public:
     /// The original's attachments are NOT carried over (compose attaches
     /// local files only).
     Q_INVOKABLE QVariantMap forwardData();
+    /// Compose prefill for editing the currently shown message as a draft:
+    /// {to, cc, bcc, subject, body, uid} — the message verbatim, not quoted.
+    /// uid is the draft's own uid so the old copy can be removed on send.
+    /// Empty map when nothing is shown.
+    Q_INVOKABLE QVariantMap draftData();
+    /// True while the open folder is this account's Drafts folder — clicking a
+    /// message there reopens it in the composer instead of the reader.
+    Q_PROPERTY(bool viewingDrafts READ viewingDrafts NOTIFY selectedFolderChanged)
+    bool viewingDrafts() const
+    {
+        return !m_draftsFolder.isEmpty() && m_selectedFolder == m_draftsFolder;
+    }
+    /// Deletes a draft by uid — the superseded copy, once its replacement has
+    /// been sent or re-saved.
+    Q_INVOKABLE void discardDraft(qint64 uid);
     /// Copy the given text to the system clipboard (used to grab the full
     /// status breadcrumb trail on right-click).
     Q_INVOKABLE void copyToClipboard(const QString &text) const;
@@ -218,6 +246,32 @@ public:
     /// Moves the given model rows to the account's junk/spam folder.
     /// No-op when the open folder already is the junk folder.
     Q_INVOKABLE void markAsJunk(const QVariantList &rows);
+
+    /// Moves the given model rows into \a targetFolder — the sidebar's
+    /// drag-and-drop target. No-op when it is the folder they are already in.
+    Q_INVOKABLE void moveMessagesTo(const QVariantList &rows, const QString &targetFolder);
+
+    /// True when \a mailBox may be dropped onto \a newParent ("" = top level):
+    /// a real, different, non-protected folder that is not inside \a mailBox
+    /// itself, and whose resulting path is still free. The sidebar asks this
+    /// per hovered row, so it only outlines targets a drop would work on.
+    Q_INVOKABLE bool canMoveFolder(const QString &mailBox, const QString &newParent) const;
+    /// Reparents \a mailBox (with its whole subtree) under \a newParent via
+    /// IMAP RENAME; "" moves it to the top level. The cached mail moves with
+    /// it — see MailStore::renameFolderOn.
+    Q_INVOKABLE void moveFolder(const QString &mailBox, const QString &newParent);
+
+    /// True for the folders that must not be moved or deleted: INBOX and the
+    /// account's special-use mailboxes (sent, trash, junk).
+    Q_INVOKABLE bool folderProtected(const QString &mailBox) const;
+    /// True when deleting \a mailBox removes it from the server for good —
+    /// it already lives in the trash (or the account has no trash folder).
+    /// The confirmation dialog is worded from this.
+    Q_INVOKABLE bool folderDeleteIsPermanent(const QString &mailBox) const;
+    /// Deletes \a mailBox: moves it into the trash, or — when it is already
+    /// there — removes it and its subfolders from the server. The QML side is
+    /// responsible for confirming either case.
+    Q_INVOKABLE void deleteFolder(const QString &mailBox);
 
     /// Local-only color-scale mark (1..5) for the given model rows; a row
     /// already carrying that color is cleared instead (toggle). 0 clears —
@@ -287,6 +341,8 @@ Q_SIGNALS:
                        const QString &authInfo);
     void errorOccurred(const QString &message);
     void mailSent();
+    void draftSaved();
+    void draftsFolderChanged();
     /// Sending failed — carries the full (unshortened) server error. The
     /// compose window stays open and shows this in a dismissible dialog; it is
     /// deliberately NOT routed through the status log.
@@ -344,6 +400,33 @@ private:
     /// in response to a [TOO-MANY-SIMULTANEOUS-CONNECTIONS] refusal.
     void shrinkBodyPool();
     void listFolders();
+    /// The server's hierarchy delimiter, as reported by LIST. Falls back to
+    /// guessing from the known paths before the first listing has arrived.
+    QChar folderSeparator() const;
+    /// Last path component of a mailbox ("INBOX/a/b" -> "b").
+    QString folderLeaf(const QString &mailBox) const;
+    /// Everything above the last component ("INBOX/a/b" -> "INBOX/a"; empty
+    /// for a top-level folder).
+    QString folderParent(const QString &mailBox) const;
+    /// \a leaf placed under \a parent ("" = top level), with " (2)", " (3)" …
+    /// appended until the path is one no mailbox already uses.
+    QString freeChildPath(const QString &parent, const QString &leaf) const;
+    /// \a mailBox plus every folder below it, deepest first — the order a
+    /// server will accept DELETEs in.
+    QStringList folderSubtree(const QString &mailBox) const;
+    /// RENAMEs \a from to \a to, then re-keys the cache, follows the open
+    /// folder to its new path and re-lists the tree. \a doneStatus is the
+    /// breadcrumb shown on success.
+    void renameFolderOnServer(const QString &from, const QString &to,
+                              const QString &doneStatus);
+    /// Moves the cached mail of a renamed subtree onto its new paths, on a
+    /// worker thread (it rewrites body blobs).
+    void renameCachedFolder(const QString &from, const QString &to);
+    /// Drops the cached mail of folders deleted from the server, on the same
+    /// worker (chunked, so the GUI thread never waits for a write lock).
+    void purgeCachedFolders(const QStringList &folders);
+    /// Joins the folder-maintenance worker, if one is running.
+    void stopFolderOps();
     /// True for a mailbox that duplicates every other one (Gmail's All Mail).
     static bool isAllMailName(const QString &mailBox);
     /// Queues a fetched body for the writer thread, and starts it if needed.
@@ -404,6 +487,15 @@ private:
                             const QString &localMergeKeyword = {});
     void localKeywordFilter(const QString &keyword, const QString &reason);
     void appendToSentFolder(const QByteArray &rawMessage);
+    /// Builds the MIME message shared by sendMail() and saveDraft().
+    /// \a strict rejects malformed or missing recipients (sending); otherwise
+    /// unparseable addresses are kept verbatim so a half-typed draft survives.
+    /// Returns null and emits sendFailed() on a fatal problem.
+    std::shared_ptr<KMime::Message> composeMessage(
+        const QString &to, const QString &cc, const QString &bcc, const QString &subject,
+        const QString &html, const QList<QUrl> &attachments, bool strict,
+        QStringList *toList = nullptr, QStringList *ccList = nullptr,
+        QStringList *bccList = nullptr);
     void collectInlineParts(KMime::Content *root);
     void collectAttachments(KMime::Content *root);
     QString attachmentName(int index) const;
@@ -500,9 +592,11 @@ private:
     bool m_folderReadWrite = false; ///< current SELECT is read-write (not EXAMINE)
     QString m_pendingFolder; ///< folder to reopen after (re)connect
     QString m_sentFolder;    ///< where sent mail gets APPENDed
+    QString m_draftsFolder;  ///< where "Save as draft" APPENDs
     /// Gmail's \All archive: excluded from the folder list and the backfill
     /// because it re-stores every message already held under INBOX and labels.
     QString m_allMailFolder;
+    QChar m_folderSeparator; ///< hierarchy delimiter reported by LIST
     int m_missingBodies = -1; ///< -1 = stale, recompute on next use
     QString m_missingBodiesFolder;
     int m_maxBodyMB = 5; ///< bodies above this are not cached (0 = no limit)
@@ -520,6 +614,8 @@ private:
     QAtomicInt m_migrateCancel;
     QThread *m_reindexThread = nullptr; ///< off-thread body text extraction
     QThread *m_purgeThread = nullptr; ///< background removal of that archive
+    QThread *m_folderOpThread = nullptr; ///< cache re-key / purge after a folder move
+    QAtomicInt m_folderOpCancel;
     QThread *m_vacuumThread = nullptr;
     QAtomicInt m_purgeCancel;
     int m_purgedRows = 0;
@@ -548,6 +644,7 @@ private:
     QString m_currentHtmlBody; ///< raw HTML part of the last fetched message
     QString m_currentTextBody; ///< plain-text part of the last fetched message
     QByteArray m_currentRaw;   ///< complete RFC-822 source of the last message
+    qint64 m_currentUid = -1;  ///< uid of the message on screen (draft editing)
     std::shared_ptr<KMime::Message> m_currentMessage; ///< keeps attachment parts alive
     QList<KMime::Content *> m_attachmentParts; ///< owned by m_currentMessage
     QVariantList m_attachments;

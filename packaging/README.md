@@ -6,7 +6,7 @@ CPack is configured in the top-level `CMakeLists.txt`:
 
 ```sh
 cmake -B build -S . && cmake --build build -j$(nproc)
-cd build && cpack -G DEB        # → mailo_0.9_amd64.deb
+cd build && cpack -G DEB        # → mailo_1.0_amd64.deb
 ```
 
 Shared-library `Depends` are computed by `dpkg-shlibdeps` from the machine
@@ -37,7 +37,7 @@ Bumping the version means editing `project(mailo VERSION …)` **and** adding a
 The package is lintian-clean; check after changes with:
 
 ```sh
-lintian build/mailo_0.9_amd64.deb
+lintian build/mailo_1.0_amd64.deb
 ```
 
 # Packaging Mailo as an AppImage

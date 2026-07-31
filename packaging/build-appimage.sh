@@ -63,7 +63,9 @@ cmake -S "$here" -B "$build_dir" \
   -DCMAKE_INSTALL_PREFIX=/usr
 
 log "Building"
-cmake --build "$build_dir" --parallel "$jobs" --target mailo
+# mailo-docs too: `install` pulls in the gzipped man page, and building only
+# the mailo target left it missing so the install step below failed.
+cmake --build "$build_dir" --parallel "$jobs" --target mailo mailo-docs
 
 log "Installing into AppDir"
 rm -rf "$appdir"
@@ -94,7 +96,21 @@ for mod in org/kde/desktop org/kde/kirigami org/kde/kirigamiaddons; do
   fi
 done
 
-# 3c. Breeze icon theme so named icons in the UI actually render.
+# 3c. The SVG *icon engine*. Breeze ships SVGs, and rendering them as icons
+#     needs iconengines/libqsvgicon.so — imageformats/libqsvg.so is a different
+#     plugin and does not cover it. linuxdeploy-plugin-qt bundles the latter
+#     but not the former, so every named icon in the UI came out as an empty
+#     square no matter how the theme was configured.
+log "Bundling the SVG icon engine"
+for plugin_root in /usr/lib/x86_64-linux-gnu/qt6/plugins /usr/lib/qt6/plugins; do
+  if [[ -d "$plugin_root/iconengines" ]]; then
+    mkdir -p "$appdir/usr/plugins/iconengines"
+    cp -a "$plugin_root/iconengines/." "$appdir/usr/plugins/iconengines/"
+    break
+  fi
+done
+
+# 3d. Breeze icon theme so named icons in the UI actually render.
 log "Bundling Breeze icons"
 for base_theme in /usr/share/icons/breeze /usr/share/icons/breeze-dark; do
   if [[ -d "$base_theme" ]]; then

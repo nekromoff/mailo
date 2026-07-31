@@ -1,3 +1,20 @@
+mailo (1.0) unstable; urgency=medium
+
+  * Attachments are stored as content-addressed files outside the database,
+    deduplicated and zstd-compressed; existing caches are migrated in place.
+  * Cache maintenance in Settings: reported size, and an explicit vacuum to
+    return free space to the filesystem.
+  * Gmail's All Mail archive is excluded from caching and hidden, removing
+    the duplicate copy of every message.
+  * Compose: Save as draft, resuming a draft from the Drafts folder, and a
+    confirmation before a message is discarded.
+  * Shortcuts act anywhere in the window rather than only in the message list.
+  * Settings dialog is resizable and remembers its size.
+  * Faster start-up, and folder and message selection no longer lost to
+    background refreshes.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Fri, 31 Jul 2026 12:00:00 +0200
+
 mailo (0.9) unstable; urgency=medium
 
   * Initial release.

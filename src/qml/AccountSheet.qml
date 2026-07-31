@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
+import QtCore
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
@@ -12,21 +13,156 @@ QQC2.Dialog {
     id: sheet
     title: "Settings"
     modal: true
-    standardButtons: QQC2.Dialog.Save | QQC2.Dialog.Cancel
-    anchors.centerIn: parent
-    width: Math.min(parent ? parent.width - Kirigami.Units.gridUnit * 4 : 820, 820)
-    // Fixed height so switching between sections doesn't resize the dialog
-    height: Math.min(parent ? parent.height - Kirigami.Units.gridUnit * 4 : 999,
-                     Kirigami.Units.gridUnit * 30)
+    // No Cancel: everything outside the Accounts page applies live, so the
+    // button only ever discarded account edits while silently keeping the
+    // rest. Escape still dismisses without saving.
+    // Not anchored — the corner grip resizes from the bottom right, which only
+    // reads correctly if the top left stays where it is.
+    // The requested size, remembered across restarts. Clamped to the window
+    // below, so dragging past the edge stops growing instead of pushing the
+    // dialog off screen — and a size saved on a large monitor cannot strand
+    // the dialog when it is next opened on a small one.
+    Settings {
+        id: dialogSettings
+        category: "settingsDialog"
+        property real width: 820
+        property real height: Kirigami.Units.gridUnit * 30
+    }
+    property alias prefWidth: dialogSettings.width
+    property alias prefHeight: dialogSettings.height
+
+    // Same clamp the fixed-size version used, so the default geometry is
+    // unchanged and only dragging the grip departs from it.
+    width: Math.min(prefWidth,
+                    parent ? parent.width - Kirigami.Units.gridUnit * 4 : prefWidth)
+    // Sized rather than fitted, so switching between sections never resizes it.
+    height: Math.min(prefHeight,
+                     parent ? parent.height - Kirigami.Units.gridUnit * 4 : prefHeight)
+
+    // Centred once per opening rather than bound: a binding would re-centre on
+    // every drag, so the dialog would creep away under the cursor.
+    onAboutToShow: {
+        if (!parent)
+            return
+        x = Math.round((parent.width - width) / 2)
+        y = Math.round((parent.height - height) / 2)
+    }
+
+    footer: RowLayout {
+        spacing: 0
+        QQC2.Label {
+            visible: sheet.page === 0 && sheet.detailsMissing !== ""
+            Layout.leftMargin: Kirigami.Units.largeSpacing
+            text: "Needs " + sheet.detailsMissing
+            opacity: 0.8
+            font.pointSize: Kirigami.Theme.smallFont.pointSize
+        }
+        QQC2.DialogButtonBox {
+            Layout.fillWidth: true
+            // Only the Accounts page has anything to save — every other page
+            // applies as you change it, so offering Save there implied the
+            // settings were pending, and on About that there was something to
+            // save at all.
+            visible: sheet.page === 0
+            enabled: sheet.detailsMissing === ""
+            standardButtons: QQC2.Dialog.Save
+            onAccepted: sheet.accept()
+        }
+        // Keeps the grip at the right edge when the button box is hidden.
+        Item {
+            Layout.fillWidth: true
+            visible: sheet.page !== 0
+        }
+        Item {
+            id: resizeGrip
+            // Dots on a fixed grid rather than rotated rules: a rotated
+            // Rectangle draws outside its own bounds by ~35% of its length,
+            // so the old ticks spilled past the dialog's corner.
+            readonly property int dot: 2
+            readonly property int step: dot + 2
+
+            implicitWidth: step * 3
+            implicitHeight: step * 3
+            Layout.alignment: Qt.AlignBottom
+            Layout.rightMargin: Kirigami.Units.largeSpacing
+            Layout.bottomMargin: Kirigami.Units.largeSpacing
+
+            Repeater {
+                // Lower-right triangle, the conventional grip. Drawn rather
+                // than themed so it cannot depend on an icon name existing.
+                model: [[2, 0], [2, 1], [2, 2], [1, 1], [1, 2], [0, 2]]
+                Rectangle {
+                    required property var modelData
+                    width: resizeGrip.dot
+                    height: resizeGrip.dot
+                    radius: 1
+                    color: Kirigami.Theme.textColor
+                    opacity: 0.4
+                    x: modelData[1] * resizeGrip.step
+                    y: modelData[0] * resizeGrip.step
+                }
+            }
+
+            MouseArea {
+                // Grab area is larger than the dots — but grows inward and
+                // stays within the dialog, unlike the negative margins it
+                // replaces.
+                anchors.fill: parent
+                anchors.leftMargin: -Kirigami.Units.largeSpacing
+                anchors.topMargin: -Kirigami.Units.largeSpacing
+                cursorShape: Qt.SizeFDiagCursor
+                property point origin
+                property real startWidth
+                property real startHeight
+                onPressed: mouse => {
+                    // Scene coordinates: this item moves as the dialog grows,
+                    // so a delta measured in local ones would compound.
+                    origin = mapToItem(null, mouse.x, mouse.y)
+                    startWidth = sheet.width
+                    startHeight = sheet.height
+                }
+                onPositionChanged: mouse => {
+                    if (!pressed)
+                        return
+                    const p = mapToItem(null, mouse.x, mouse.y)
+                    sheet.prefWidth = startWidth + (p.x - origin.x)
+                    sheet.prefHeight = startHeight + (p.y - origin.y)
+                }
+            }
+        }
+    }
 
     /// The window's persisted UI settings object (set by Main.qml).
     property var ui
 
-    /// 0 = Accounts, 1 = General, 2 = Look (UI), 3 = Shortcuts
+    /// 0 = Accounts, 1 = General, 2 = Look and feel, 3 = Shortcuts
     property int page: 0
 
     /// Account being edited; -1 = creating a new one.
     property int editIndex: -1
+
+    /// OAuth providers supply their own servers, so only the address matters.
+    readonly property bool oauthAccount: authBox.currentIndex !== 0
+
+    /// What the account still needs before it can be saved, or "" when ready.
+    /// Saving a half-filled account produced one that could never connect and
+    /// had to be deleted and redone, so the button stays off until it would
+    /// actually work.
+    readonly property string detailsMissing: {
+        if (userField.text.trim() === "")
+            return oauthAccount ? "an e-mail address" : "a username"
+        if (!oauthAccount) {
+            if (hostField.text.trim() === "")
+                return "an IMAP server"
+            if (smtpHostField.text.trim() === "")
+                return "an SMTP server for sending"
+            // Only for a new account: editing an existing one leaves the field
+            // blank on purpose, and the saved password stays as it is.
+            if (editIndex < 0 && passwordField.text === "")
+                return "a password"
+        }
+        return ""
+    }
 
     function loadDetails() {
         const d = Mail.accountDetails(editIndex)
@@ -51,6 +187,10 @@ QQC2.Dialog {
     onAccepted: {
         // Look-page settings apply live; Save only persists account edits.
         if (page !== 0)
+            return
+        // Belt and braces: the button is disabled, but Enter reaches accept()
+        // without going through it.
+        if (detailsMissing !== "")
             return
         // OAuth providers get fixed, known-good server settings.
         const presets = authBox.currentIndex === 1
@@ -147,7 +287,13 @@ QQC2.Dialog {
 
         // Settings sections
         ColumnLayout {
-            Layout.preferredWidth: Kirigami.Units.gridUnit * 8
+            id: sectionList
+            // Never narrower than its widest entry: a fixed 8 gridUnits cut
+            // off "Look and feel". implicitWidth here is the widest delegate's
+            // (icon + text + padding), so the column tracks the labels rather
+            // than a guess at how long they are.
+            Layout.minimumWidth: implicitWidth
+            Layout.preferredWidth: Math.max(implicitWidth, Kirigami.Units.gridUnit * 8)
             Layout.alignment: Qt.AlignTop
             spacing: 0
 
@@ -167,7 +313,7 @@ QQC2.Dialog {
             }
             QQC2.ItemDelegate {
                 Layout.fillWidth: true
-                text: "Look (UI)"
+                text: "Look and feel"
                 icon.name: "preferences-desktop-theme"
                 highlighted: sheet.page === 2
                 onClicked: sheet.page = 2
@@ -214,15 +360,33 @@ QQC2.Dialog {
 
                 ListView {
                     id: accountList
-                    model: Mail.accountNames
+                    // An account being created gets a row of its own straight
+                    // away, so it is visible where it will end up instead of
+                    // existing only in the form. It follows the username as it
+                    // is typed, and is not a real account until Save.
+                    readonly property string draftName:
+                        userField.text !== "" ? userField.text : "New account"
+                    model: sheet.editIndex === -1
+                           ? Mail.accountNames.concat([draftName])
+                           : Mail.accountNames
+
                     delegate: QQC2.ItemDelegate {
                         required property string modelData
                         required property int index
+                        readonly property bool isDraft: index >= Mail.accountNames.length
                         width: accountList.width
                         text: modelData
-                        icon.name: "user-identity"
-                        highlighted: sheet.editIndex === index
+                        icon.name: isDraft ? "list-add" : "user-identity"
+                        font.italic: isDraft
+                        highlighted: isDraft ? sheet.editIndex === -1
+                                             : sheet.editIndex === index
                         onClicked: {
+                            if (isDraft) {
+                                // Already editing it — reloading would wipe
+                                // whatever has been typed so far.
+                                sheet.editIndex = -1
+                                return
+                            }
                             sheet.editIndex = index
                             sheet.loadDetails()
                         }
@@ -608,7 +772,7 @@ QQC2.Dialog {
         }
         } // general ScrollView
 
-        // --- Page 2: Look (UI) ---
+        // --- Page 2: Look and feel ---
         QQC2.ScrollView {
             id: lookScroll
             Layout.fillWidth: true
@@ -673,6 +837,109 @@ QQC2.Dialog {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 text: "Applies to the interface panels. Changes take effect immediately."
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Mark emails"
+                Kirigami.FormData.isSection: true
+            }
+            Repeater {
+                model: [1, 2, 3, 4, 5]
+                RowLayout {
+                    id: scaleRow
+                    required property int modelData
+                    readonly property string keyProp: "scaleKey" + modelData
+                    readonly property string colorProp: "scaleColor" + modelData
+                    Kirigami.FormData.label: "Scale " + modelData + ":"
+                    spacing: Kirigami.Units.smallSpacing
+
+                    QQC2.Button {
+                        id: scaleCapture
+                        property bool capturing: false
+                        implicitWidth: Kirigami.Units.gridUnit * 8
+                        text: capturing ? "Press keys…"
+                                        : (sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
+                                           ? sheet.ui[scaleRow.keyProp] : "None")
+                        icon.name: capturing ? "input-keyboard" : ""
+                        onClicked: {
+                            capturing = true
+                            forceActiveFocus()
+                        }
+                        onActiveFocusChanged: {
+                            if (!activeFocus)
+                                capturing = false
+                        }
+                        Keys.onPressed: event => {
+                            if (!capturing)
+                                return
+                            event.accepted = true
+                            if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift
+                                    || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta)
+                                return
+                            if (event.key === Qt.Key_Escape) {
+                                capturing = false
+                                return
+                            }
+                            const seq = shortcutsForm.sequenceFromEvent(event)
+                            if (seq !== "") {
+                                sheet.ui[scaleRow.keyProp] = seq
+                                capturing = false
+                            }
+                        }
+                    }
+                    QQC2.Button {
+                        icon.name: "edit-clear"
+                        enabled: sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
+                        QQC2.ToolTip.text: "Clear shortcut"
+                        QQC2.ToolTip.visible: hovered
+                        onClicked: sheet.ui[scaleRow.keyProp] = ""
+                    }
+                    Rectangle { // swatch; hatched look when undefined
+                        width: Kirigami.Units.gridUnit * 1.2
+                        height: width
+                        radius: 3
+                        color: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
+                               ? sheet.ui[scaleRow.colorProp] : "transparent"
+                        border.color: Kirigami.Theme.textColor
+                        border.width: 1
+                        QQC2.Label {
+                            anchors.centerIn: parent
+                            visible: !sheet.ui || sheet.ui[scaleRow.colorProp] === ""
+                            text: "?"
+                            opacity: 0.8
+                        }
+                    }
+                    QQC2.Button {
+                        text: "Pick…"
+                        icon.name: "color-picker"
+                        onClicked: {
+                            scaleColorDialog.scaleIndex = scaleRow.modelData
+                            scaleColorDialog.selectedColor =
+                                sheet.ui[scaleRow.colorProp] !== ""
+                                    ? sheet.ui[scaleRow.colorProp]
+                                    : Kirigami.Theme.textColor
+                            scaleColorDialog.open()
+                        }
+                    }
+                    QQC2.Button {
+                        icon.name: "edit-clear"
+                        enabled: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
+                        QQC2.ToolTip.text: "Clear color"
+                        QQC2.ToolTip.visible: hovered
+                        onClicked: sheet.ui[scaleRow.colorProp] = ""
+                    }
+                }
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Pressing a scale shortcut marks the selected messages "
+                      + "with that color (press again to clear the mark). "
+                      + "Defined colors appear next to the search bar as a "
+                      + "quick filter."
+                wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
@@ -787,108 +1054,6 @@ QQC2.Dialog {
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
 
-            Kirigami.Separator {
-                Kirigami.FormData.label: "Color scale"
-                Kirigami.FormData.isSection: true
-            }
-            Repeater {
-                model: [1, 2, 3, 4, 5]
-                RowLayout {
-                    id: scaleRow
-                    required property int modelData
-                    readonly property string keyProp: "scaleKey" + modelData
-                    readonly property string colorProp: "scaleColor" + modelData
-                    Kirigami.FormData.label: "Scale " + modelData + ":"
-                    spacing: Kirigami.Units.smallSpacing
-
-                    QQC2.Button {
-                        id: scaleCapture
-                        property bool capturing: false
-                        implicitWidth: Kirigami.Units.gridUnit * 8
-                        text: capturing ? "Press keys…"
-                                        : (sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
-                                           ? sheet.ui[scaleRow.keyProp] : "None")
-                        icon.name: capturing ? "input-keyboard" : ""
-                        onClicked: {
-                            capturing = true
-                            forceActiveFocus()
-                        }
-                        onActiveFocusChanged: {
-                            if (!activeFocus)
-                                capturing = false
-                        }
-                        Keys.onPressed: event => {
-                            if (!capturing)
-                                return
-                            event.accepted = true
-                            if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift
-                                    || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta)
-                                return
-                            if (event.key === Qt.Key_Escape) {
-                                capturing = false
-                                return
-                            }
-                            const seq = shortcutsForm.sequenceFromEvent(event)
-                            if (seq !== "") {
-                                sheet.ui[scaleRow.keyProp] = seq
-                                capturing = false
-                            }
-                        }
-                    }
-                    QQC2.Button {
-                        icon.name: "edit-clear"
-                        enabled: sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
-                        QQC2.ToolTip.text: "Clear shortcut"
-                        QQC2.ToolTip.visible: hovered
-                        onClicked: sheet.ui[scaleRow.keyProp] = ""
-                    }
-                    Rectangle { // swatch; hatched look when undefined
-                        width: Kirigami.Units.gridUnit * 1.2
-                        height: width
-                        radius: 3
-                        color: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
-                               ? sheet.ui[scaleRow.colorProp] : "transparent"
-                        border.color: Kirigami.Theme.textColor
-                        border.width: 1
-                        QQC2.Label {
-                            anchors.centerIn: parent
-                            visible: !sheet.ui || sheet.ui[scaleRow.colorProp] === ""
-                            text: "?"
-                            opacity: 0.8
-                        }
-                    }
-                    QQC2.Button {
-                        text: "Pick…"
-                        icon.name: "color-picker"
-                        onClicked: {
-                            scaleColorDialog.scaleIndex = scaleRow.modelData
-                            scaleColorDialog.selectedColor =
-                                sheet.ui[scaleRow.colorProp] !== ""
-                                    ? sheet.ui[scaleRow.colorProp]
-                                    : Kirigami.Theme.textColor
-                            scaleColorDialog.open()
-                        }
-                    }
-                    QQC2.Button {
-                        icon.name: "edit-clear"
-                        enabled: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
-                        QQC2.ToolTip.text: "Clear color"
-                        QQC2.ToolTip.visible: hovered
-                        onClicked: sheet.ui[scaleRow.colorProp] = ""
-                    }
-                }
-            }
-            QQC2.Label {
-                Kirigami.FormData.label: ""
-                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Pressing a scale shortcut marks the selected messages "
-                      + "with that color (press again to clear the mark). "
-                      + "Defined colors appear next to the search bar as a "
-                      + "quick filter."
-                wrapMode: Text.Wrap
-                opacity: 0.8
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
-            }
         }
         } // shortcuts ScrollView
 
@@ -900,13 +1065,25 @@ QQC2.Dialog {
             contentWidth: availableWidth
             clip: true
 
-            QQC2.Label {
+            // A FormLayout purely for its section heading, so the page title
+            // is styled exactly like "Mail checking" or "Storage" rather than
+            // being a Markdown heading inside the text.
+            Kirigami.FormLayout {
                 width: aboutScroll.availableWidth
-                // Compiled into the binary from ABOUT.md at build time.
-                text: Mail.aboutText
-                textFormat: Text.MarkdownText
-                wrapMode: Text.Wrap
-                onLinkActivated: link => Mail.openExternalUrl(link)
+
+                Kirigami.Separator {
+                    Kirigami.FormData.label: "Mailo"
+                    Kirigami.FormData.isSection: true
+                }
+                QQC2.Label {
+                    Kirigami.FormData.label: ""
+                    Layout.fillWidth: true
+                    // Compiled into the binary from ABOUT.md at build time.
+                    text: Mail.aboutText
+                    textFormat: Text.MarkdownText
+                    wrapMode: Text.Wrap
+                    onLinkActivated: link => Mail.openExternalUrl(link)
+                }
             }
         } // about ScrollView
         } // StackLayout
