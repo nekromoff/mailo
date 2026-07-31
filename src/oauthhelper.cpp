@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #include "oauthhelper.h"
 
 #include <QCryptographicHash>

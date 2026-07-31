@@ -1,12 +1,20 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #include "mailstore.h"
 
+#include "attachmentstore.h"
+
 #include <QDateTime>
+#include <QHash>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFileInfo>
 #include <QRegularExpression>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStandardPaths>
+#include <QThread>
 
 /// The store runs on the GUI thread: any call here directly delays input
 /// handling and rendering. The UI budget is 20 ms — make violations loud.
@@ -27,6 +35,25 @@ struct SlowGuard {
     QElapsedTimer timer;
     const char *op;
 };
+
+/// One-time migrations record themselves in meta_flags so they cost a single
+/// indexed lookup on every later start instead of a full-table pass. Both
+/// helpers assume meta_flags exists (open() creates it first thing).
+bool migrationDone(const QSqlDatabase &db, const QString &flag)
+{
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("SELECT 1 FROM meta_flags WHERE flag = ?"));
+    q.addBindValue(flag);
+    return q.exec() && q.next();
+}
+
+void markMigrationDone(const QSqlDatabase &db, const QString &flag)
+{
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("INSERT OR IGNORE INTO meta_flags (flag) VALUES (?)"));
+    q.addBindValue(flag);
+    q.exec();
+}
 }
 
 bool MailStore::open()
@@ -46,8 +73,19 @@ bool MailStore::open()
     QFile::setPermissions(dir + QStringLiteral("/mailo.db"),
                           QFile::ReadOwner | QFile::WriteOwner);
 
+    SlowGuard guard("open");
     QSqlQuery q(m_db);
     q.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
+    // The purge and vacuum workers write on their own connections. Without a
+    // busy timeout this connection would fail its writes outright the moment
+    // one of them held the lock, instead of waiting the few ms it takes.
+    q.exec(QStringLiteral("PRAGMA busy_timeout=15000"));
+
+    // Gates every one-time migration below, so create it before the first one.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS meta_flags (flag TEXT PRIMARY KEY)"));
+    // Resumable progress for migrations too long to finish in one run.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS meta_values ("
+                          " key TEXT PRIMARY KEY, value TEXT)"));
     if (!q.exec(QStringLiteral(
             "CREATE TABLE IF NOT EXISTS messages ("
             " folder TEXT NOT NULL, uid INTEGER NOT NULL,"
@@ -63,10 +101,15 @@ bool MailStore::open()
 
     // Sweep ghost rows cached by earlier versions: entries without a uid or
     // with no content at all ("(no subject), 1970") can never be opened.
-    q.exec(QStringLiteral("DELETE FROM messages WHERE uid <= 0"
-                          " OR (IFNULL(subject,'') = '' AND IFNULL(sender,'') = ''"
-                          "     AND IFNULL(date,0) <= 0)"));
-    q.exec(QStringLiteral("DELETE FROM bodies WHERE uid <= 0"));
+    // Neither predicate is indexable, so this is a full pass over messages and
+    // bodies — once, not on every start, since no current code writes them.
+    if (!migrationDone(m_db, QStringLiteral("ghost_sweep1"))) {
+        q.exec(QStringLiteral("DELETE FROM messages WHERE uid <= 0"
+                              " OR (IFNULL(subject,'') = '' AND IFNULL(sender,'') = ''"
+                              "     AND IFNULL(date,0) <= 0)"));
+        q.exec(QStringLiteral("DELETE FROM bodies WHERE uid <= 0"));
+        markMigrationDone(m_db, QStringLiteral("ghost_sweep1"));
+    }
 
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS folders ("
                           " mailbox TEXT PRIMARY KEY, sortkey INTEGER)"));
@@ -77,6 +120,43 @@ bool MailStore::open()
                           " account TEXT NOT NULL, mailbox TEXT NOT NULL,"
                           " sortkey INTEGER, uidvalidity INTEGER DEFAULT 0,"
                           " PRIMARY KEY(account, mailbox))"));
+
+    // Attachment payloads live in files keyed by content hash (see
+    // attachmentstore.h); these two tables are the index over that store.
+    // `refs` is what makes eviction possible at all — the old
+    // (folder, uid) -> BLOB layout had nowhere to record that the same
+    // payload was reachable from several messages.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS attachments ("
+                          " hash TEXT PRIMARY KEY, size INTEGER NOT NULL,"
+                          " stored INTEGER NOT NULL, codec INTEGER NOT NULL DEFAULT 0,"
+                          " refs INTEGER NOT NULL DEFAULT 0, last_used INTEGER DEFAULT 0)"));
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS message_parts ("
+                          " folder TEXT NOT NULL, uid INTEGER NOT NULL, part_id TEXT NOT NULL,"
+                          " hash TEXT NOT NULL, filename TEXT, mime TEXT, encoding TEXT,"
+                          " PRIMARY KEY(folder, uid, part_id))"));
+    // Dropping a folder has to find its parts by (folder, uid); releasing a
+    // payload has to count the remaining referrers by hash.
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_message_parts_hash"
+                          " ON message_parts(hash)"));
+
+    // The first attachment migration mis-reported the codec of deduplicated
+    // payloads and skipped those messages, having already moved its cursor
+    // past them. Rewind once so they get another pass; messages already
+    // migrated simply parse, find nothing large inline, and cost one read.
+    if (!migrationDone(m_db, QStringLiteral("attach_migrate_reset1"))) {
+        q.exec(QStringLiteral(
+            "DELETE FROM meta_values WHERE key = 'attach_migrate_cursor'"));
+        q.exec(QStringLiteral("DELETE FROM meta_flags WHERE flag = 'attach_migrate1'"));
+        markMigrationDone(m_db, QStringLiteral("attach_migrate_reset1"));
+    }
+
+    // Bodies deliberately not cached because they exceed the size limit.
+    // Without this the backfill would ask for them again on every single pass:
+    // uidsWithoutBody() cannot tell "never fetched" from "refused to store".
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS body_skipped ("
+                          " folder TEXT NOT NULL, uid INTEGER NOT NULL,"
+                          " size INTEGER DEFAULT 0,"
+                          " PRIMARY KEY(folder, uid))"));
 
     // Senders the user chose to always load remote content for.
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS remote_senders ("
@@ -94,6 +174,23 @@ bool MailStore::open()
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN suspicious INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN auth TEXT DEFAULT ''"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN attach INTEGER DEFAULT 0"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN color INTEGER DEFAULT 0"));
+    // (folder, color) alone could find the rows but not order them, so the
+    // colour filter still sorted the whole folder. Carrying the sort keys in
+    // the index makes it a seek plus a LIMIT.
+    if (!migrationDone(m_db, QStringLiteral("color_index2"))) {
+        q.exec(QStringLiteral("DROP INDEX IF EXISTS idx_messages_color"));
+        markMigrationDone(m_db, QStringLiteral("color_index2"));
+    }
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_color"
+                          " ON messages(folder, color, date DESC, uid DESC)"));
+    // Every list query is "newest first within a folder". Without this the
+    // only usable index is the (folder, uid) primary key, which yields uid
+    // order — so SQLite read the whole folder into a temp B-tree and sorted it
+    // before applying LIMIT. On a 200k-message folder that is a full sort to
+    // show 1000 rows, on the GUI thread, on every open, scroll and search.
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_date"
+                          " ON messages(folder, date DESC, uid DESC)"));
 
     m_ftsAvailable = q.exec(QStringLiteral(
         "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
@@ -204,6 +301,13 @@ void MailStore::adoptLegacyCache(const QString &account)
 {
     if (!m_db.isOpen() || account.isEmpty())
         return;
+    // Strictly a first-run upgrade step. The instr() predicates below cannot
+    // use an index, so re-running it on an already-scoped cache scanned every
+    // messages/bodies/fts row for nothing — the single largest cost in
+    // startup. Once claimed, no unscoped row can appear again.
+    if (migrationDone(m_db, QStringLiteral("legacy_adopt1")))
+        return;
+    SlowGuard guard("adoptLegacyCache");
     m_db.transaction();
     QSqlQuery q(m_db);
 
@@ -228,7 +332,8 @@ void MailStore::adoptLegacyCache(const QString &account)
         upd.addBindValue(prefix);
         upd.exec();
     }
-    m_db.commit();
+    if (m_db.commit())
+        markMigrationDone(m_db, QStringLiteral("legacy_adopt1"));
 }
 
 QStringList MailStore::cachedFolders(const QString &account)
@@ -292,6 +397,7 @@ static QList<MessageListModel::Header> readHeaderRows(QSqlQuery &q)
         h.suspicious = q.value(5).toBool();
         h.authInfo = q.value(6).toString();
         h.attachKind = q.value(7).toInt();
+        h.colorLabel = q.value(8).toInt();
         out.append(h);
     }
     return out;
@@ -303,8 +409,8 @@ QList<MessageListModel::Header> MailStore::cachedHeaders(const QString &folder, 
         return {};
     SlowGuard guard("cachedHeaders");
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach"
-                             " FROM messages WHERE folder = ?"
+    q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
+                             " color FROM messages WHERE folder = ?"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(limit);
@@ -318,14 +424,29 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
     if (!m_db.isOpen())
         return {};
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach"
-                             " FROM messages WHERE folder = ?"
+    q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
+                             " color FROM messages WHERE folder = ?"
                              " AND (date < ? OR (date = ? AND uid < ?))"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(dateSecs);
     q.addBindValue(dateSecs);
     q.addBindValue(uid);
+    q.addBindValue(limit);
+    return readHeaderRows(q);
+}
+
+QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder, int color,
+                                                          int limit)
+{
+    if (!m_db.isOpen())
+        return {};
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
+                             " color FROM messages WHERE folder = ? AND color = ?"
+                             " ORDER BY date DESC, uid DESC LIMIT ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(color);
     q.addBindValue(limit);
     return readHeaderRows(q);
 }
@@ -367,7 +488,10 @@ void MailStore::storeHeaders(const QString &folder,
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(folder, uid) DO UPDATE SET"
         " subject = excluded.subject, sender = excluded.sender, date = excluded.date,"
-        " seen = excluded.seen, suspicious = excluded.suspicious, auth = excluded.auth,"
+        // A locally-read message stays read even if the server still reports
+        // \Unseen — e.g. it was read offline and the STORE never went out.
+        " seen = MAX(messages.seen, excluded.seen),"
+        " suspicious = excluded.suspicious, auth = excluded.auth,"
         " attach = CASE WHEN messages.attach > 1 AND excluded.attach = 1"
         " THEN messages.attach ELSE excluded.attach END"));
     QSqlQuery ins(m_db);
@@ -416,6 +540,29 @@ void MailStore::setAttachKind(const QString &folder, qint64 uid, int kind)
     q.exec();
 }
 
+void MailStore::setColorLabel(const QString &folder, qint64 uid, int color)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET color = ? WHERE folder = ? AND uid = ?"));
+    q.addBindValue(color);
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
+void MailStore::setSeen(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET seen = 1 WHERE folder = ? AND uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
 QList<qint64> MailStore::uidsWithoutBody(const QString &folder, int limit)
 {
     QList<qint64> out;
@@ -425,7 +572,8 @@ QList<qint64> MailStore::uidsWithoutBody(const QString &folder, int limit)
     q.prepare(QStringLiteral(
         "SELECT m.uid FROM messages m"
         " LEFT JOIN bodies b ON b.folder = m.folder AND b.uid = m.uid"
-        " WHERE m.folder = ? AND b.uid IS NULL"
+        " LEFT JOIN body_skipped s ON s.folder = m.folder AND s.uid = m.uid"
+        " WHERE m.folder = ? AND b.uid IS NULL AND s.uid IS NULL"
         " ORDER BY m.date DESC, m.uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(limit);
@@ -444,9 +592,40 @@ int MailStore::missingBodyCount(const QString &folder)
     q.prepare(QStringLiteral(
         "SELECT COUNT(*) FROM messages m"
         " LEFT JOIN bodies b ON b.folder = m.folder AND b.uid = m.uid"
-        " WHERE m.folder = ? AND b.uid IS NULL"));
+        " LEFT JOIN body_skipped s ON s.folder = m.folder AND s.uid = m.uid"
+        " WHERE m.folder = ? AND b.uid IS NULL AND s.uid IS NULL"));
     q.addBindValue(scoped(folder));
     return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
+}
+
+void MailStore::skipBody(const QString &folder, qint64 uid, qint64 size)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO body_skipped (folder, uid, size) VALUES (?, ?, ?)"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.addBindValue(size);
+    q.exec();
+}
+
+int MailStore::unskipBodiesUpTo(qint64 maxSize)
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    // maxSize <= 0 means "no limit" — everything previously refused is fair
+    // game again, so the backfill picks it up on its next pass.
+    if (maxSize <= 0) {
+        q.exec(QStringLiteral("DELETE FROM body_skipped"));
+    } else {
+        q.prepare(QStringLiteral("DELETE FROM body_skipped WHERE size <= ?"));
+        q.addBindValue(maxSize);
+        q.exec();
+    }
+    return q.numRowsAffected();
 }
 
 QByteArray MailStore::cachedBody(const QString &folder, qint64 uid)
@@ -460,6 +639,305 @@ QByteArray MailStore::cachedBody(const QString &folder, qint64 uid)
     if (q.exec() && q.next())
         return q.value(0).toByteArray();
     return {};
+}
+
+void MailStore::storeParts(const QString &folder, qint64 uid, const QList<PartRef> &parts)
+{
+    storePartsOn(m_db, scoped(folder), uid, parts);
+}
+
+void MailStore::storePartsOn(QSqlDatabase &db, const QString &key, qint64 uid,
+                             const QList<PartRef> &parts)
+{
+    if (!db.isOpen() || parts.isEmpty())
+        return;
+    QSqlQuery att(db);
+    // The payload row may already exist from another message referencing the
+    // same bytes; only the reference count moves in that case.
+    att.prepare(QStringLiteral(
+        "INSERT INTO attachments (hash, size, stored, codec, refs, last_used)"
+        " VALUES (?, ?, ?, ?, 1, ?)"
+        " ON CONFLICT(hash) DO UPDATE SET refs = refs + 1, last_used = excluded.last_used"));
+    QSqlQuery part(db);
+    part.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO message_parts"
+        " (folder, uid, part_id, hash, filename, mime, encoding) VALUES (?, ?, ?, ?, ?, ?, ?)"));
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    for (const PartRef &p : parts) {
+        att.addBindValue(p.hash);
+        att.addBindValue(p.size);
+        att.addBindValue(p.stored);
+        att.addBindValue(p.codec);
+        att.addBindValue(now);
+        att.exec();
+        part.addBindValue(key);
+        part.addBindValue(uid);
+        part.addBindValue(p.partId);
+        part.addBindValue(p.hash);
+        part.addBindValue(p.filename);
+        part.addBindValue(p.mime);
+        part.addBindValue(QString()); // encoding: payloads are stored decoded
+        part.exec();
+    }
+}
+
+QList<MailStore::PartRef> MailStore::partsFor(const QString &folder, qint64 uid)
+{
+    QList<PartRef> out;
+    if (!m_db.isOpen())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT p.part_id, p.hash, p.filename, p.mime, a.size, a.stored, a.codec"
+        " FROM message_parts p LEFT JOIN attachments a ON a.hash = p.hash"
+        " WHERE p.folder = ? AND p.uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    if (!q.exec())
+        return out;
+    while (q.next()) {
+        PartRef p;
+        p.partId = q.value(0).toString();
+        p.hash = q.value(1).toString();
+        p.filename = q.value(2).toString();
+        p.mime = q.value(3).toString();
+        p.size = q.value(4).toLongLong();
+        p.stored = q.value(5).toLongLong();
+        p.codec = q.value(6).toInt();
+        out.append(p);
+    }
+    return out;
+}
+
+qint64 MailStore::releaseParts(const QString &scopedFolder, const QList<qint64> &uids)
+{
+    return releasePartsOn(m_db, scopedFolder, uids);
+}
+
+qint64 MailStore::releasePartsOn(QSqlDatabase &db, const QString &scopedFolder,
+                                 const QList<qint64> &uids)
+{
+    if (!db.isOpen() || uids.isEmpty())
+        return 0;
+    QStringList uidList;
+    uidList.reserve(uids.size());
+    for (qint64 u : uids)
+        uidList << QString::number(u);
+    const QString uidIn = uidList.join(QLatin1Char(','));
+
+    // Which payloads do these messages reference, and how many times?
+    QHash<QString, int> releasing;
+    {
+        QSqlQuery q(db);
+        q.prepare(QStringLiteral("SELECT hash FROM message_parts"
+                                 " WHERE folder = ? AND uid IN (%1)")
+                      .arg(uidIn));
+        q.addBindValue(scopedFolder);
+        if (q.exec()) {
+            while (q.next())
+                releasing[q.value(0).toString()] += 1;
+        }
+    }
+    if (releasing.isEmpty())
+        return 0;
+
+    QSqlQuery del(db);
+    del.prepare(QStringLiteral("DELETE FROM message_parts WHERE folder = ? AND uid IN (%1)")
+                    .arg(uidIn));
+    del.addBindValue(scopedFolder);
+    del.exec();
+
+    qint64 freed = 0;
+    QSqlQuery dec(db);
+    dec.prepare(QStringLiteral("UPDATE attachments SET refs = refs - ? WHERE hash = ?"));
+    QSqlQuery look(db);
+    look.prepare(QStringLiteral("SELECT refs, stored FROM attachments WHERE hash = ?"));
+    QSqlQuery drop(db);
+    drop.prepare(QStringLiteral("DELETE FROM attachments WHERE hash = ?"));
+    for (auto it = releasing.cbegin(); it != releasing.cend(); ++it) {
+        dec.addBindValue(it.value());
+        dec.addBindValue(it.key());
+        dec.exec();
+        look.addBindValue(it.key());
+        if (!look.exec() || !look.next())
+            continue;
+        if (look.value(0).toLongLong() > 0)
+            continue; // still referenced by another message
+        freed += look.value(1).toLongLong();
+        drop.addBindValue(it.key());
+        drop.exec();
+        AttachmentStore::remove(it.key());
+    }
+    return freed;
+}
+
+qint64 MailStore::attachmentBytes()
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    if (!q.exec(QStringLiteral("SELECT IFNULL(SUM(stored), 0) FROM attachments")) || !q.next())
+        return 0;
+    return q.value(0).toLongLong();
+}
+
+bool MailStore::attachmentMigrationPending()
+{
+    return m_db.isOpen() && !migrationDone(m_db, QStringLiteral("attach_migrate1"));
+}
+
+int MailStore::migrateAttachmentsChunk(
+    QSqlDatabase &db, qint64 &cursor, int limit, qint64 &bytesSaved,
+    const std::function<QByteArray(const QByteArray &, QList<PartRef> *)> &splitFn)
+{
+    if (!db.isOpen() || limit <= 0)
+        return 0;
+    // Keyset pagination by rowid: OFFSET would re-walk the whole table on
+    // every chunk, and rows are being rewritten underneath us as we go.
+    struct Row {
+        qint64 rowid;
+        QString folder;
+        qint64 uid;
+        QByteArray raw;
+    };
+    QList<Row> rows;
+    {
+        QSqlQuery q(db);
+        q.prepare(QStringLiteral(
+            "SELECT rowid, folder, uid, raw FROM bodies WHERE rowid > ?"
+            " ORDER BY rowid LIMIT ?"));
+        q.addBindValue(cursor);
+        q.addBindValue(limit);
+        if (!q.exec())
+            return 0;
+        while (q.next())
+            rows.append({q.value(0).toLongLong(), q.value(1).toString(),
+                         q.value(2).toLongLong(), q.value(3).toByteArray()});
+    }
+    if (rows.isEmpty())
+        return 0;
+
+    db.transaction();
+    QSqlQuery upd(db);
+    upd.prepare(QStringLiteral("UPDATE bodies SET raw = ? WHERE rowid = ?"));
+    for (const Row &row : rows) {
+        cursor = row.rowid;
+        QList<PartRef> parts;
+        const QByteArray stub = splitFn(row.raw, &parts);
+        if (parts.isEmpty())
+            continue; // nothing big enough to lift out
+        bytesSaved += row.raw.size() - stub.size();
+        upd.addBindValue(stub);
+        upd.addBindValue(row.rowid);
+        upd.exec();
+        storePartsOn(db, row.folder, row.uid, parts);
+    }
+    QSqlQuery cur(db);
+    cur.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO meta_values (key, value) VALUES ('attach_migrate_cursor', ?)"));
+    cur.addBindValue(QString::number(cursor));
+    cur.exec();
+    if (!db.commit())
+        db.rollback();
+    return rows.size();
+}
+
+void MailStore::finishAttachmentMigration(QSqlDatabase &db)
+{
+    markMigrationDone(db, QStringLiteral("attach_migrate1"));
+}
+
+int MailStore::sweepOrphanAttachments()
+{
+    if (!m_db.isOpen())
+        return 0;
+    const QStringList onDisk = AttachmentStore::allHashes();
+    if (onDisk.isEmpty())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT 1 FROM attachments WHERE hash = ?"));
+    int removed = 0;
+    for (const QString &hash : onDisk) {
+        q.addBindValue(hash);
+        if (q.exec() && q.next())
+            continue; // known payload
+        if (AttachmentStore::remove(hash))
+            ++removed;
+    }
+    return removed;
+}
+
+QSqlDatabase MailStore::openWorkerConnection(const QString &name)
+{
+    QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+    db.setDatabaseName(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                       + QStringLiteral("/mailo.db"));
+    if (!db.open()) {
+        qWarning() << "mailstore: worker connection failed:" << db.lastError().text();
+        return {};
+    }
+    QSqlQuery pragma(db);
+    // Several connections write now; each must wait rather than fail.
+    pragma.exec(QStringLiteral("PRAGMA busy_timeout=15000"));
+    return db;
+}
+
+void MailStore::writeBodiesOn(QSqlDatabase &db, const QList<BodyWrite> &batch)
+{
+    if (!db.isOpen() || batch.isEmpty())
+        return;
+    db.transaction();
+    QSqlQuery body(db);
+    body.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO bodies (folder, uid, raw) VALUES (?, ?, ?)"));
+    QSqlQuery del(db);
+    del.prepare(QStringLiteral(
+        "DELETE FROM fts WHERE rowid ="
+        " (SELECT rowid FROM messages WHERE folder = ? AND uid = ?)"));
+    QSqlQuery ins(db);
+    ins.prepare(QStringLiteral(
+        "INSERT INTO fts (rowid, subject, sender, body, folder, uid)"
+        " SELECT rowid, subject, sender, ?, folder, uid FROM messages"
+        " WHERE folder = ? AND uid = ?"));
+    QSqlQuery done(db);
+    done.prepare(QStringLiteral("DELETE FROM fts_pending WHERE folder = ? AND uid = ?"));
+    for (const BodyWrite &w : batch) {
+        body.addBindValue(w.scopedFolder);
+        body.addBindValue(w.uid);
+        body.addBindValue(w.raw);
+        body.exec();
+        del.addBindValue(w.scopedFolder);
+        del.addBindValue(w.uid);
+        del.exec();
+        ins.addBindValue(w.indexText);
+        ins.addBindValue(w.scopedFolder);
+        ins.addBindValue(w.uid);
+        ins.exec();
+        done.addBindValue(w.scopedFolder);
+        done.addBindValue(w.uid);
+        done.exec();
+        // Part rows share the stub's transaction: a payload file with no row
+        // is recoverable (the orphan sweep deletes it), a row with no file is
+        // not — the message would read back with an empty attachment.
+        storePartsOn(db, w.scopedFolder, w.uid, w.parts);
+    }
+    if (!db.commit())
+        db.rollback();
+}
+
+void MailStore::removeBodyOnly(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen())
+        return;
+    const QString key = scoped(folder);
+    m_db.transaction();
+    releasePartsOn(m_db, key, {uid});
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM bodies WHERE folder = ? AND uid = ?"));
+    q.addBindValue(key);
+    q.addBindValue(uid);
+    q.exec();
+    m_db.commit();
 }
 
 void MailStore::storeBody(const QString &folder, qint64 uid, const QByteArray &raw,
@@ -566,12 +1044,54 @@ void MailStore::finishBodyIndex(const QString &scopedFolder, qint64 uid,
     m_db.commit();
 }
 
+void MailStore::finishBodyIndexBatch(
+    const QList<std::tuple<QString, qint64, QString>> &entries)
+{
+    if (!m_db.isOpen() || entries.isEmpty())
+        return;
+    SlowGuard guard("finishBodyIndexBatch");
+    // One transaction for the whole batch. Per-message commits meant one fsync
+    // per cached body — 122k of them on a full index rebuild.
+    m_db.transaction();
+    QSqlQuery del(m_db);
+    del.prepare(QStringLiteral(
+        "DELETE FROM fts WHERE rowid ="
+        " (SELECT rowid FROM messages WHERE folder = ? AND uid = ?)"));
+    QSqlQuery ins(m_db);
+    ins.prepare(QStringLiteral(
+        "INSERT INTO fts (rowid, subject, sender, body, folder, uid)"
+        " SELECT rowid, IFNULL(subject, ''), IFNULL(sender, ''), ?, folder, uid"
+        " FROM messages WHERE folder = ? AND uid = ?"));
+    QSqlQuery done(m_db);
+    done.prepare(QStringLiteral("DELETE FROM fts_pending WHERE folder = ? AND uid = ?"));
+    for (const auto &entry : entries) {
+        const QString &folder = std::get<0>(entry);
+        const qint64 uid = std::get<1>(entry);
+        if (m_ftsAvailable) {
+            del.addBindValue(folder);
+            del.addBindValue(uid);
+            del.exec();
+            ins.addBindValue(std::get<2>(entry));
+            ins.addBindValue(folder);
+            ins.addBindValue(uid);
+            ins.exec();
+        }
+        done.addBindValue(folder);
+        done.addBindValue(uid);
+        done.exec();
+    }
+    m_db.commit();
+}
+
 void MailStore::removeMessages(const QString &folder, const QList<qint64> &uids)
 {
     if (!m_db.isOpen() || uids.isEmpty())
         return;
     SlowGuard guard("removeMessages");
     m_db.transaction();
+    // Give back the attachment references first: once the part rows are gone
+    // the payloads on disk would have no way of ever being freed.
+    releaseParts(scoped(folder), uids);
     // fts first (rowid-keyed via messages, which must still exist), then the
     // regular tables.
     if (m_ftsAvailable) {
@@ -630,6 +1150,19 @@ void MailStore::clearFolder(const QString &folder)
     SlowGuard guard("clearFolder");
     m_db.transaction();
     QSqlQuery q(m_db);
+    // Attachment payloads are refcounted, so the folder's references have to
+    // be given back before its part rows go — otherwise the files leak.
+    {
+        QList<qint64> uids;
+        QSqlQuery pick(m_db);
+        pick.prepare(QStringLiteral("SELECT uid FROM message_parts WHERE folder = ?"));
+        pick.addBindValue(scoped(folder));
+        if (pick.exec()) {
+            while (pick.next())
+                uids.append(pick.value(0).toLongLong());
+        }
+        releaseParts(scoped(folder), uids);
+    }
     // fts first: its rows are found via messages rowids, so the messages
     // rows must still be there.
     if (m_ftsAvailable) {
@@ -645,6 +1178,157 @@ void MailStore::clearFolder(const QString &folder)
         q.exec();
     }
     m_db.commit();
+}
+
+int MailStore::purgeChunkOn(QSqlDatabase &db, const QString &key, int limit)
+{
+    if (!db.isOpen() || key.isEmpty() || limit <= 0)
+        return 0;
+
+    // Take one chunk of rowids up front: fts is keyed by messages.rowid, so
+    // every delete below is driven by the same fixed set and the three tables
+    // cannot drift apart if a later statement fails.
+    QList<qint64> rowids;
+    QList<qint64> uids;
+    {
+        QSqlQuery pick(db);
+        pick.prepare(QStringLiteral(
+            "SELECT rowid, uid FROM messages WHERE folder = ? LIMIT ?"));
+        pick.addBindValue(key);
+        pick.addBindValue(limit);
+        if (pick.exec()) {
+            while (pick.next()) {
+                rowids.append(pick.value(0).toLongLong());
+                uids.append(pick.value(1).toLongLong());
+            }
+        }
+    }
+
+    if (rowids.isEmpty()) {
+        // Headers are gone; sweep any bodies left behind (a body can outlive
+        // its header if a previous purge was interrupted between the two).
+        QSqlQuery rest(db);
+        rest.prepare(QStringLiteral(
+            "DELETE FROM bodies WHERE rowid IN"
+            " (SELECT rowid FROM bodies WHERE folder = ? LIMIT ?)"));
+        rest.addBindValue(key);
+        rest.addBindValue(limit);
+        return (rest.exec() ? rest.numRowsAffected() : 0);
+    }
+
+    QStringList rowList;
+    rowList.reserve(rowids.size());
+    for (qint64 r : std::as_const(rowids))
+        rowList << QString::number(r);
+    QStringList uidList;
+    uidList.reserve(uids.size());
+    for (qint64 u : std::as_const(uids))
+        uidList << QString::number(u);
+    // Numeric ids straight from SQL — no user input, so inlining them (rather
+    // than binding N placeholders) is safe and keeps this to three statements.
+    const QString rowIn = rowList.join(QLatin1Char(','));
+    const QString uidIn = uidList.join(QLatin1Char(','));
+
+    db.transaction();
+    // Hand back this chunk's attachment references before its rows go, or the
+    // payload files would be orphaned with no row left to free them.
+    releasePartsOn(db, key, uids);
+    QSqlQuery q(db);
+    // fts may be absent on a build without FTS5; the DELETE then simply fails.
+    q.exec(QStringLiteral("DELETE FROM fts WHERE rowid IN (%1)").arg(rowIn));
+    q.prepare(QStringLiteral("DELETE FROM fts_pending WHERE folder = ? AND uid IN (%1)")
+                  .arg(uidIn));
+    q.addBindValue(key);
+    q.exec();
+    q.prepare(QStringLiteral("DELETE FROM bodies WHERE folder = ? AND uid IN (%1)").arg(uidIn));
+    q.addBindValue(key);
+    q.exec();
+    q.exec(QStringLiteral("DELETE FROM messages WHERE rowid IN (%1)").arg(rowIn));
+    const int removed = q.numRowsAffected();
+    if (!db.commit()) {
+        db.rollback();
+        return 0;
+    }
+    return removed > 0 ? removed : rowids.size();
+}
+
+void MailStore::purgeFolder(const QString &scopedFolder, const QAtomicInt &cancel,
+                            const std::function<void(int)> &progress)
+{
+    const QString name = QStringLiteral("mailstore-purge");
+    int total = 0;
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+        db.setDatabaseName(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                           + QStringLiteral("/mailo.db"));
+        if (db.open()) {
+            QSqlQuery pragma(db);
+            // The GUI thread is the other writer. Chunks are small enough that
+            // it never waits long, but it must be willing to wait at all.
+            pragma.exec(QStringLiteral("PRAGMA busy_timeout=15000"));
+            // 100 rows keeps a single write-lock hold to a few ms, so a folder
+            // switch on the GUI thread is never stuck behind this.
+            while (!cancel.loadRelaxed()) {
+                const int removed = purgeChunkOn(db, scopedFolder, 100);
+                if (removed <= 0)
+                    break;
+                total += removed;
+                if (progress)
+                    progress(total);
+                // Yield the write lock between chunks — without this the purge
+                // would hold it back-to-back and starve the GUI thread.
+                QThread::msleep(20);
+            }
+            db.close();
+        }
+    }
+    QSqlDatabase::removeDatabase(name);
+}
+
+qint64 MailStore::databaseBytes() const
+{
+    return m_db.isOpen() ? QFileInfo(m_db.databaseName()).size() : 0;
+}
+
+qint64 MailStore::reclaimableBytes()
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    if (!q.exec(QStringLiteral("SELECT * FROM pragma_freelist_count(), pragma_page_size()"))
+        || !q.next())
+        return 0;
+    return q.value(0).toLongLong() * q.value(1).toLongLong();
+}
+
+bool MailStore::vacuum(QString *error)
+{
+    // Its own connection, so this can run on a worker thread while the GUI
+    // thread's "mailstore" connection stays put. The connection name is unique
+    // per call — a stale one left by a previous failed run would be reused
+    // with the wrong thread affinity.
+    const QString name = QStringLiteral("mailstore-vacuum");
+    bool ok = false;
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
+        db.setDatabaseName(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                           + QStringLiteral("/mailo.db"));
+        if (!db.open()) {
+            if (error)
+                *error = db.lastError().text();
+        } else {
+            QSqlQuery q(db);
+            // No busy_timeout would make this fail instantly whenever the GUI
+            // thread happens to hold a write lock.
+            q.exec(QStringLiteral("PRAGMA busy_timeout=30000"));
+            ok = q.exec(QStringLiteral("VACUUM"));
+            if (!ok && error)
+                *error = q.lastError().text();
+            db.close();
+        }
+    }
+    QSqlDatabase::removeDatabase(name);
+    return ok;
 }
 
 bool MailStore::headIndicatesAttachment(const QByteArray &head)
@@ -797,6 +1481,7 @@ QList<MessageListModel::Header> MailStore::search(const QString &folder,
             h.suspicious = q.value(5).toBool();
             h.authInfo = q.value(6).toString();
             h.attachKind = q.value(7).toInt();
+            h.colorLabel = q.value(8).toInt();
             out.append(h);
         }
     };
@@ -804,8 +1489,8 @@ QList<MessageListModel::Header> MailStore::search(const QString &folder,
     if (m_ftsAvailable) {
         QSqlQuery q(m_db);
         q.prepare(QStringLiteral(
-            "SELECT m.uid, m.subject, m.sender, m.date, m.seen, m.suspicious, m.auth, m.attach"
-            " FROM messages m JOIN fts f ON m.rowid = f.rowid"
+            "SELECT m.uid, m.subject, m.sender, m.date, m.seen, m.suspicious, m.auth, m.attach,"
+            " m.color FROM messages m JOIN fts f ON m.rowid = f.rowid"
             " WHERE fts MATCH ? AND m.folder = ? ORDER BY m.date DESC LIMIT 200"));
         // Quote as a literal phrase so FTS5 operators in user input can't
         // break it; the trailing * makes it a prefix query, so partial words
@@ -824,7 +1509,7 @@ QList<MessageListModel::Header> MailStore::search(const QString &folder,
     // the token-based FTS index cannot ("gari" inside "hungarian").
     QSqlQuery like(m_db);
     like.prepare(QStringLiteral(
-        "SELECT uid, subject, sender, date, seen, suspicious, auth, attach FROM messages"
+        "SELECT uid, subject, sender, date, seen, suspicious, auth, attach, color FROM messages"
         " WHERE folder = ? AND (subject LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\')"
         " ORDER BY date DESC LIMIT 200"));
     QString escaped = keyword;

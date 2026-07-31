@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
@@ -19,6 +22,13 @@ ColumnLayout {
     /// Forward was clicked for the shown message.
     signal forwardRequested()
 
+    // Reset to the "Select a message" placeholder (e.g. the shown message was
+    // deleted and the list is now empty).
+    function clear() {
+        hasMessage = false
+        web.url = "about:blank"
+    }
+
     function showMessage(subject, from, to, cc, date, bodyUrl, authInfo) {
         subjectLabel.text = subject.length > 0 ? subject : "(no subject)"
         fromLabel.text = from
@@ -28,7 +38,9 @@ ColumnLayout {
         fullAuthInfo = authInfo
         dkimLabel.text = condenseAuth(authInfo)
         hasMessage = true
-        viewMode = "html"
+        // Junk folders open as plain text; the HTML button is the explicit
+        // opt-in to render the (still sandboxed) HTML.
+        viewMode = Mail.junkTextOnly ? "text" : "html"
         web.url = bodyUrl
     }
 
@@ -53,7 +65,7 @@ ColumnLayout {
         columnSpacing: Kirigami.Units.largeSpacing
         rowSpacing: Kirigami.Units.smallSpacing / 2
 
-        QQC2.Label { text: "From:"; opacity: 0.6 }
+        QQC2.Label { text: "From:"; opacity: 0.8 }
         RowLayout {
             Layout.fillWidth: true
             QQC2.Label {
@@ -96,18 +108,18 @@ ColumnLayout {
             }
             QQC2.Label {
                 id: dateLabel
-                opacity: 0.7
+                opacity: 0.8
             }
         }
 
-        QQC2.Label { text: "To:"; opacity: 0.6 }
+        QQC2.Label { text: "To:"; opacity: 0.8 }
         QQC2.Label {
             id: toLabel
             Layout.fillWidth: true
             elide: Text.ElideRight
         }
 
-        QQC2.Label { text: "Cc:"; opacity: 0.6; visible: ccLabel.text.length > 0 }
+        QQC2.Label { text: "Cc:"; opacity: 0.8; visible: ccLabel.text.length > 0 }
         QQC2.Label {
             id: ccLabel
             Layout.fillWidth: true
@@ -115,7 +127,7 @@ ColumnLayout {
             visible: text.length > 0
         }
 
-        QQC2.Label { text: "Subject:"; opacity: 0.6 }
+        QQC2.Label { text: "Subject:"; opacity: 0.8 }
         RowLayout {
             Layout.fillWidth: true
             spacing: Kirigami.Units.smallSpacing
@@ -158,6 +170,16 @@ ColumnLayout {
             QQC2.ToolTip.visible: dkimHover.hovered && viewer.fullAuthInfo.length > 0
             HoverHandler { id: dkimHover }
         }
+    }
+
+    Kirigami.InlineMessage {
+        Layout.fillWidth: true
+        Layout.leftMargin: Kirigami.Units.largeSpacing
+        Layout.rightMargin: Kirigami.Units.largeSpacing
+        Layout.bottomMargin: Kirigami.Units.smallSpacing
+        visible: viewer.hasMessage && Mail.junkTextOnly && viewer.viewMode === "text"
+        type: Kirigami.MessageType.Warning
+        text: "Spam folder — showing plain text for safety. Click HTML above to render this message anyway."
     }
 
     Kirigami.Separator {

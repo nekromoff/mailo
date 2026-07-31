@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
@@ -19,7 +22,7 @@ QQC2.Dialog {
     /// The window's persisted UI settings object (set by Main.qml).
     property var ui
 
-    /// 0 = Accounts, 1 = General, 2 = Look (UI)
+    /// 0 = Accounts, 1 = General, 2 = Look (UI), 3 = Shortcuts
     property int page: 0
 
     /// Account being edited; -1 = creating a new one.
@@ -37,6 +40,7 @@ QQC2.Dialog {
         smtpSecurityBox.currentIndex = d.smtpSecurity ?? 1
         authBox.currentIndex = d.authType ?? 0
         signatureEdit.text = d.signature ?? ""
+        htmlMailBox.checked = d.htmlMail ?? true
     }
 
     onOpened: {
@@ -69,7 +73,8 @@ QQC2.Dialog {
             smtpPort: presets.smtpPort,
             smtpSecurity: presets.smtpSecurity,
             authType: authBox.currentIndex,
-            signature: signatureEdit.text
+            signature: signatureEdit.text,
+            htmlMail: htmlMailBox.checked
         })
     }
 
@@ -131,6 +136,12 @@ QQC2.Dialog {
         }
     }
 
+    ColorDialog {
+        id: scaleColorDialog
+        property int scaleIndex: 0
+        onAccepted: sheet.ui["scaleColor" + scaleIndex] = selectedColor.toString()
+    }
+
     contentItem: RowLayout {
         spacing: Kirigami.Units.largeSpacing
 
@@ -160,6 +171,20 @@ QQC2.Dialog {
                 icon.name: "preferences-desktop-theme"
                 highlighted: sheet.page === 2
                 onClicked: sheet.page = 2
+            }
+            QQC2.ItemDelegate {
+                Layout.fillWidth: true
+                text: "Shortcuts"
+                icon.name: "input-keyboard"
+                highlighted: sheet.page === 3
+                onClicked: sheet.page = 3
+            }
+            QQC2.ItemDelegate {
+                Layout.fillWidth: true
+                text: "About"
+                icon.name: "help-about"
+                highlighted: sheet.page === 4
+                onClicked: sheet.page = 4
             }
         }
 
@@ -332,6 +357,26 @@ QQC2.Dialog {
             }
 
             Kirigami.Separator {
+                Kirigami.FormData.label: "Composing"
+                Kirigami.FormData.isSection: true
+            }
+            QQC2.CheckBox {
+                id: htmlMailBox
+                Kirigami.FormData.label: "Message format:"
+                text: "Send HTML mail"
+                checked: true
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "HTML mail carries a plain-text version alongside, so every "
+                      + "recipient can read it. Untick to send plain text only."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            Kirigami.Separator {
                 Kirigami.FormData.label: "Signature"
                 Kirigami.FormData.isSection: true
             }
@@ -391,7 +436,7 @@ QQC2.Dialog {
                     text: "Added automatically to every new message, reply and "
                           + "forward from this account — above the quoted mail."
                     wrapMode: Text.Wrap
-                    opacity: 0.6
+                    opacity: 0.8
                     font.pointSize: Kirigami.Theme.smallFont.pointSize
                 }
             }
@@ -431,7 +476,7 @@ QQC2.Dialog {
                 text: "Checks the open folder for new mail on this schedule when "
                       + "real-time push (IMAP IDLE) is not active. 0 turns it off."
                 wrapMode: Text.Wrap
-                opacity: 0.6
+                opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
 
@@ -456,7 +501,108 @@ QQC2.Dialog {
                 text: "Used for message dates in the list and the reading pane. "
                       + "Messages from today show only their time."
                 wrapMode: Text.Wrap
-                opacity: 0.6
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Storage"
+                Kirigami.FormData.isSection: true
+            }
+            QQC2.TextField {
+                id: maxBodyField
+                Kirigami.FormData.label: "Don't cache messages over (MB):"
+                implicitWidth: Kirigami.Units.gridUnit * 4
+                text: Mail.maxBodyMB
+                validator: IntValidator { bottom: 0; top: 1024 }
+                onTextEdited: {
+                    if (acceptableInput)
+                        Mail.maxBodyMB = parseInt(text)
+                }
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Messages larger than this are still opened normally, they "
+                      + "are just never stored for offline use — a few big "
+                      + "attachments can otherwise outweigh thousands of normal "
+                      + "messages. 0 caches everything. Raising the limit makes "
+                      + "previously skipped messages eligible again."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            RowLayout {
+                Kirigami.FormData.label: "Offline cache:"
+                spacing: Kirigami.Units.smallSpacing
+                QQC2.Label {
+                    id: cacheSizeLabel
+                    // Re-read on open rather than polling: the figure only
+                    // moves when a purge or a vacuum has run.
+                    text: Mail.cacheSizeText()
+                    // Read at the same moments as the text, so the button
+                    // below agrees with the figure beside it.
+                    property bool worthwhile: Mail.reclaimWorthwhile()
+                }
+                QQC2.BusyIndicator {
+                    running: Mail.reclaiming
+                    visible: running
+                    implicitWidth: Kirigami.Units.gridUnit
+                    implicitHeight: Kirigami.Units.gridUnit
+                }
+            }
+            QQC2.Button {
+                Kirigami.FormData.label: ""
+                text: cacheSizeLabel.worthwhile ? "Reclaim disk space"
+                                               : "Nothing to reclaim"
+                enabled: !Mail.reclaiming && cacheSizeLabel.worthwhile
+                // Close Settings first: the progress dialog is modal over the
+                // main window, and leaving this one open would stack two modals.
+                onClicked: {
+                    sheet.close()
+                    Mail.reclaimDiskSpace()
+                }
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Deleting cached mail frees space inside the cache file but "
+                      + "does not shrink it. This rebuilds the file to give that "
+                      + "space back to the disk. It takes several minutes on a "
+                      + "large cache and pauses syncing while it runs."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            Connections {
+                target: Mail
+                function onReclaimingChanged() {
+                    if (!Mail.reclaiming) {
+                        cacheSizeLabel.text = Mail.cacheSizeText()
+                        cacheSizeLabel.worthwhile = Mail.reclaimWorthwhile()
+                    }
+                }
+            }
+
+            // Last on the page: troubleshooting, not something anyone sets on
+            // the way to somewhere else.
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Diagnostics"
+                Kirigami.FormData.isSection: true
+            }
+            QQC2.CheckBox {
+                Kirigami.FormData.label: "Log activity to console:"
+                checked: Mail.debugLogging
+                onToggled: Mail.debugLogging = checked
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Prints folder, account and sync activity to the terminal "
+                      + "mailo was started from. Useful when reporting a bug; "
+                      + "takes effect immediately, no restart needed."
+                wrapMode: Text.Wrap
+                opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
         }
@@ -527,11 +673,242 @@ QQC2.Dialog {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 text: "Applies to the interface panels. Changes take effect immediately."
-                opacity: 0.6
+                opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
         }
         } // look ScrollView
+
+        // --- Page 3: Shortcuts ---
+        QQC2.ScrollView {
+            id: shortcutsScroll
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            contentWidth: availableWidth
+            clip: true
+
+        Kirigami.FormLayout {
+            id: shortcutsForm
+            width: shortcutsScroll.availableWidth
+
+            /// Human/QKeySequence-style string for a captured key press,
+            /// or "" when the pressed key cannot stand alone as a shortcut.
+            function sequenceFromEvent(event) {
+                let s = ""
+                if (event.modifiers & Qt.ControlModifier) s += "Ctrl+"
+                if (event.modifiers & Qt.AltModifier) s += "Alt+"
+                if (event.modifiers & Qt.ShiftModifier) s += "Shift+"
+                if (event.modifiers & Qt.MetaModifier) s += "Meta+"
+                const named = {}
+                named[Qt.Key_Delete] = "Del"
+                named[Qt.Key_Backspace] = "Backspace"
+                named[Qt.Key_Space] = "Space"
+                named[Qt.Key_Insert] = "Ins"
+                named[Qt.Key_Home] = "Home"
+                named[Qt.Key_End] = "End"
+                if (event.key in named)
+                    return s + named[event.key]
+                if (event.key >= Qt.Key_F1 && event.key <= Qt.Key_F12)
+                    return s + "F" + (event.key - Qt.Key_F1 + 1)
+                if ((event.key >= Qt.Key_A && event.key <= Qt.Key_Z)
+                        || (event.key >= Qt.Key_0 && event.key <= Qt.Key_9))
+                    return s + String.fromCharCode(event.key)
+                return ""
+            }
+
+            Repeater {
+                model: [
+                    {label: "Select message:", key: "shortcutSelect", def: "Ins"},
+                    {label: "Delete message:", key: "shortcutDelete", def: "Del"},
+                    {label: "Classify as junk:", key: "shortcutJunk", def: "J"},
+                    {label: "Compose:", key: "shortcutCompose", def: "C"},
+                    {label: "Reply:", key: "shortcutReply", def: "R"},
+                    {label: "Forward:", key: "shortcutForward", def: "F"},
+                    {label: "Attach file:", key: "shortcutAttach", def: "Ctrl+Shift+A"},
+                    {label: "Send message:", key: "shortcutSend", def: "Ctrl+Return"}
+                ]
+                RowLayout {
+                    required property var modelData
+                    Kirigami.FormData.label: modelData.label
+                    spacing: Kirigami.Units.smallSpacing
+
+                    QQC2.Button {
+                        id: captureButton
+                        property bool capturing: false
+                        implicitWidth: Kirigami.Units.gridUnit * 8
+                        text: capturing ? "Press keys…"
+                                        : (sheet.ui ? sheet.ui[modelData.key]
+                                                    : modelData.def)
+                        icon.name: capturing ? "input-keyboard" : ""
+                        onClicked: {
+                            capturing = true
+                            forceActiveFocus()
+                        }
+                        onActiveFocusChanged: {
+                            if (!activeFocus)
+                                capturing = false
+                        }
+                        Keys.onPressed: event => {
+                            if (!capturing)
+                                return
+                            event.accepted = true
+                            // Wait for a real key — a held modifier is not
+                            // a shortcut on its own.
+                            if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift
+                                    || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta)
+                                return
+                            if (event.key === Qt.Key_Escape) {
+                                capturing = false
+                                return
+                            }
+                            const seq = shortcutsForm.sequenceFromEvent(event)
+                            if (seq !== "") {
+                                sheet.ui[modelData.key] = seq
+                                capturing = false
+                            }
+                        }
+                    }
+                    QQC2.Button {
+                        icon.name: "edit-clear"
+                        QQC2.ToolTip.text: "Reset to default (" + modelData.def + ")"
+                        QQC2.ToolTip.visible: hovered
+                        onClicked: sheet.ui[modelData.key] = modelData.def
+                    }
+                }
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Click a shortcut, then press the new key or combination "
+                      + "(Esc cancels). Shortcuts act in the mail and folder "
+                      + "lists and apply immediately."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Color scale"
+                Kirigami.FormData.isSection: true
+            }
+            Repeater {
+                model: [1, 2, 3, 4, 5]
+                RowLayout {
+                    id: scaleRow
+                    required property int modelData
+                    readonly property string keyProp: "scaleKey" + modelData
+                    readonly property string colorProp: "scaleColor" + modelData
+                    Kirigami.FormData.label: "Scale " + modelData + ":"
+                    spacing: Kirigami.Units.smallSpacing
+
+                    QQC2.Button {
+                        id: scaleCapture
+                        property bool capturing: false
+                        implicitWidth: Kirigami.Units.gridUnit * 8
+                        text: capturing ? "Press keys…"
+                                        : (sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
+                                           ? sheet.ui[scaleRow.keyProp] : "None")
+                        icon.name: capturing ? "input-keyboard" : ""
+                        onClicked: {
+                            capturing = true
+                            forceActiveFocus()
+                        }
+                        onActiveFocusChanged: {
+                            if (!activeFocus)
+                                capturing = false
+                        }
+                        Keys.onPressed: event => {
+                            if (!capturing)
+                                return
+                            event.accepted = true
+                            if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift
+                                    || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta)
+                                return
+                            if (event.key === Qt.Key_Escape) {
+                                capturing = false
+                                return
+                            }
+                            const seq = shortcutsForm.sequenceFromEvent(event)
+                            if (seq !== "") {
+                                sheet.ui[scaleRow.keyProp] = seq
+                                capturing = false
+                            }
+                        }
+                    }
+                    QQC2.Button {
+                        icon.name: "edit-clear"
+                        enabled: sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
+                        QQC2.ToolTip.text: "Clear shortcut"
+                        QQC2.ToolTip.visible: hovered
+                        onClicked: sheet.ui[scaleRow.keyProp] = ""
+                    }
+                    Rectangle { // swatch; hatched look when undefined
+                        width: Kirigami.Units.gridUnit * 1.2
+                        height: width
+                        radius: 3
+                        color: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
+                               ? sheet.ui[scaleRow.colorProp] : "transparent"
+                        border.color: Kirigami.Theme.textColor
+                        border.width: 1
+                        QQC2.Label {
+                            anchors.centerIn: parent
+                            visible: !sheet.ui || sheet.ui[scaleRow.colorProp] === ""
+                            text: "?"
+                            opacity: 0.8
+                        }
+                    }
+                    QQC2.Button {
+                        text: "Pick…"
+                        icon.name: "color-picker"
+                        onClicked: {
+                            scaleColorDialog.scaleIndex = scaleRow.modelData
+                            scaleColorDialog.selectedColor =
+                                sheet.ui[scaleRow.colorProp] !== ""
+                                    ? sheet.ui[scaleRow.colorProp]
+                                    : Kirigami.Theme.textColor
+                            scaleColorDialog.open()
+                        }
+                    }
+                    QQC2.Button {
+                        icon.name: "edit-clear"
+                        enabled: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
+                        QQC2.ToolTip.text: "Clear color"
+                        QQC2.ToolTip.visible: hovered
+                        onClicked: sheet.ui[scaleRow.colorProp] = ""
+                    }
+                }
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Pressing a scale shortcut marks the selected messages "
+                      + "with that color (press again to clear the mark). "
+                      + "Defined colors appear next to the search bar as a "
+                      + "quick filter."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+        }
+        } // shortcuts ScrollView
+
+        // --- Page 4: About ---
+        QQC2.ScrollView {
+            id: aboutScroll
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            contentWidth: availableWidth
+            clip: true
+
+            QQC2.Label {
+                width: aboutScroll.availableWidth
+                // Compiled into the binary from ABOUT.md at build time.
+                text: Mail.aboutText
+                textFormat: Text.MarkdownText
+                wrapMode: Text.Wrap
+                onLinkActivated: link => Mail.openExternalUrl(link)
+            }
+        } // about ScrollView
         } // StackLayout
     }
 }

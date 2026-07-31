@@ -2,6 +2,8 @@
 
 A fast, security-minded IMAP mail client for the KDE desktop.
 
+(c) 2026 Daniel Duris, dusoft@staznosti.sk
+
 ## What it does
 
 - **IMAP mail reading** — connect to any IMAP server (SSL/TLS, STARTTLS, or plain),

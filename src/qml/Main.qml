@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 import QtCore
 import QtQuick
 import QtQuick.Controls as QQC2
@@ -8,8 +11,46 @@ import Mailo.Core
 Kirigami.ApplicationWindow {
     id: root
     title: "Mailo"
-    width: 1200
-    height: 760
+    width: windowSettings.width
+    height: windowSettings.height
+
+    // Last window geometry; restored at startup, captured on close.
+    Settings {
+        id: windowSettings
+        category: "window"
+        property int width: 1200
+        property int height: 760
+        property bool maximized: false
+    }
+    onClosing: close => {
+        // VACUUM cannot be interrupted and the destructor has to join its
+        // thread — quitting mid-rebuild would look like a hang, so refuse.
+        if (Mail.reclaiming) {
+            close.accepted = false
+            return
+        }
+        windowSettings.maximized = root.visibility === Window.Maximized
+        // Keep the last windowed size — maximized dimensions would make
+        // un-maximizing on the next run a no-op.
+        if (root.visibility === Window.Windowed) {
+            windowSettings.width = root.width
+            windowSettings.height = root.height
+        }
+        // Closing the mail window means quitting. Left to
+        // quitOnLastWindowClosed, the process kept running in its event loop
+        // with nothing on screen — ComposeSheet is a top-level Window of its
+        // own that is created once and kept, so "last window" is not something
+        // to rely on here.
+        Qt.quit()
+    }
+
+    // Same category as the C++ trace, so QT_LOGGING_RULES='mailo.trace.debug=true'
+    // (or the Settings toggle) turns both on together.
+    LoggingCategory {
+        id: traceLog
+        name: "mailo.trace"
+        defaultLogLevel: LoggingCategory.Fatal
+    }
 
     // Persisted UI state (column order, sorting, collapsed account nodes)
     Settings {
@@ -21,6 +62,34 @@ Kirigami.ApplicationWindow {
         property string collapsedAccounts: "[]"
         property int rowDensity: 1     // 0 compact, 1 medium, 2 wide
         property string bgColor: ""    // "" = theme default
+        // Definable shortcuts (Look settings); QKeySequence strings.
+        property string shortcutDelete: "Del"
+        property string shortcutJunk: "J"
+        property string shortcutCompose: "C"
+        property string shortcutReply: "R"
+        property string shortcutForward: "F"
+        property string shortcutSelect: "Ins"
+        // Compose-window shortcuts (full QKeySequence strings with modifiers).
+        property string shortcutAttach: "Ctrl+Shift+A"
+        property string shortcutSend: "Ctrl+Return"
+        // Color scale 1–5: shortcut + color per slot, both "" = undefined.
+        // A slot with a shortcut but no color clears the mark instead.
+        property string scaleKey1: ""
+        property string scaleKey2: ""
+        property string scaleKey3: ""
+        property string scaleKey4: ""
+        property string scaleKey5: ""
+        property string scaleColor1: ""
+        property string scaleColor2: ""
+        property string scaleColor3: ""
+        property string scaleColor4: ""
+        property string scaleColor5: ""
+    }
+
+    // Active color quick filter (0 = off), mirrored to Mail.filterByColor().
+    property int colorFilter: 0
+    function scaleColorOf(i) {
+        return uiSettings["scaleColor" + i]
     }
 
     // Mail-list row height from the density setting
@@ -29,18 +98,88 @@ Kirigami.ApplicationWindow {
     readonly property color panelColor: uiSettings.bgColor !== ""
         ? uiSettings.bgColor : Kirigami.Theme.backgroundColor
 
+    // The definable shortcuts only act while the message list has focus —
+    // they never conflict with typing in search, compose or settings fields.
+    function matchesShortcut(event, seq) {
+        if (!seq)
+            return false
+        const parts = seq.split("+")
+        let mods = 0
+        for (let i = 0; i < parts.length - 1; i++) {
+            const m = parts[i].trim().toLowerCase()
+            if (m === "ctrl") mods |= Qt.ControlModifier
+            else if (m === "shift") mods |= Qt.ShiftModifier
+            else if (m === "alt") mods |= Qt.AltModifier
+            else if (m === "meta") mods |= Qt.MetaModifier
+        }
+        if ((event.modifiers & ~Qt.KeypadModifier) !== mods)
+            return false
+        const keyName = parts[parts.length - 1].trim().toLowerCase()
+        const named = {
+            "del": Qt.Key_Delete, "delete": Qt.Key_Delete,
+            "backspace": Qt.Key_Backspace, "space": Qt.Key_Space,
+            "ins": Qt.Key_Insert, "insert": Qt.Key_Insert,
+            "home": Qt.Key_Home, "end": Qt.Key_End
+        }
+        if (keyName in named)
+            return event.key === named[keyName]
+        if (/^f\d{1,2}$/.test(keyName))
+            return event.key === Qt.Key_F1 + parseInt(keyName.substring(1)) - 1
+        if (keyName.length === 1)
+            return event.key === keyName.toUpperCase().charCodeAt(0)
+        return false
+    }
+
+    function handleMailShortcut(event) {
+        if (matchesShortcut(event, uiSettings.shortcutDelete))
+            messageList.requestDelete()
+        else if (matchesShortcut(event, uiSettings.shortcutJunk))
+            messageList.requestJunk()
+        else if (matchesShortcut(event, uiSettings.shortcutCompose) && Mail.hasAccount)
+            composeSheet().openNew()
+        else if (matchesShortcut(event, uiSettings.shortcutReply) && viewer.hasMessage)
+            composeSheet().openReply(Mail.replyData(false))
+        else if (matchesShortcut(event, uiSettings.shortcutForward) && viewer.hasMessage)
+            composeSheet().openForward(Mail.forwardData())
+        else if (matchesShortcut(event, uiSettings.shortcutSelect))
+            messageList.toggleSelectAndAdvance()
+        else if (!handleScaleShortcut(event))
+            return
+        event.accepted = true
+    }
+
+    // Color-scale shortcuts: mark the selection with the slot's color, or
+    // clear the mark when the slot has no color defined.
+    function handleScaleShortcut(event) {
+        for (let i = 1; i <= 5; i++) {
+            const seq = uiSettings["scaleKey" + i]
+            if (seq !== "" && matchesShortcut(event, seq)) {
+                Mail.markMessageColor(messageList.selectedIndexes(),
+                                      scaleColorOf(i) !== "" ? i : 0)
+                return true
+            }
+        }
+        return false
+    }
+
     Component.onCompleted: {
-        if (Mail.hasAccount)
+        if (windowSettings.maximized)
+            root.showMaximized()
+        if (Mail.hasAccount) {
             Mail.connectAccount()
-        else
-            accountSheet.open()
+            // Keyboard-ready from the start: the list has focus, and
+            // autoSelect() makes the newest message current once it loads.
+            messageList.forceActiveFocus()
+        } else {
+            accountSheet().open()
+        }
     }
 
     Connections {
         target: Mail
-        function onErrorOccurred(message) {
-            root.showPassiveNotification(message, "long")
-        }
+        // Errors are folded into the status breadcrumb (Mail.setStatus), not
+        // shown as passive popups — the status line already carries them, kept
+        // short. No onErrorOccurred handler on purpose.
         function onMessageLoaded(subject, from, to, cc, date, bodyUrl, authInfo) {
             viewer.showMessage(subject, from, to, cc, date, bodyUrl, authInfo)
         }
@@ -54,13 +193,70 @@ Kirigami.ApplicationWindow {
         }
     }
 
-    AccountSheet {
-        id: accountSheet
-        ui: uiSettings
+    // Both of these are built on first use, not at startup. Between them they
+    // were the whole cost of the QML load — AccountSheet instantiates all five
+    // settings pages (a StackLayout builds every child regardless of
+    // currentIndex) and ComposeSheet a full editor window, for UI the user may
+    // never open in a session.
+    // A vacuum holds an exclusive lock on the whole cache for minutes, so the
+    // mailbox genuinely is unavailable while it runs — every folder switch or
+    // fetch would block on the lock. Rather than let the app look hung, say so
+    // and take input away. No buttons: it cannot be cancelled or dismissed.
+    QQC2.Dialog {
+        id: reclaimDialog
+        modal: true
+        closePolicy: QQC2.Popup.NoAutoClose
+        anchors.centerIn: parent
+        parent: root.contentItem
+        title: "Reclaiming disk space"
+        visible: Mail.reclaiming
+        ColumnLayout {
+            spacing: Kirigami.Units.largeSpacing
+            QQC2.Label {
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 20
+                wrapMode: Text.Wrap
+                text: "Rebuilding the mail cache to return free space to the disk.\n\n"
+                      + "Your mail is unavailable until this finishes, and it "
+                      + "cannot be interrupted. This usually takes a few minutes."
+            }
+            QQC2.ProgressBar {
+                Layout.fillWidth: true
+                indeterminate: true
+            }
+        }
     }
 
-    ComposeSheet {
-        id: composeSheet
+    // Created on first use rather than at startup, and kept afterwards. Between
+    // them these were essentially the whole cost of the QML load: AccountSheet
+    // builds all five settings pages (a StackLayout instantiates every child
+    // regardless of currentIndex) and ComposeSheet a full editor window — for
+    // UI that many sessions never open.
+    //
+    // Component + createObject, not a Loader: AccountSheet is a Dialog that
+    // centers itself with anchors.centerIn: parent, so it must be parented to
+    // the window's contentItem exactly as the old declarative form was. A
+    // Loader would make its 0x0 self the parent and the dialog would size and
+    // position against nothing.
+    property var accountDialog: null
+    Component {
+        id: accountComponent
+        AccountSheet { ui: uiSettings }
+    }
+    function accountSheet() {
+        if (!accountDialog)
+            accountDialog = accountComponent.createObject(root.contentItem)
+        return accountDialog
+    }
+
+    property var composeWindow: null
+    Component {
+        id: composeComponent
+        ComposeSheet { ui: uiSettings }
+    }
+    function composeSheet() {
+        if (!composeWindow)
+            composeWindow = composeComponent.createObject(root)
+        return composeWindow
     }
 
     QQC2.Dialog {
@@ -142,15 +338,31 @@ Kirigami.ApplicationWindow {
                 }
             }
             QQC2.Label {
+                id: statusLabel
                 Layout.fillWidth: true
                 text: Mail.statusText
                 elide: Text.ElideRight
-                opacity: 0.7
+                opacity: 0.8
+                // The label elides, so the older crumbs may be off-screen —
+                // right-click copies the full breadcrumb trail, and hovering
+                // shows it in a tooltip.
+                QQC2.ToolTip.text: Mail.statusText
+                QQC2.ToolTip.visible: statusHover.hovered && Mail.statusText.length > 0
+                HoverHandler { id: statusHover }
+                TapHandler {
+                    acceptedButtons: Qt.RightButton
+                    onTapped: {
+                        if (Mail.statusText.length === 0)
+                            return
+                        Mail.copyToClipboard(Mail.statusText)
+                        root.showPassiveNotification("Status copied", "short")
+                    }
+                }
             }
             QQC2.ToolButton {
                 icon.name: "mail-message-new"
                 enabled: Mail.hasAccount
-                onClicked: composeSheet.openNew()
+                onClicked: composeSheet().openNew()
                 QQC2.ToolTip.text: "Compose"
                 QQC2.ToolTip.visible: hovered
             }
@@ -163,7 +375,7 @@ Kirigami.ApplicationWindow {
             }
             QQC2.ToolButton {
                 icon.name: "settings-configure"
-                onClicked: accountSheet.open()
+                onClicked: accountSheet().open()
                 QQC2.ToolTip.text: "Account settings"
                 QQC2.ToolTip.visible: hovered
             }
@@ -273,13 +485,25 @@ Kirigami.ApplicationWindow {
                                             Layout.preferredHeight: Kirigami.Units.iconSizes.small
                                             opacity: 0.6
                                         }
+                                        // Highlight-blue dot marks the active
+                                        // account. The cue is carried by this
+                                        // graphical accent (3:1 bar), not by
+                                        // the text color — the theme highlight
+                                        // blue as text is only ~2.4:1 and fails
+                                        // AA, so the name keeps full-contrast
+                                        // textColor (bold does the rest).
+                                        Rectangle {
+                                            visible: accountSection.isCurrent
+                                            Layout.preferredWidth: Kirigami.Units.smallSpacing * 1.5
+                                            Layout.preferredHeight: Layout.preferredWidth
+                                            radius: width / 2
+                                            color: Kirigami.Theme.highlightColor
+                                        }
                                         QQC2.Label {
                                             Layout.fillWidth: true
                                             text: accountSection.modelData
                                             font.bold: true
-                                            color: accountSection.isCurrent
-                                                   ? Kirigami.Theme.highlightColor
-                                                   : Kirigami.Theme.textColor
+                                            color: Kirigami.Theme.textColor
                                             elide: Text.ElideRight
                                         }
                                     }
@@ -297,6 +521,21 @@ Kirigami.ApplicationWindow {
                                     model: accountSection.isCurrent ? Mail.folderModel : null
                                     keyNavigationEnabled: true
                                     activeFocusOnTab: accountSection.isCurrent
+                                    Keys.onPressed: event => {
+                                        // Arrow keys are the one case where
+                                        // moving the selection should open the
+                                        // folder. Arming the debounce from the
+                                        // key press (rather than from
+                                        // currentIndex changing) means only a
+                                        // real keystroke can ever open one.
+                                        if (event.key === Qt.Key_Up || event.key === Qt.Key_Down
+                                                || event.key === Qt.Key_PageUp
+                                                || event.key === Qt.Key_PageDown
+                                                || event.key === Qt.Key_Home
+                                                || event.key === Qt.Key_End)
+                                            folderOpenDebounce.restart()
+                                        root.handleMailShortcut(event)
+                                    }
 
                                     property bool live: accountSection.isCurrent
                                     onLiveChanged: {
@@ -308,12 +547,69 @@ Kirigami.ApplicationWindow {
                                             folderPane.folderListView = folderList
                                     }
 
+                                    // True while currentIndex is being moved to
+                                    // match the folder that is already open, so
+                                    // the debounce below does not treat that as
+                                    // the user asking to open something.
+                                    property bool syncingIndex: false
+
+                                    // The model is rebuilt on every account
+                                    // switch and folder refresh, which snaps
+                                    // currentIndex back to row 0. Left alone
+                                    // that fired openCurrent() for INBOX and
+                                    // overrode the folder the user had just
+                                    // clicked — including the one an account
+                                    // switch was still in the middle of opening.
+                                    function syncToOpenFolder() {
+                                        if (!live)
+                                            return
+                                        const open = Mail.selectedFolder
+                                        // count === 0 means the model is mid-
+                                        // rebuild; setting an index now would
+                                        // just be undone by the repopulation.
+                                        if (!open || count === 0)
+                                            return
+                                        // Ask the model, not the view: a folder
+                                        // scrolled out of sight has no delegate,
+                                        // so itemAtIndex() returns null for it
+                                        // and the row would never be found.
+                                        const row = Mail.folderModel.rowForMailBox(open)
+                                        if (row < 0 || row === currentIndex)
+                                            return
+                                        syncingIndex = true
+                                        currentIndex = row
+                                        syncingIndex = false
+                                    }
+                                    Connections {
+                                        target: Mail
+                                        function onSelectedFolderChanged() {
+                                            folderList.syncToOpenFolder()
+                                        }
+                                    }
+                                    onCountChanged: {
+                                        console.debug(traceLog, "[qml] count -> " + count
+                                                      + " idx=" + currentIndex
+                                                      + " open=" + Mail.selectedFolder)
+                                        // A repopulated model is never the user
+                                        // asking for a folder — cancel any
+                                        // auto-open the reset index just armed.
+                                        folderOpenDebounce.stop()
+                                        rebuildSettle.restart()
+                                        syncToOpenFolder()
+                                    }
+
                                     function openCurrent() {
-                                        const item = itemAtIndex(currentIndex)
-                                        if (item && item.selectable) {
+                                        // Model-backed, for the same reason as
+                                        // syncToOpenFolder above.
+                                        const mailBox = Mail.folderModel.mailBoxAt(currentIndex)
+                                        console.debug(traceLog, "[qml] openCurrent idx="
+                                                      + currentIndex + " mailBox=" + mailBox
+                                                      + " open=" + Mail.selectedFolder)
+                                        if (mailBox && mailBox !== Mail.selectedFolder
+                                                && Mail.folderModel.selectableAt(currentIndex)) {
                                             messageList.currentIndex = -1
                                             messageList.clearSelection()
-                                            Mail.openFolder(item.mailBox)
+                                            Mail.openFolder(mailBox)
                                         }
                                     }
                                     Keys.onReturnPressed: openCurrent()
@@ -329,9 +625,40 @@ Kirigami.ApplicationWindow {
                                         interval: 300
                                         onTriggered: folderList.openCurrent()
                                     }
+                                    // Deliberately NOT hooked to open a folder.
+                                    // currentIndex moves for reasons that are
+                                    // not the user: a model reset snaps it to
+                                    // 0 or -1, and ListView also re-adjusts it
+                                    // asynchronously while laying out, i.e.
+                                    // after any "I am syncing" flag has been
+                                    // cleared. Auto-opening from here made the
+                                    // selection walk the list opening folders
+                                    // as it went. Only real input opens now:
+                                    // a click on the delegate, Return/Enter, or
+                                    // arrow-key navigation (armed in
+                                    // Keys.onPressed below).
                                     onCurrentIndexChanged: {
-                                        if (currentIndex >= 0)
-                                            folderOpenDebounce.restart()
+                                        console.debug(traceLog, "[qml] currentIndex -> "
+                                                      + currentIndex + " syncing=" + syncingIndex
+                                                      + " open=" + Mail.selectedFolder
+                                                      + " count=" + count)
+                                        // While a rebuild settles, ListView
+                                        // snaps the cursor to row 0 (INBOX) and
+                                        // to -1 before landing. Nothing opens
+                                        // from here any more, so putting it
+                                        // straight back is safe — and stops
+                                        // INBOX drawing as the current item for
+                                        // a frame. Outside that window the
+                                        // cursor is the user's to move.
+                                        if (!syncingIndex && rebuildSettle.running)
+                                            syncToOpenFolder()
+                                    }
+
+                                    // Runs for a moment after any model change;
+                                    // see onCurrentIndexChanged above.
+                                    Timer {
+                                        id: rebuildSettle
+                                        interval: 600
                                     }
 
                                     delegate: QQC2.ItemDelegate {
@@ -355,13 +682,35 @@ Kirigami.ApplicationWindow {
                                         icon.name: folderPane.folderIcon(mailBox)
                                         icon.width: Kirigami.Units.iconSizes.small
                                         icon.height: Kirigami.Units.iconSizes.small
-                                        icon.color: Qt.alpha(Kirigami.Theme.textColor, 0.45)
-                                        highlighted: folderList.currentIndex === index
+                                        icon.color: Qt.alpha(Kirigami.Theme.textColor, 0.55)
+                                        // Follows the folder that is actually
+                                        // open, not the view's cursor. During a
+                                        // model rebuild currentIndex churns
+                                        // through 0 (INBOX) and -1 before
+                                        // settling, which made INBOX flash as
+                                        // selected on every account switch.
+                                        highlighted: folderDelegate.mailBox === Mail.selectedFolder
                                         onClicked: {
                                             if (!selectable) { // container-only folder: toggle instead
                                                 Mail.folderModel.toggleExpanded(index)
                                                 return
                                             }
+                                            // Clicking a folder works its
+                                            // subtree like the arrow does:
+                                            // reveal it, and fold it away again
+                                            // on a second click. "Second" means
+                                            // this folder is already the open
+                                            // one — clicking a different
+                                            // expanded parent to read its mail
+                                            // should not collapse it. Children
+                                            // sort below this row, so index
+                                            // stays valid either way.
+                                            if (hasChildren && expanded
+                                                    && Mail.selectedFolder === mailBox) {
+                                                Mail.folderModel.toggleExpanded(index)
+                                                return // already open; nothing to re-fetch
+                                            }
+                                            Mail.folderModel.expandRow(index)
                                             folderList.currentIndex = index
                                             folderList.forceActiveFocus()
                                             // A click opens right away — drop
@@ -423,7 +772,7 @@ Kirigami.ApplicationWindow {
                                             icon.name: folderPane.folderIcon(modelData.mailBox)
                                             icon.width: Kirigami.Units.iconSizes.small
                                             icon.height: Kirigami.Units.iconSizes.small
-                                            icon.color: Qt.alpha(Kirigami.Theme.textColor, 0.45)
+                                            icon.color: Qt.alpha(Kirigami.Theme.textColor, 0.55)
                                             onClicked: {
                                                 messageList.currentIndex = -1
                                                 messageList.clearSelection()
@@ -461,7 +810,7 @@ Kirigami.ApplicationWindow {
                                         Layout.fillWidth: true
                                         leftPadding: Kirigami.Units.largeSpacing + Kirigami.Units.gridUnit
                                         text: "Not synced yet"
-                                        opacity: 0.5
+                                        opacity: 0.8
                                         elide: Text.ElideRight
                                     }
                                 }
@@ -568,6 +917,43 @@ Kirigami.ApplicationWindow {
                         id: searchFieldBox
                         model: ["Everything", "Subject", "From", "Body"]
                         implicitWidth: Kirigami.Units.gridUnit * 7
+                    }
+
+                    // Quick filter by color mark — one square per defined
+                    // scale color; click filters, click again clears.
+                    Repeater {
+                        model: [1, 2, 3, 4, 5]
+                        Rectangle {
+                            required property int modelData
+                            readonly property string scaleColor:
+                                root.scaleColorOf(modelData)
+                            visible: scaleColor !== ""
+                            width: Kirigami.Units.gridUnit * 1.1
+                            height: width
+                            radius: 3
+                            color: scaleColor !== "" ? scaleColor : "transparent"
+                            border.width: root.colorFilter === modelData ? 2 : 1
+                            border.color: root.colorFilter === modelData
+                                          ? Kirigami.Theme.highlightColor
+                                          : Qt.alpha(Kirigami.Theme.textColor, 0.55)
+                            // Deliberately a MouseArea, not a Button: filtering
+                            // must never steal keyboard focus from the search
+                            // field or the message list.
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    root.colorFilter = root.colorFilter === parent.modelData
+                                        ? 0 : parent.modelData
+                                    Mail.filterByColor(root.colorFilter)
+                                }
+                            }
+                            QQC2.ToolTip.text: root.colorFilter === modelData
+                                ? "Clear color filter"
+                                : "Show only messages marked with this color"
+                            QQC2.ToolTip.visible: squareHover.hovered
+                            HoverHandler { id: squareHover }
+                        }
                     }
                 }
 
@@ -723,10 +1109,13 @@ Kirigami.ApplicationWindow {
                             selectionAnchor = -1
                             selectionRev++
                         }
+                        // A plain cursor move: no explicit multi-selection —
+                        // the row is implicitly selected by being current
+                        // (highlight and selectedIndexes() both cover that).
+                        // Keeping the set empty lets the select shortcut
+                        // toggle the current row ON with its first press.
                         function selectSingle(i) {
-                            const s = {}
-                            s[i] = true
-                            selectedSet = s
+                            selectedSet = {}
                             selectionAnchor = i
                             selectionRev++
                         }
@@ -737,6 +1126,21 @@ Kirigami.ApplicationWindow {
                                 selectedSet[i] = true
                             selectionAnchor = i
                             selectionRev++
+                        }
+                        // Toggle-select the current row and step down one —
+                        // repeated presses select a run (file-manager style).
+                        // The advance must not collapse the selection like a
+                        // normal cursor move does.
+                        property bool preserveSelection: false
+                        function toggleSelectAndAdvance() {
+                            if (currentIndex < 0)
+                                return
+                            toggleSelect(currentIndex)
+                            if (currentIndex < count - 1) {
+                                preserveSelection = true
+                                currentIndex++
+                                preserveSelection = false
+                            }
                         }
                         function selectRange(a, b) {
                             const s = {}
@@ -769,13 +1173,101 @@ Kirigami.ApplicationWindow {
                                 clearSelection()
                             }
                         }
-                        Keys.onDeletePressed: requestDelete()
+                        Keys.onPressed: event => root.handleMailShortcut(event)
+
+                        function requestJunk() {
+                            const rows = selectedIndexes()
+                            if (rows.length === 0)
+                                return
+                            Mail.markAsJunk(rows)
+                            clearSelection()
+                        }
 
                         // Row indexes shift on re-sort/search — selections
                         // would silently point at the wrong messages.
                         Connections {
                             target: Mail.messageModel
-                            function onModelReset() { messageList.clearSelection() }
+                            function onModelReset() {
+                                messageList.clearSelection()
+                                // The rows under the cursor are different ones
+                                // now (search/filter/sort) — currentIndex often
+                                // keeps its old number, so no change signal
+                                // fires and the preview would show the previous
+                                // message. Re-anchor on the first row and fetch
+                                // it explicitly.
+                                if (messageList.count > 0) {
+                                    messageList.currentIndex = 0
+                                    fetchDebounce.restart()
+                                } else {
+                                    messageList.currentIndex = -1
+                                }
+                            }
+                            // Incremental inserts (appendHeaders: search local
+                            // merge, load-more) shift every row at/after the
+                            // insertion point. selectedSet, selectionAnchor and
+                            // currentIndex are stored as row numbers, so without
+                            // remapping the highlight sticks to whatever message
+                            // now sits at the old index — leaving the real row
+                            // unhighlighted and a stale highlight behind.
+                            function onRowsInserted(parent, first, last) {
+                                const shift = last - first + 1
+                                const remap = k => (k >= first ? k + shift : k)
+                                const next = {}
+                                for (const key in messageList.selectedSet) {
+                                    if (messageList.selectedSet[key])
+                                        next[remap(parseInt(key))] = true
+                                }
+                                messageList.selectedSet = next
+                                if (messageList.selectionAnchor >= 0)
+                                    messageList.selectionAnchor = remap(messageList.selectionAnchor)
+                                if (messageList.currentIndex >= first)
+                                    messageList.currentIndex = remap(messageList.currentIndex)
+                                messageList.selectionRev++
+                            }
+                            function onRowsRemoved(parent, first, last) {
+                                const shift = last - first + 1
+                                const remap = k => (k > last ? k - shift : k)
+                                const next = {}
+                                for (const key in messageList.selectedSet) {
+                                    const k = parseInt(key)
+                                    if (messageList.selectedSet[key] && (k < first || k > last))
+                                        next[remap(k)] = true
+                                }
+                                messageList.selectedSet = next
+                                const a = messageList.selectionAnchor
+                                messageList.selectionAnchor =
+                                    (a >= first && a <= last) ? -1
+                                    : (a > last ? a - shift : a)
+                                messageList.selectionRev++
+
+                                // Keep the preview in sync with what now sits
+                                // under the cursor. If the current row itself
+                                // was removed, currentIndex often keeps its old
+                                // number and points at a *different* message,
+                                // yet no onCurrentIndexChanged fires — so the
+                                // preview would keep showing the deleted mail.
+                                // Re-anchor and re-fetch explicitly.
+                                const cur = messageList.currentIndex
+                                if (cur >= first && cur <= last) {
+                                    // The current row was deleted: land on the
+                                    // row that took its place (clamped to end).
+                                    const target = Math.min(first, messageList.count - 1)
+                                    if (target < 0) {
+                                        messageList.currentIndex = -1
+                                        viewer.clear()
+                                    } else if (messageList.currentIndex === target) {
+                                        // Same number, new message → force a fetch.
+                                        Mail.fetchMessage(target)
+                                    } else {
+                                        messageList.currentIndex = target
+                                    }
+                                } else if (cur > last) {
+                                    // Rows above the cursor went away; its number
+                                    // shifts but the message is the same — just
+                                    // keep the highlight in the right place.
+                                    messageList.currentIndex = cur - shift
+                                }
+                            }
                         }
 
                         // Fetch older messages when scrolled (or key-navigated) to the end.
@@ -799,7 +1291,10 @@ Kirigami.ApplicationWindow {
                                 // collapses any multi-selection to that row —
                                 // otherwise the clicked row stays highlighted
                                 // while the arrow keys move a second one.
-                                selectSingle(currentIndex)
+                                // Exception: the select-and-advance shortcut
+                                // moves the cursor without dropping the set.
+                                if (!preserveSelection)
+                                    selectSingle(currentIndex)
                                 fetchDebounce.restart()
                             }
                         }
@@ -841,7 +1336,15 @@ Kirigami.ApplicationWindow {
                             required property bool hasAttachment
                             required property bool calendarAttachment
                             required property string authInfo
+                            required property int colorLabel
                             required property int index
+
+                            // The message's color-scale mark (empty if none).
+                            // Shown as a row background tint rather than as the
+                            // text color, so text keeps full theme contrast and
+                            // an arbitrary user color never becomes unreadable.
+                            readonly property string markColor:
+                                colorLabel > 0 ? root.scaleColorOf(colorLabel) : ""
 
                             width: messageList.width
                             // Row height comes from the density setting alone;
@@ -850,6 +1353,22 @@ Kirigami.ApplicationWindow {
                             bottomPadding: 1
                             highlighted: messageList.currentIndex === index
                                          || messageList.isSelected(index)
+
+                            // Row background: selection highlight, then hover,
+                            // then the color-scale mark as a light tint. The
+                            // mark shows as a tint only when the row is NOT
+                            // selected ("moved away"); a selected marked row
+                            // shows the mark on its TEXT instead (see below).
+                            background: Rectangle {
+                                color: msgDelegate.highlighted
+                                        ? Kirigami.Theme.highlightColor
+                                        : msgDelegate.hovered
+                                          ? Qt.alpha(Kirigami.Theme.highlightColor, 0.2)
+                                          : msgDelegate.markColor !== ""
+                                            ? Qt.alpha(msgDelegate.markColor, 0.22)
+                                            : "transparent"
+                            }
+
                             onHoveredChanged: {
                                 if (hovered) {
                                     hoverPrefetch.row = index
@@ -936,7 +1455,24 @@ Kirigami.ApplicationWindow {
                                                 : rowCell.colId === "date" ? msgDelegate.date : ""
                                             elide: Text.ElideRight
                                             font.bold: rowCell.colId === "subject" && !msgDelegate.seen
-                                            opacity: rowCell.colId === "subject" ? 1 : 0.7
+                                            // Secondary columns are dimmed to ≥7:1 (AAA) on
+                                            // normal rows, but shown at full opacity when the
+                                            // row is highlighted — the theme's selection color
+                                            // is already low-contrast, so dimming there would
+                                            // push it further below AA.
+                                            opacity: (rowCell.colId === "subject"
+                                                      || msgDelegate.highlighted) ? 1 : 0.8
+                                            // A marked, selected row shows the
+                                            // mark as its TEXT color (the tint
+                                            // background is suppressed under
+                                            // selection). When not selected the
+                                            // mark lives in the background tint,
+                                            // so text uses the normal theme color.
+                                            color: (msgDelegate.highlighted && msgDelegate.markColor !== "")
+                                                   ? msgDelegate.markColor
+                                                   : msgDelegate.highlighted
+                                                     ? Kirigami.Theme.highlightedTextColor
+                                                     : Kirigami.Theme.textColor
                                         }
                                     }
                                 }
@@ -959,8 +1495,8 @@ Kirigami.ApplicationWindow {
                 id: viewer
                 QQC2.SplitView.fillHeight: true
                 QQC2.SplitView.minimumHeight: 160
-                onReplyRequested: replyAll => composeSheet.openReply(Mail.replyData(replyAll))
-                onForwardRequested: composeSheet.openForward(Mail.forwardData())
+                onReplyRequested: replyAll => composeSheet().openReply(Mail.replyData(replyAll))
+                onForwardRequested: composeSheet().openForward(Mail.forwardData())
             }
             }
         }

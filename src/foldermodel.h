@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #pragma once
 
 #include <QAbstractListModel>
@@ -50,6 +53,20 @@ public:
     QStringList allMailBoxes() const;
 
     Q_INVOKABLE void toggleExpanded(int row);
+    /// Reveals a row's children if they are hidden. A no-op when the row has
+    /// none or is already expanded — so opening a folder can call it
+    /// unconditionally without forcing a model reset on every click.
+    Q_INVOKABLE void expandRow(int row);
+
+    /// Visible row of \a mailBox, or -1 when it is unknown or hidden inside a
+    /// collapsed parent. The view cannot answer this itself: ListView only
+    /// instantiates delegates near the viewport, so itemAtIndex() returns null
+    /// for rows that are merely scrolled out of sight.
+    Q_INVOKABLE int rowForMailBox(const QString &mailBox) const;
+    /// Full IMAP path at a visible row (empty when out of range).
+    Q_INVOKABLE QString mailBoxAt(int row) const;
+    /// Whether the folder at a visible row can be opened (not \Noselect).
+    Q_INVOKABLE bool selectableAt(int row) const;
 
 private:
     void rebuildVisible();

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 // Offscreen end-to-end check of the message-viewer pipeline:
 // registers the mailo: scheme, serves HTML through ViewerSchemeHandler,
 // loads it in a WebEngineView with production settings, and verifies the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #pragma once
 
 #include <QAbstractListModel>
@@ -21,7 +24,8 @@ public:
         SuspiciousRole,
         AuthInfoRole,
         AttachmentRole,
-        CalendarRole
+        CalendarRole,
+        ColorLabelRole
     };
 
     /// Attachment kinds carried in Header::attachKind.
@@ -36,6 +40,7 @@ public:
         bool suspicious = false; ///< SPF/DKIM/DMARC failure reported by our server
         QString authInfo;        ///< raw Authentication-Results header
         int attachKind = NoAttachment; ///< 1 = multipart/mixed head, 2 = all-.ics attachments
+        int colorLabel = 0;      ///< local color-scale mark (0 = none, 1..5)
     };
 
     using QAbstractListModel::QAbstractListModel;
@@ -55,9 +60,12 @@ public:
     int appendHeaders(const QList<Header> &headers);
     void clear();
     qint64 uidAt(int row) const;
+    bool seenAt(int row) const;
     void markSeen(int row);
     /// Refines a message's attachment kind in place (body-derived knowledge).
     void setAttachKind(qint64 uid, int kind);
+    int colorLabelAt(int row) const;
+    void setColorLabel(qint64 uid, int color);
     /// Drops the given uids from the model (visible and hidden lists).
     void removeByUids(const QList<qint64> &uids);
 
@@ -66,6 +74,8 @@ public:
     bool hasFilter() const { return m_filter.isValid() && !m_filter.pattern().isEmpty(); }
 
     Q_INVOKABLE void sortBy(int column, bool descending);
+    /// Quick filter: show only rows carrying this color mark (0 = off).
+    Q_INVOKABLE void setColorFilter(int color);
 
 private:
     void rebuildVisible();
@@ -77,6 +87,7 @@ private:
     QList<Header> m_headers; ///< visible (possibly filtered) rows
     QList<Header> m_all;     ///< everything fetched for the folder
     QRegularExpression m_filter;
+    int m_colorFilter = 0;
     SortColumn m_sortColumn = SortColumn::Date;
     bool m_sortDescending = true;
 };

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #include "messagelistmodel.h"
 
 int MessageListModel::rowCount(const QModelIndex &parent) const
@@ -33,6 +36,8 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
         return h.attachKind != NoAttachment;
     case CalendarRole:
         return h.attachKind == CalendarAttachment;
+    case ColorLabelRole:
+        return h.colorLabel;
     }
     return {};
 }
@@ -49,6 +54,7 @@ QHash<int, QByteArray> MessageListModel::roleNames() const
         {AuthInfoRole, "authInfo"},
         {AttachmentRole, "hasAttachment"},
         {CalendarRole, "calendarAttachment"},
+        {ColorLabelRole, "colorLabel"},
     };
 }
 
@@ -93,6 +99,13 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
                     if (existing.attachKind > GenericAttachment
                         && h.attachKind == GenericAttachment)
                         merged.attachKind = existing.attachKind;
+                    // A locally-read message stays read: the server refresh
+                    // may predate our \Seen write-back landing there.
+                    if (existing.seen)
+                        merged.seen = true;
+                    // The color mark is local-only — the server never knows it.
+                    if (existing.colorLabel != 0)
+                        merged.colorLabel = existing.colorLabel;
                     existing = merged;
                     break;
                 }
@@ -110,7 +123,7 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
         known.insert(h.uid);
         ++added;
         m_all.insert(std::upper_bound(m_all.begin(), m_all.end(), h, cmp) - m_all.begin(), h);
-        if (hasFilter() && !matchesFilter(h))
+        if ((hasFilter() || m_colorFilter != 0) && !matchesFilter(h))
             continue;
         const int row = int(std::upper_bound(m_headers.begin(), m_headers.end(), h, cmp)
                             - m_headers.begin());
@@ -169,7 +182,19 @@ bool MessageListModel::lessThan(const Header &a, const Header &b) const
 
 bool MessageListModel::matchesFilter(const Header &h) const
 {
+    if (m_colorFilter != 0 && h.colorLabel != m_colorFilter)
+        return false;
+    if (!hasFilter())
+        return true;
     return m_filter.match(h.subject).hasMatch() || m_filter.match(h.from).hasMatch();
+}
+
+void MessageListModel::setColorFilter(int color)
+{
+    if (m_colorFilter == color)
+        return;
+    m_colorFilter = color;
+    rebuildVisible();
 }
 
 void MessageListModel::sortList(QList<Header> &list) const
@@ -181,7 +206,7 @@ void MessageListModel::sortList(QList<Header> &list) const
 void MessageListModel::rebuildVisible()
 {
     beginResetModel();
-    if (hasFilter()) {
+    if (hasFilter() || m_colorFilter != 0) {
         m_headers.clear();
         for (const Header &h : std::as_const(m_all)) {
             if (matchesFilter(h))
@@ -196,6 +221,11 @@ void MessageListModel::rebuildVisible()
 qint64 MessageListModel::uidAt(int row) const
 {
     return (row >= 0 && row < m_headers.size()) ? m_headers.at(row).uid : -1;
+}
+
+bool MessageListModel::seenAt(int row) const
+{
+    return row >= 0 && row < m_headers.size() && m_headers.at(row).seen;
 }
 
 void MessageListModel::removeByUids(const QList<qint64> &uids)
@@ -228,6 +258,52 @@ void MessageListModel::setAttachKind(qint64 uid, int kind)
             }
             break;
         }
+    }
+}
+
+int MessageListModel::colorLabelAt(int row) const
+{
+    return (row >= 0 && row < m_headers.size()) ? m_headers.at(row).colorLabel : 0;
+}
+
+void MessageListModel::setColorLabel(qint64 uid, int color)
+{
+    const Header *updated = nullptr;
+    for (Header &h : m_all) {
+        if (h.uid == uid) {
+            h.colorLabel = color;
+            updated = &h;
+            break;
+        }
+    }
+    if (!updated)
+        return;
+
+    int row = -1;
+    for (int i = 0; i < m_headers.size(); ++i) {
+        if (m_headers.at(i).uid == uid) {
+            row = i;
+            break;
+        }
+    }
+    // The change can move the row into or out of an active color filter —
+    // insert/remove it instead of only repainting in place.
+    const bool matches = matchesFilter(*updated);
+    if (row >= 0 && !matches) {
+        beginRemoveRows({}, row, row);
+        m_headers.removeAt(row);
+        endRemoveRows();
+    } else if (row < 0 && matches) {
+        const auto cmp = [this](const Header &a, const Header &b) { return lessThan(a, b); };
+        const int at = int(std::upper_bound(m_headers.begin(), m_headers.end(), *updated, cmp)
+                           - m_headers.begin());
+        beginInsertRows({}, at, at);
+        m_headers.insert(at, *updated);
+        endInsertRows();
+    } else if (row >= 0 && m_headers.at(row).colorLabel != color) {
+        m_headers[row].colorLabel = color;
+        const QModelIndex idx = index(row);
+        Q_EMIT dataChanged(idx, idx, {ColorLabelRole});
     }
 }
 

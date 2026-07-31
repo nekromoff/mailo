@@ -1,0 +1,44 @@
+.TH MAILO 1 "2026-07-20" "mailo 0.9" "User Commands"
+.SH NAME
+mailo \- lightweight IMAP mail client for the KDE desktop
+.SH SYNOPSIS
+.B mailo
+.RI [ mailto\-URL ]
+.SH DESCRIPTION
+.B Mailo
+is an IMAP mail client focused on speed and safe message viewing. It caches
+headers, bodies and the folder tree in SQLite for instant, offline\-capable
+browsing and full\-text search, and renders HTML mail in a sandboxed
+QtWebEngine view that blocks all remote content until you opt in per message.
+.PP
+Accounts are configured from the application's account sheet. Passwords and
+OAuth tokens are stored in the system keyring (KWallet or any Secret Service
+provider) via qtkeychain, never on disk in plain text.
+.SH OPTIONS
+.B Mailo
+takes no options. A single optional
+.I mailto:
+URL may be passed to open the composer pre\-addressed; the package registers
+.B mailo
+as a handler for the
+.I x\-scheme\-handler/mailto
+MIME type.
+.SH ENVIRONMENT
+.TP
+.B QT_QUICK_CONTROLS_STYLE
+Overrides the QtQuick Controls style. When unset, Mailo forces
+.IR org.kde.desktop .
+.SH FILES
+.TP
+.I ~/.config/mailo/mailo.conf
+Account configuration.
+.TP
+.I ~/.local/share/mailo/mailo/
+SQLite message, folder and attachment cache.
+.SH BUGS
+Report bugs at <https://github.com/nekromoff/mailo/issues>.
+.SH AUTHOR
+Daniel Duris <dusoft@staznosti.sk>
+.SH COPYRIGHT
+Copyright \(co 2026 Daniel Duris. Licensed under the GNU Lesser General Public
+License, version 3 or later.

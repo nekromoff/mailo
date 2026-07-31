@@ -1,5 +1,11 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #pragma once
 
+#include <QAtomicInt>
+#include <QMutex>
+#include <QWaitCondition>
 #include <QDateTime>
 #include <QObject>
 #include <QPointer>
@@ -16,11 +22,14 @@
 #include "mailstore.h"
 #include "messagelistmodel.h"
 
+class QThread;
+
 namespace KIMAP
 {
 class Session;
 class IdleJob;
 class LoginJob;
+class ImapSet;
 }
 namespace KMime
 {
@@ -46,6 +55,12 @@ class MailClient : public QObject
     Q_PROPERTY(bool connected READ connected NOTIFY connectedChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
+    /// True while a cache vacuum is running — the UI disables the button and
+    /// shows a spinner, since the database is locked for writes meanwhile.
+    Q_PROPERTY(bool reclaiming READ reclaiming NOTIFY reclaimingChanged)
+    /// ABOUT.md compiled into the binary (Settings → About). CONSTANT — baked
+    /// in at build time, never changes at runtime.
+    Q_PROPERTY(QString aboutText READ aboutText CONSTANT)
     Q_PROPERTY(FolderModel *folderModel READ folderModel CONSTANT)
     Q_PROPERTY(MessageListModel *messageModel READ messageModel CONSTANT)
     /// Attachments of the last fetched message: [{name, sizeText}, …]
@@ -55,6 +70,9 @@ class MailClient : public QObject
                    WRITE setRemoteContentAllowed NOTIFY remoteContentAllowedChanged)
     /// Instant plain-text stand-in shown while the HTML view renders.
     Q_PROPERTY(QString textPreview READ textPreview NOTIFY textPreviewChanged)
+    /// True while the shown message comes from a junk/spam folder: the viewer
+    /// then defaults to plain text and renders HTML only on explicit request.
+    Q_PROPERTY(bool junkTextOnly READ junkTextOnly NOTIFY junkTextOnlyChanged)
 
     // Account fields for prefilling the settings sheet
     Q_PROPERTY(QString accountHost READ accountHost NOTIFY accountChanged)
@@ -76,6 +94,16 @@ class MailClient : public QObject
     /// IDLE push is not active. 0 disables polling. Persisted.
     Q_PROPERTY(int refreshMinutes READ refreshMinutes WRITE setRefreshMinutes
                    NOTIFY refreshMinutesChanged)
+    /// Largest message body to keep in the offline cache, in MB (0 = no
+    /// limit). Bigger ones are still opened on demand, just never stored.
+    Q_PROPERTY(int maxBodyMB READ maxBodyMB WRITE setMaxBodyMB NOTIFY maxBodyMBChanged)
+    /// Writes a running trace of folder/account/sync activity to the console.
+    /// Off by default; takes effect immediately. Persisted.
+    Q_PROPERTY(bool debugLogging READ debugLogging WRITE setDebugLogging
+                   NOTIFY debugLoggingChanged)
+    /// The folder actually open right now. The sidebar follows this rather
+    /// than deciding for itself which row is open.
+    Q_PROPERTY(QString selectedFolder READ selectedFolder NOTIFY selectedFolderChanged)
 
     /// Qt date pattern (e.g. "dd/MM/yyyy") used for message dates in the list
     /// and the viewer; today's messages show only the time. Persisted.
@@ -88,6 +116,9 @@ public:
     Q_ENUM(Security)
 
     explicit MailClient(QObject *parent = nullptr);
+    /// Stops and joins the cache workers — both hold a raw `this` and a SQLite
+    /// connection, neither of which may outlive the client.
+    ~MailClient() override;
 
     /// The scheme handler that serves message bodies to the viewer.
     void setViewerHandler(ViewerSchemeHandler *handler) { m_viewerHandler = handler; }
@@ -96,6 +127,7 @@ public:
     bool connected() const { return m_connected; }
     bool busy() const { return m_busy; }
     QString statusText() const { return m_statusText; }
+    QString aboutText() const;
     FolderModel *folderModel() { return &m_folderModel; }
     MessageListModel *messageModel() { return &m_messageModel; }
 
@@ -112,6 +144,11 @@ public:
     int currentAccount() const { return m_currentAccount; }
     int cachedFolderRevision() const { return m_cachedFolderRevision; }
     int refreshMinutes() const { return m_refreshMinutes; }
+    int maxBodyMB() const { return m_maxBodyMB; }
+    void setMaxBodyMB(int mb);
+    QString selectedFolder() const { return m_selectedFolder; }
+    bool debugLogging() const { return m_debugLogging; }
+    void setDebugLogging(bool on);
     void setRefreshMinutes(int minutes);
     QString dateFormat() const { return m_dateFormat; }
     void setDateFormat(const QString &format);
@@ -137,8 +174,9 @@ public:
     /// Disconnects, loads account \a index and reconnects.
     Q_INVOKABLE void switchAccount(int index);
     /// Builds a MIME message and sends it via SMTP. attachments are local file URLs.
-    Q_INVOKABLE void sendMail(const QString &to, const QString &cc, const QString &subject,
-                              const QString &html, const QList<QUrl> &attachments);
+    Q_INVOKABLE void sendMail(const QString &to, const QString &cc, const QString &bcc,
+                              const QString &subject, const QString &html,
+                              const QList<QUrl> &attachments);
     /// Compose prefill for replying to the currently shown message:
     /// {to, cc, subject, body} — body is HTML with the original quoted.
     /// cc is filled only for \a replyAll. Empty map when nothing is shown.
@@ -149,6 +187,9 @@ public:
     /// The original's attachments are NOT carried over (compose attaches
     /// local files only).
     Q_INVOKABLE QVariantMap forwardData();
+    /// Copy the given text to the system clipboard (used to grab the full
+    /// status breadcrumb trail on right-click).
+    Q_INVOKABLE void copyToClipboard(const QString &text) const;
     /// Initial body for a brand-new message: a blank line for the cursor
     /// followed by the account's signature (empty when no signature is set).
     Q_INVOKABLE QString newMessageBody() const;
@@ -174,6 +215,19 @@ public:
     /// The QML side is responsible for confirming the permanent case.
     Q_INVOKABLE void deleteMessages(const QVariantList &rows);
 
+    /// Moves the given model rows to the account's junk/spam folder.
+    /// No-op when the open folder already is the junk folder.
+    Q_INVOKABLE void markAsJunk(const QVariantList &rows);
+
+    /// Local-only color-scale mark (1..5) for the given model rows; a row
+    /// already carrying that color is cleared instead (toggle). 0 clears —
+    /// a scale slot left without a color acts as the "clear mark" shortcut.
+    Q_INVOKABLE void markMessageColor(const QVariantList &rows, int color);
+
+    /// Quick filter: show only messages marked with this color (0 = off).
+    /// Queries the disk cache so marks outside the loaded page appear too.
+    Q_INVOKABLE void filterByColor(int color);
+
     /// Server-side IMAP SEARCH in the selected folder.
     /// field: 0 = whole message, 1 = subject, 2 = from, 3 = body.
     /// A query wrapped in slashes (/pattern/) instead regex-filters the loaded list.
@@ -193,6 +247,7 @@ public:
     bool remoteContentAllowed() const { return m_remoteContentAllowed; }
     void setRemoteContentAllowed(bool allow);
     QString textPreview() const { return m_textPreview; }
+    bool junkTextOnly() const { return m_junkTextOnly; }
     /// Writes attachment \a index of the current message to \a fileUrl.
     Q_INVOKABLE void saveAttachment(int index, const QUrl &fileUrl);
     /// True when the attachment could execute code if opened (.sh, .desktop,
@@ -206,7 +261,20 @@ public:
     /// Opens a link from a message in the system browser / mail handler.
     Q_INVOKABLE void openExternalUrl(const QUrl &url);
 
+    // --- Cache maintenance (Settings → Storage) ---
+    /// Human-readable cache size, e.g. "13.4 GB (6.2 GB reclaimable)".
+    Q_INVOKABLE QString cacheSizeText();
+    /// Rebuilds the cache file on a worker thread to hand free pages back to
+    /// the filesystem. Deleting messages only marks pages reusable — the file
+    /// itself never shrinks without this. Sync is paused for the duration.
+    Q_INVOKABLE void reclaimDiskSpace();
+    /// Whether a rebuild would actually hand anything back. False right after
+    /// one has run, so the UI can stop offering a multi-minute no-op.
+    Q_INVOKABLE bool reclaimWorthwhile();
+    bool reclaiming() const { return m_reclaiming; }
+
 Q_SIGNALS:
+    void reclaimingChanged();
     void accountChanged();
     void connectedChanged();
     void busyChanged();
@@ -219,14 +287,22 @@ Q_SIGNALS:
                        const QString &authInfo);
     void errorOccurred(const QString &message);
     void mailSent();
+    /// Sending failed — carries the full (unshortened) server error. The
+    /// compose window stays open and shows this in a dismissible dialog; it is
+    /// deliberately NOT routed through the status log.
+    void sendFailed(const QString &error);
     /// Folder contents were refreshed from the server (initial or re-open).
     void folderRefreshed();
     void attachmentsChanged();
     void remoteContentAllowedChanged();
     void textPreviewChanged();
+    void junkTextOnlyChanged();
     void accountsChanged();
     void cachedFoldersChanged();
     void refreshMinutesChanged();
+    void maxBodyMBChanged();
+    void debugLoggingChanged();
+    void selectedFolderChanged();
     void dateFormatChanged();
 
 private:
@@ -236,15 +312,62 @@ private:
     /// Records a body-derived attachment kind (e.g. calendar invite) in the
     /// cache and the visible list.
     void refineAttachKind(const QString &folder, qint64 uid, KMime::Message *msg);
+    /// Marks a message read everywhere: visible list, disk cache, and (when
+    /// online) the server via STORE \Seen — so the state survives restarts.
+    void markMessageRead(int row);
     void loadAccount();
     void loadAccountFields();
     void readWalletPassword();
-    void switchAccountInternal(int index, const QString &sessionPassword);
+    /// Switches to account \a index. \a targetFolder is the folder to land
+    /// on — its cached contents are shown immediately, and it is what the
+    /// connection opens once the folder list arrives. Empty means INBOX.
+    void switchAccountInternal(int index, const QString &sessionPassword,
+                               const QString &targetFolder = {});
     QString walletKey() const;
     void writeSecretToWallet();
     void setBusy(bool busy);
     void setStatus(const QString &text);
+    /// Composed background-sync status for the open folder: the header-sync
+    /// progress ("N of M synced") and the body-caching progress ("caching K
+    /// bodies") shown together, so the two phases don't overwrite each other's
+    /// numbers. Empty when nothing is syncing. \a folder must be the open one.
+    QString openFolderSyncStatus(const QString &folder);
+    /// Grow the background-sync backoff after server pushback (a throttling
+    /// NO/BAD, or a dropped connection) and re-arm the backfill after that
+    /// pause. Doubling, capped at 60 s.
+    void backoffBackfill();
+    /// Clear the throttle backoff/attempt state — called when a fetch succeeds
+    /// and on (re)connect or folder change, so a healthy server resumes at
+    /// full pace.
+    void resetBackfillBackoff();
+    /// Drop one background body-fetch connection and stop growing the pool,
+    /// in response to a [TOO-MANY-SIMULTANEOUS-CONNECTIONS] refusal.
+    void shrinkBodyPool();
     void listFolders();
+    /// True for a mailbox that duplicates every other one (Gmail's All Mail).
+    static bool isAllMailName(const QString &mailBox);
+    /// Queues a fetched body for the writer thread, and starts it if needed.
+    void queueBodyWrite(MailStore::BodyWrite &&write);
+    /// Writer-thread loop: drains m_bodyWriteQueue into batched transactions.
+    void runBodyWriter();
+    /// Stops and joins the writer thread after flushing its queue. It restarts
+    /// on the next queueBodyWrite().
+    void stopBodyWriter();
+
+    /// Cached missingBodyCount() for one folder — see the .cpp for why.
+    int missingBodiesIn(const QString &folder);
+    void noteBodyStored(const QString &folder);
+    void invalidateMissingBodies();
+
+    /// Moves attachments of already-cached messages into the file store, a
+    /// chunk at a time on a worker thread. Resumes after a restart.
+    void startAttachmentMigration();
+    void stopAttachmentMigration();
+
+    /// Starts the background removal of the excluded archive's cached rows.
+    void startAllMailPurge();
+    /// Cancels it and waits for the worker to finish.
+    void stopAllMailPurge();
     void fetchHeaders(qint64 fromSeq, qint64 toSeq, bool append);
     /// The actual header FETCH on \a session. \a background jobs never touch
     /// busy state, and any result for a folder the user has left goes to the
@@ -264,10 +387,14 @@ private:
     void fetchNewerThanCache(qint64 maxCachedUid, int cachedCount);
     /// Fetches the next older header window from the server (backfill step).
     void fetchOlderFromServer();
-    /// Idle-time body caching: queues the next few headers that have no
-    /// cached body yet. Runs only after the header backfill has finished,
-    /// so a fresh account always shows the full list first.
-    void backfillBodies();
+    /// Idle-time body caching: queues \a folder's next few headers that have
+    /// no cached body yet. Runs only after the header backfill has finished,
+    /// so a fresh account always shows the full list first. Returns false
+    /// when the folder has no missing bodies (nothing was queued).
+    bool backfillBodies(const QString &folder);
+    /// Once the open folder is fully synced, walks the account's remaining
+    /// folders (headers, then bodies) so every mailbox gets cached.
+    void continueFolderBackfill();
     /// Remembers the oldest (date, uid) shown from the disk cache, so
     /// loadMoreMessages() can page the next cached chunk in from there.
     void updatePageAnchor(const QList<MessageListModel::Header> &page);
@@ -292,6 +419,9 @@ private:
     /// compose body; empty when no signature is set.
     QString signatureBlock() const;
     QString trashFolderName() const;
+    QString junkFolderName() const;
+    /// Junk/spam folders get hostile-content handling in the viewer.
+    bool isJunkFolder(const QString &mailBox) const;
     void purgeDeleted(const QList<qint64> &uids);
     void configureLogin(KIMAP::LoginJob *login) const;
     QString oauthWalletKey() const;
@@ -303,10 +433,33 @@ private:
     /// Merges any new server messages into the open folder without clearing it.
     void refreshCurrentFolder();
     /// Arms the idle-time fetch of the next older header window.
-    void scheduleBackfill();
+    void scheduleBackfill(int delayMs = 4000);
     /// Updates viewer remote-content policy without persisting a preference.
     void applyRemoteContentAllowed(bool allow);
     void processPrefetchQueue();
+    /// Parses and caches one prefetched body (raw + search text + refined
+    /// attachment kind; recipient harvesting for the Sent folder).
+    void storeFetchedBody(const QString &folder, qint64 uid,
+                          const std::shared_ptr<KMime::Message> &message);
+    /// One extra IMAP connection of the parallel body-caching pool.
+    struct BodyConn {
+        QPointer<KIMAP::Session> session;
+        QString folder;    ///< mailbox currently selected on it
+        bool ready = false;
+        bool busy = false; ///< a body batch is streaming on it
+    };
+    /// Opens the missing pool connections (best effort, once per connect).
+    void ensureBodyPool();
+    /// Takes the next same-folder batch off the prefetch queue and streams
+    /// it on \a conn, selecting the folder there first when needed.
+    void dispatchBodyBatch(const std::shared_ptr<BodyConn> &conn);
+    /// The streaming multi-UID body FETCH itself; \a release frees the
+    /// issuing connection and is called exactly once.
+    void startBodyFetchJob(KIMAP::Session *session, const QString &folder,
+                           const KIMAP::ImapSet &set,
+                           const std::function<void()> &release);
+    /// True while any connection (pool or fallback) streams a body batch.
+    bool bodyFetchActive() const;
     void teardownSession();
     /// One tiny batch of search-index repair (bodies queued in fts_pending):
     /// parses the raw message and writes its text into the FTS index. Timer-
@@ -325,6 +478,7 @@ private:
     QString m_clientId;
     QString m_clientSecret;
     QString m_signature; ///< per-account signature (HTML, may be a full doc)
+    bool m_htmlMail = true; ///< send multipart text+HTML; false = plain text only
     QString m_refreshToken;
     QString m_accessToken;
     QDateTime m_accessTokenExpiry;
@@ -343,8 +497,33 @@ private:
     bool m_syncReady = false; ///< the sync connection is logged in
     QString m_syncFolder;     ///< mailbox currently selected on the sync connection
     QString m_selectedFolder;
+    bool m_folderReadWrite = false; ///< current SELECT is read-write (not EXAMINE)
     QString m_pendingFolder; ///< folder to reopen after (re)connect
     QString m_sentFolder;    ///< where sent mail gets APPENDed
+    /// Gmail's \All archive: excluded from the folder list and the backfill
+    /// because it re-stores every message already held under INBOX and labels.
+    QString m_allMailFolder;
+    int m_missingBodies = -1; ///< -1 = stale, recompute on next use
+    QString m_missingBodiesFolder;
+    int m_maxBodyMB = 5; ///< bodies above this are not cached (0 = no limit)
+    bool m_debugLogging = false;
+
+    /// Bodies wait here for the writer thread; the mutex guards the queue and
+    /// pairs with m_bodyWriteWake.
+    QList<MailStore::BodyWrite> m_bodyWriteQueue;
+    QMutex m_bodyWriteMutex;
+    QWaitCondition m_bodyWriteWake;
+    QThread *m_bodyWriterThread = nullptr;
+    QAtomicInt m_bodyWriterStop;
+
+    QThread *m_migrateThread = nullptr; ///< attachment externalisation of old mail
+    QAtomicInt m_migrateCancel;
+    QThread *m_reindexThread = nullptr; ///< off-thread body text extraction
+    QThread *m_purgeThread = nullptr; ///< background removal of that archive
+    QThread *m_vacuumThread = nullptr;
+    QAtomicInt m_purgeCancel;
+    int m_purgedRows = 0;
+    bool m_reclaiming = false; ///< a VACUUM is running on a worker thread
     QTimer m_keepAlive;
     QTimer m_pollTimer;      ///< IDLE-less fallback refresh of the open folder
     int m_refreshMinutes = 5;
@@ -354,6 +533,12 @@ private:
     QTimer m_reindexTimer;   ///< drip-feed repair of the body search index
     QTimer m_backfillTimer;  ///< idle-time fetch of older header windows
     bool m_backfill = false; ///< the running header fetch is a backfill one
+    int m_backfillAttempt = 0; ///< consecutive throttle hits (0 while healthy)
+    bool m_syncPaused = false; ///< backfill suspended after too many throttles
+    QStringList m_folderBackfillQueue; ///< folders still to background-sync
+    QString m_backfillFolder;   ///< non-open folder currently background-syncing
+    qint64 m_backfillOldestSeq = 0; ///< its header cursor (0 = size unknown yet)
+    bool m_folderBackfillPassDone = false; ///< all folders visited this connect
     bool m_headerFetch = false; ///< a header FETCH is in flight (any session)
     bool m_bodyBackfill = false; ///< the idle body-caching phase is running
     bool m_searchActive = false; ///< showing search results, not the folder
@@ -369,11 +554,15 @@ private:
     bool m_remoteContentAllowed = false;
     QString m_currentSenderAddress; ///< addr-spec of the shown message's sender
     QString m_textPreview;
-    QList<qint64> m_prefetchQueue; ///< uids waiting for a background body fetch
+    QList<QPair<QString, qint64>> m_prefetchQueue; ///< (folder, uid) waiting for a background body fetch
     bool m_prefetching = false;
+    QList<std::shared_ptr<BodyConn>> m_bodyPool; ///< parallel body-fetch connections
+    bool m_bodyPoolBroken = false; ///< server refused extra connections — stop trying
+    bool m_junkTextOnly = false; ///< shown message is from a junk folder
     bool m_connected = false;
     bool m_busy = false;
-    QString m_statusText;
+    QString m_statusText;        ///< breadcrumb shown in the UI (newest first)
+    QStringList m_statusTrail;   ///< recent raw messages, newest first (max 3)
 
     FolderModel m_folderModel;
     MessageListModel m_messageModel;

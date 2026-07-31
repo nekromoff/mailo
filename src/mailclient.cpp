@@ -1,13 +1,23 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #include "mailclient.h"
+#include "attachmentstore.h"
 #include "oauthhelper.h"
 
+#include <QClipboard>
 #include <QDesktopServices>
+#include <QGuiApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QLocale>
+#include <QRandomGenerator>
 #include <QSettings>
+#include <QSqlQuery>
+#include <QLoggingCategory>
+#include <QThread>
 #include <QTimer>
 
 #include <kimap/appendjob.h>
@@ -61,8 +71,174 @@ static QSettings appSettings()
     return QSettings(QStringLiteral("mailo"), QStringLiteral("mailo"));
 }
 
+/// Walks the MIME tree in a fixed order, numbering parts "1", "2", "2.1", …
+/// Split and restore both walk it the same way, so a part id written today
+/// still identifies the same node when the message is read back.
+static void walkParts(KMime::Content *node, const QString &prefix,
+                      const std::function<void(KMime::Content *, const QString &)> &fn)
+{
+    const auto children = node->contents();
+    for (int i = 0; i < children.size(); ++i) {
+        const QString id = prefix.isEmpty() ? QString::number(i + 1)
+                                            : prefix + QLatin1Char('.') + QString::number(i + 1);
+        fn(children.at(i), id);
+        walkParts(children.at(i), id, fn);
+    }
+}
+
+/// True for a part whose payload is an attachment rather than the message
+/// text — the only thing worth lifting out into the file store.
+static bool isAttachmentPart(KMime::Content *part)
+{
+    if (!part->contents().isEmpty())
+        return false; // a container, not a payload
+    const auto *cd = std::as_const(*part).contentDisposition();
+    if (cd && cd->disposition() == KMime::Headers::CDattachment)
+        return true;
+    // Inline images referenced by HTML mail are attachments for our purposes:
+    // they are big, binary, and repeat across every message in a newsletter.
+    return cd && !cd->filename().isEmpty();
+}
+
+/// Replaces every large attachment payload with an empty body, returning the
+/// parts that were lifted out. The message keeps all of its headers — notably
+/// Authentication-Results, which is what the SPF/DKIM display reads — so the
+/// stub stays a valid, self-describing MIME message.
+static QList<MailStore::PartRef> stripAttachments(KMime::Message *msg)
+{
+    QList<MailStore::PartRef> lifted;
+    walkParts(msg, QString(), [&lifted](KMime::Content *part, const QString &id) {
+        if (!isAttachmentPart(part))
+            return;
+        const QByteArray decoded = part->decodedBody();
+        if (decoded.size() < AttachmentStore::kExternalizeThreshold)
+            return; // small enough that a file of its own would cost more
+        const AttachmentStore::Stored stored = AttachmentStore::put(decoded);
+        if (stored.hash.isEmpty())
+            return; // could not write it; leave the payload where it is
+        MailStore::PartRef ref;
+        ref.partId = id;
+        ref.hash = stored.hash;
+        ref.size = stored.size;
+        ref.stored = stored.stored;
+        ref.codec = stored.codec;
+        const auto *cd = std::as_const(*part).contentDisposition();
+        ref.filename = cd ? cd->filename() : QString();
+        if (const auto *ct = std::as_const(*part).contentType())
+            ref.mime = QString::fromLatin1(ct->mimeType());
+        lifted.append(ref);
+        part->setBody({});
+        lifted.last().partId = id;
+    });
+    return lifted;
+}
+
+/// Confirms that a stub plus its stored payloads reproduces the original
+/// parts. Used before the migration overwrites a cached message: the payload
+/// has just made a round trip through hashing, zstd and the filesystem, and
+/// the original bytes are about to be gone.
+static bool verifyRoundTrip(const QByteArray &stub, const QList<MailStore::PartRef> &parts,
+                            QString *reason);
+
+/// Puts the payloads back into a parsed stub. Bodies are stored decoded, so
+/// the transfer encoding is rewritten to match rather than re-encoding to
+/// base64: every consumer reads decodedContent(), and this keeps the read
+/// path allocation-cheap. A payload missing from disk leaves that part empty,
+/// which the caller treats as a cache miss.
+static bool restoreAttachments(KMime::Message *msg, const QList<MailStore::PartRef> &parts)
+{
+    if (parts.isEmpty())
+        return true;
+    QHash<QString, const MailStore::PartRef *> byId;
+    for (const auto &p : parts)
+        byId.insert(p.partId, &p);
+    bool complete = true;
+    walkParts(msg, QString(), [&byId, &complete](KMime::Content *part, const QString &id) {
+        const auto it = byId.constFind(id);
+        if (it == byId.cend())
+            return;
+        const QByteArray payload = AttachmentStore::get((*it)->hash, (*it)->codec);
+        if (payload.isEmpty()) {
+            complete = false;
+            return;
+        }
+        if (auto *cte = part->contentTransferEncoding())
+            cte->setEncoding(KMime::Headers::CEbinary);
+        part->setBody(payload);
+    });
+    return complete;
+}
+
+static bool verifyRoundTrip(const QByteArray &stub, const QList<MailStore::PartRef> &parts,
+                            QString *reason)
+{
+    KMime::Message check;
+    check.setContent(KMime::CRLFtoLF(stub));
+    check.parse();
+    if (!restoreAttachments(&check, parts)) {
+        *reason = QStringLiteral("a payload could not be read back from disk");
+        return false;
+    }
+    QHash<QString, qint64> expect;
+    for (const auto &p : parts)
+        expect.insert(p.partId, p.size);
+    bool ok = true;
+    walkParts(&check, QString(), [&expect, &ok, reason](KMime::Content *part, const QString &id) {
+        const auto it = expect.constFind(id);
+        if (it == expect.cend())
+            return;
+        const qint64 got = part->decodedBody().size();
+        if (got != it.value()) {
+            // Back, but not with the bytes we stored.
+            *reason = QStringLiteral("part %1 came back %2 bytes, expected %3")
+                          .arg(id).arg(got).arg(it.value());
+            ok = false;
+        }
+    });
+    return ok;
+}
+
 static const auto kWalletService = QStringLiteral("mailo");
 static const auto kWalletKey = QStringLiteral("imap-password");
+
+// Background-sync pacing. Headers are cheap, bodies move real bandwidth, so
+// they are fetched in modest windows with a deliberate pause between windows
+// rather than back-to-back. This keeps sustained backfill under the rate/
+// bandwidth limits that make servers like Gmail drop the connection. The
+// adaptive backoff (backoffBackfill) still layers on top when a server pushes
+// back regardless.
+static constexpr int kHeaderWindow = 200;   ///< headers fetched per request
+static constexpr int kHeaderPauseMs = 400;  ///< pause between header windows
+static constexpr int kBodyPauseMs = 600;    ///< pause between body-fetch batches
+
+// Truncated exponential backoff with full jitter, applied when the server
+// throttles or drops the backfill (see backoffBackfill). Wait time on attempt
+// n (1-based) = min(2^n seconds + [0,1000) ms jitter, cap). After the max
+// number of attempts the backfill pauses until the next (re)connect or folder
+// change, rather than retrying forever.
+static constexpr int kBackoffBaseMs = 1000;   ///< 2^1 * 500 → ~1 s first wait
+static constexpr int kBackoffCapMs = 64000;   ///< per-attempt ceiling (64 s)
+static constexpr int kBackoffJitterMs = 1000; ///< full jitter added on top
+static constexpr int kBackoffMaxAttempts = 8; ///< then pause syncing
+
+/// True when the IMAP error text carries a throttling response code such as
+/// Gmail's [THROTTLED] or [TOO-MANY-SIMULTANEOUS-CONNECTIONS]. Case-folded so
+/// server casing differences don't matter.
+static bool isThrottleError(const QString &err)
+{
+    const QString e = err.toUpper();
+    return e.contains(QStringLiteral("THROTTL"))
+        || e.contains(QStringLiteral("TOO-MANY-SIMULTANEOUS-CONNECTIONS"))
+        || e.contains(QStringLiteral("TOO MANY SIMULTANEOUS CONNECTIONS"));
+}
+
+/// True specifically for the concurrent-connection cap, which we answer by
+/// using fewer connections, not just by waiting.
+static bool isTooManyConnections(const QString &err)
+{
+    return err.toUpper().contains(QStringLiteral("SIMULTANEOUS-CONNECTIONS"))
+        || err.toUpper().contains(QStringLiteral("SIMULTANEOUS CONNECTIONS"));
+}
 
 /// First Authentication-Results header stamped by our own receiving server
 /// (senders can forge their own AR headers, so foreign authserv-ids are
@@ -149,9 +325,31 @@ static QString countNoun(qint64 n, const char *singular, const char *plural)
         QLatin1String(n == 1 ? singular : plural));
 }
 
+/// Opt-in diagnostics (Settings -> General -> "Log activity to console"). Off
+/// by default so a normal run stays quiet; toggling needs no restart.
+Q_LOGGING_CATEGORY(logTrace, "mailo.trace")
+
+/// Condense a verbose/multi-line error (often a raw server or KJob string)
+/// into a terse status crumb: first line only, trailing punctuation trimmed,
+/// and clipped so it never bloats the status line.
+static QString shortenError(const QString &err)
+{
+    QString s = err.section(QLatin1Char('\n'), 0, 0).simplified();
+    while (!s.isEmpty() && (s.endsWith(QLatin1Char('.')) || s.endsWith(QLatin1Char(':'))))
+        s.chop(1);
+    constexpr int kMaxLen = 60;
+    if (s.size() > kMaxLen)
+        s = s.left(kMaxLen - 1).trimmed() + QStringLiteral("…");
+    return s;
+}
+
 MailClient::MailClient(QObject *parent)
     : QObject(parent)
 {
+    // Errors go into the status breadcrumb (short), not passive popups.
+    connect(this, &MailClient::errorOccurred, this, [this](const QString &msg) {
+        setStatus(shortenError(msg));
+    });
     loadAccount();
     m_folderModel.setAccountKey(accountKey());
     m_store.open();
@@ -168,7 +366,9 @@ MailClient::MailClient(QObject *parent)
     updatePageAnchor(cachedInbox);
     if (!cachedInbox.isEmpty()) {
         m_messageModel.setHeaders(cachedInbox);
-        setStatus(tr("INBOX — %1 cached.").arg(countNoun(cachedInbox.size(), "message", "messages")));
+        // Real cache size from SQL — cachedInbox is one page (max 1000 rows).
+        setStatus(tr("INBOX — %1 cached")
+                      .arg(m_store.cachedHeaderCount(m_selectedFolder)));
     }
 
     // Keepalive ping so the server doesn't drop us as an idle connection.
@@ -182,6 +382,9 @@ MailClient::MailClient(QObject *parent)
     // running; a no-op whenever the IDLE job is alive.
     m_refreshMinutes = qBound(
         0, appSettings().value(QStringLiteral("ui/refreshMinutes"), 5).toInt(), 24 * 60);
+    m_maxBodyMB =
+        qBound(0, appSettings().value(QStringLiteral("ui/maxBodyMB"), 5).toInt(), 1024);
+    setDebugLogging(appSettings().value(QStringLiteral("ui/debugLogging"), false).toBool());
     connect(&m_pollTimer, &QTimer::timeout, this, [this] {
         if (m_connected && !m_idleJob)
             refreshCurrentFolder();
@@ -201,11 +404,20 @@ MailClient::MailClient(QObject *parent)
     m_backfillTimer.setSingleShot(true);
     m_backfillTimer.setInterval(4000);
     connect(&m_backfillTimer, &QTimer::timeout, this, [this] {
-        if (!m_connected || !m_session || m_searchActive)
+        if (!m_connected || !m_session || m_searchActive || m_syncPaused)
             return;
-        // Something user-triggered (or a prefetch) is running — retry later.
-        if (m_busy || m_headerFetch || m_prefetching || !m_prefetchQueue.isEmpty()) {
-            m_backfillTimer.start();
+        // The dedicated sync connection may have been dropped on its own (e.g.
+        // Gmail throttling the backfill while leaving the main session up).
+        // Bring it back before the next window so background work doesn't
+        // silently stall or serialize onto the user's connection.
+        if (!m_syncSession) {
+            startSyncSession();
+            m_backfillTimer.start(1000); // give the new session time to log in
+            return;
+        }
+        // Something user-triggered (or a prefetch) is running — retry soon.
+        if (m_busy || m_headerFetch || bodyFetchActive() || !m_prefetchQueue.isEmpty()) {
+            m_backfillTimer.start(500);
             return;
         }
         if (m_oldestFetchedSeq > 1) {
@@ -213,7 +425,11 @@ MailClient::MailClient(QObject *parent)
             fetchOlderFromServer();
             return;
         }
-        backfillBodies();
+        if (backfillBodies(m_selectedFolder))
+            return;
+        // The open folder is completely cached — sync the account's other
+        // folders so offline reading and search cover the whole mailbox.
+        continueFolderBackfill();
     });
 
     // Search-index repair: cached bodies queued for re-indexing (after an
@@ -222,6 +438,11 @@ MailClient::MailClient(QObject *parent)
     m_reindexTimer.setInterval(300);
     connect(&m_reindexTimer, &QTimer::timeout, this, [this] { reindexPendingBodies(); });
     m_reindexTimer.start();
+
+    // Old mail still has its attachments inside the message BLOBs; move them
+    // out in the background. Deferred so it never competes with startup.
+    if (m_store.attachmentMigrationPending())
+        QTimer::singleShot(8000, this, [this] { startAttachmentMigration(); });
 }
 
 void MailClient::loadCachedFolderModel()
@@ -253,6 +474,37 @@ void MailClient::setRefreshMinutes(int minutes)
     else
         m_pollTimer.stop();
     Q_EMIT refreshMinutesChanged();
+}
+
+void MailClient::setDebugLogging(bool on)
+{
+    m_debugLogging = on;
+    appSettings().setValue(QStringLiteral("ui/debugLogging"), on);
+    // Rules, not a boolean check at each call site: disabled categories cost
+    // nothing, and QT_LOGGING_RULES in the environment still wins for a
+    // developer who wants the trace without touching the setting.
+    QLoggingCategory::setFilterRules(on ? QStringLiteral("mailo.trace.debug=true")
+                                        : QStringLiteral("mailo.trace.debug=false"));
+    Q_EMIT debugLoggingChanged();
+}
+
+void MailClient::setMaxBodyMB(int mb)
+{
+    mb = qBound(0, mb, 1024);
+    if (m_maxBodyMB == mb)
+        return;
+    const bool raised = mb == 0 || mb > m_maxBodyMB;
+    m_maxBodyMB = mb;
+    appSettings().setValue(QStringLiteral("ui/maxBodyMB"), mb);
+    if (raised) {
+        // Messages refused under the old, smaller limit become eligible again.
+        const int freed = m_store.unskipBodiesUpTo(qint64(mb) * 1024 * 1024);
+        if (freed > 0) {
+            invalidateMissingBodies();
+            scheduleBackfill(1000);
+        }
+    }
+    Q_EMIT maxBodyMBChanged();
 }
 
 void MailClient::setDateFormat(const QString &format)
@@ -334,13 +586,15 @@ void MailClient::toggleCachedCollapsed(int index, const QString &mailBox)
 
 void MailClient::openFolderInAccount(int index, const QString &mailBox)
 {
+    qCDebug(logTrace, "openFolderInAccount(%d, %s)  current=%d",
+            index, qUtf8Printable(mailBox), m_currentAccount);
     if (index == m_currentAccount) {
         openFolder(mailBox);
         return;
     }
-    switchAccountInternal(index, QString());
-    // Opened once the new account's connection has listed its folders.
-    m_pendingFolder = mailBox;
+    // The switch itself shows this folder's cache and opens it once the new
+    // account's connection has listed its folders.
+    switchAccountInternal(index, QString(), mailBox);
 }
 
 bool MailClient::hasAccount() const
@@ -434,6 +688,7 @@ void MailClient::loadAccountFields()
     m_clientId = s.value(QStringLiteral("clientId")).toString();
     m_clientSecret = s.value(QStringLiteral("clientSecret")).toString();
     m_signature = s.value(QStringLiteral("signature")).toString();
+    m_htmlMail = s.value(QStringLiteral("htmlMail"), true).toBool();
     s.endArray();
     m_accessToken.clear(); // tokens never survive an account switch
     m_refreshToken.clear();
@@ -568,6 +823,8 @@ QVariantMap MailClient::accountDetails(int index) const
                    s.value(QStringLiteral("clientSecret")).toString());
         out.insert(QStringLiteral("signature"),
                    s.value(QStringLiteral("signature")).toString());
+        out.insert(QStringLiteral("htmlMail"),
+                   s.value(QStringLiteral("htmlMail"), true).toBool());
     }
     s.endArray();
     return out;
@@ -603,6 +860,7 @@ void MailClient::saveAccountDetails(int index, const QVariantMap &d)
     s.setValue(QStringLiteral("clientSecret"),
                d.value(QStringLiteral("clientSecret")).toString());
     s.setValue(QStringLiteral("signature"), d.value(QStringLiteral("signature")).toString());
+    s.setValue(QStringLiteral("htmlMail"), d.value(QStringLiteral("htmlMail"), true).toBool());
     s.endArray();
 
     if (authType == 0) {
@@ -634,7 +892,7 @@ void MailClient::removeAccount(int index)
             QStringLiteral("user"), QStringLiteral("smtpHost"), QStringLiteral("smtpPort"),
             QStringLiteral("smtpSecurity"), QStringLiteral("authType"),
             QStringLiteral("clientId"), QStringLiteral("clientSecret"),
-            QStringLiteral("signature")};
+            QStringLiteral("signature"), QStringLiteral("htmlMail")};
         for (const QString &k : keys)
             a.insert(k, s.value(k));
         accounts.append(a);
@@ -681,31 +939,39 @@ void MailClient::switchAccount(int index)
     switchAccountInternal(index, QString());
 }
 
-void MailClient::switchAccountInternal(int index, const QString &sessionPassword)
+void MailClient::switchAccountInternal(int index, const QString &sessionPassword,
+                                       const QString &targetFolder)
 {
+    qCDebug(logTrace, "switchAccountInternal(%d)  pendingWas=%s",
+            index, qUtf8Printable(m_pendingFolder));
     QSettings s = appSettings();
     s.setValue(QStringLiteral("currentAccount"), index);
     m_currentAccount = index;
 
+    // Set the destination before anything is torn down, so no observer ever
+    // sees a blank selection: the sidebar highlight binds to it, and a moment
+    // of "" made it fall back to row 0 — INBOX — mid-switch.
+    m_selectedFolder = targetFolder.isEmpty() ? QStringLiteral("INBOX") : targetFolder;
+    m_pendingFolder = targetFolder;
+    Q_EMIT selectedFolderChanged();
+
     teardownSession();
     m_folderModel.setFolders({});
     m_messageModel.clear();
-    m_selectedFolder.clear();
-    m_pendingFolder.clear();
     m_oldestFetchedSeq = 0;
     m_searchActive = false;
 
     loadAccountFields();
     m_folderModel.setAccountKey(accountKey());
     m_store.setAccountKey(accountKey());
-    // The switched-to account's sidebar and INBOX come straight from cache;
-    // the network refresh merges into them once connected.
+    // The switched-to account's sidebar and the target folder come straight
+    // from cache; the network refresh merges into them once connected.
     loadCachedFolderModel();
-    m_selectedFolder = QStringLiteral("INBOX");
-    const auto cachedInbox = m_store.cachedHeaders(m_selectedFolder);
-    updatePageAnchor(cachedInbox);
-    if (!cachedInbox.isEmpty())
-        m_messageModel.setHeaders(cachedInbox);
+    // Cached contents of the folder being opened — not INBOX's, which is what
+    // made the message list show INBOX until the server's folder list arrived.
+    const auto cached = m_store.cachedHeaders(m_selectedFolder);
+    updatePageAnchor(cached);
+    m_messageModel.setHeaders(cached);
     if (!sessionPassword.isEmpty()) {
         ++m_walletGen; // cancel any in-flight wallet read
         m_password = sessionPassword;
@@ -725,13 +991,14 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
         m_connectWhenReady = true;
 }
 
-void MailClient::sendMail(const QString &to, const QString &cc, const QString &subject,
-                          const QString &html, const QList<QUrl> &attachments)
+void MailClient::sendMail(const QString &to, const QString &cc, const QString &bcc,
+                          const QString &subject, const QString &html,
+                          const QList<QUrl> &attachments)
 {
     const bool haveCredential = m_authType != 0 ? !m_accessToken.isEmpty()
                                                 : !m_password.isEmpty();
     if (m_smtpHost.isEmpty() || m_user.isEmpty() || !haveCredential) {
-        Q_EMIT errorOccurred(tr("SMTP is not configured (check account settings)."));
+        Q_EMIT sendFailed(tr("SMTP is not configured (check account settings)."));
         return;
     }
     // Defense against header/SMTP-command injection: no CR/LF survives, and
@@ -747,7 +1014,7 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
         for (const QString &part : parts) {
             const QString addr = part.trimmed();
             if (!addrRe.match(addr).hasMatch()) {
-                Q_EMIT errorOccurred(tr("Invalid recipient address: %1").arg(addr));
+                Q_EMIT sendFailed(tr("Invalid recipient address: %1").arg(addr));
                 *ok = false;
                 return {};
             }
@@ -761,10 +1028,13 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
     if (!ok)
         return;
     if (toList.isEmpty()) {
-        Q_EMIT errorOccurred(tr("No recipient given."));
+        Q_EMIT sendFailed(tr("No recipient given."));
         return;
     }
     const QStringList ccList = parseAddresses(cc, &ok);
+    if (!ok)
+        return;
+    const QStringList bccList = parseAddresses(bcc, &ok);
     if (!ok)
         return;
     QString cleanSubject = subject;
@@ -785,20 +1055,24 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
     msg->subject()->fromUnicodeString(cleanSubject);
     msg->date()->setDateTime(QDateTime::currentDateTime());
     msg->messageID()->generate(m_smtpHost.toUtf8());
-    msg->userAgent()->fromUnicodeString(QStringLiteral("mailo/0.1"));
+    msg->userAgent()->fromUnicodeString(QStringLiteral("mailo/0.9"));
 
     const QString plain = QTextDocumentFragment::fromHtml(html).toPlainText();
 
-    // text + html alternative pair
-    auto alternative = std::make_unique<KMime::Content>();
-    alternative->contentType()->setMimeType("multipart/alternative");
-    alternative->contentType()->setBoundary(KMime::multiPartBoundary());
-    {
-        auto textPart = std::make_unique<KMime::Content>();
-        textPart->contentType()->setMimeType("text/plain");
-        textPart->contentType()->setCharset("utf-8");
-        textPart->contentTransferEncoding()->setEncoding(KMime::Headers::CEquPr);
-        textPart->fromUnicodeString(plain);
+    auto textPart = std::make_unique<KMime::Content>();
+    textPart->contentType()->setMimeType("text/plain");
+    textPart->contentType()->setCharset("utf-8");
+    textPart->contentTransferEncoding()->setEncoding(KMime::Headers::CEquPr);
+    textPart->fromUnicodeString(plain);
+
+    msg->contentType()->setMimeType("multipart/mixed");
+    msg->contentType()->setBoundary(KMime::multiPartBoundary());
+
+    if (m_htmlMail) {
+        // text + html alternative pair — receiving clients pick their format
+        auto alternative = std::make_unique<KMime::Content>();
+        alternative->contentType()->setMimeType("multipart/alternative");
+        alternative->contentType()->setBoundary(KMime::multiPartBoundary());
         alternative->appendContent(std::move(textPart));
 
         auto htmlPart = std::make_unique<KMime::Content>();
@@ -807,18 +1081,19 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
         htmlPart->contentTransferEncoding()->setEncoding(KMime::Headers::CEquPr);
         htmlPart->fromUnicodeString(html);
         alternative->appendContent(std::move(htmlPart));
-    }
 
-    msg->contentType()->setMimeType("multipart/mixed");
-    msg->contentType()->setBoundary(KMime::multiPartBoundary());
-    msg->appendContent(std::move(alternative));
+        msg->appendContent(std::move(alternative));
+    } else {
+        // Plain-text-only account: the text part stands alone.
+        msg->appendContent(std::move(textPart));
+    }
 
     {
         QMimeDatabase mimeDb;
         for (const QUrl &url : attachments) {
             QFile file(url.toLocalFile());
             if (!file.open(QIODevice::ReadOnly)) {
-                Q_EMIT errorOccurred(tr("Could not read attachment %1.").arg(url.toLocalFile()));
+                Q_EMIT sendFailed(tr("Could not read attachment %1.").arg(url.toLocalFile()));
                 return;
             }
             const QString name = QFileInfo(file).fileName();
@@ -836,8 +1111,10 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
     msg->assemble();
 
     // --- Ship it over SMTP ---
+    // Sending is silent in the status log: success just closes the compose
+    // window (mailSent), failure keeps it open with a dismissible dialog
+    // (sendFailed). The busy spinner covers the in-progress state.
     setBusy(true);
-    setStatus(tr("Sending…"));
 
     auto *session = new KSmtp::Session(m_smtpHost, quint16(m_smtpPort), this);
     switch (m_smtpSecurity) {
@@ -852,24 +1129,23 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
         break;
     }
 
-    auto finish = [this, session, msg, toList, ccList](const QString &error) {
+    auto finish = [this, session, msg, toList, ccList, bccList](const QString &error) {
         setBusy(false);
         if (error.isEmpty()) {
-            setStatus(tr("Message sent."));
-            for (const QString &addr : toList + ccList)
+            for (const QString &addr : toList + ccList + bccList)
                 m_store.addRecipient(addr);
-            Q_EMIT mailSent();
+            Q_EMIT mailSent(); // compose window closes on this
             appendToSentFolder(msg->encodedContent(KMime::NewlineType::CRLF));
         } else {
-            setStatus(tr("Sending failed."));
-            Q_EMIT errorOccurred(error);
+            // Keep the compose window open and show the full error there.
+            Q_EMIT sendFailed(error);
         }
         session->quit();
         session->deleteLater();
     };
 
     connect(session, &KSmtp::Session::stateChanged, this,
-            [this, session, msg, toList, ccList, fromAddr, finish](KSmtp::Session::State state) {
+            [this, session, msg, toList, ccList, bccList, fromAddr, finish](KSmtp::Session::State state) {
                 if (state != KSmtp::Session::NotAuthenticated)
                     return;
                 auto *login = new KSmtp::LoginJob(session);
@@ -881,7 +1157,7 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
                     login->setPassword(m_password);
                 }
                 connect(login, &KJob::result, this,
-                        [session, msg, toList, ccList, fromAddr, finish](KJob *job) {
+                        [session, msg, toList, ccList, bccList, fromAddr, finish](KJob *job) {
                             if (job->error()) {
                                 finish(job->errorString());
                                 return;
@@ -891,6 +1167,10 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
                             send->setTo(toList);
                             if (!ccList.isEmpty())
                                 send->setCc(ccList);
+                            // Bcc goes into the SMTP envelope only — never a
+                            // header, so recipients can't see the Bcc list.
+                            if (!bccList.isEmpty())
+                                send->setBcc(bccList);
                             send->setData(msg->encodedContent(KMime::NewlineType::CRLF));
                             QObject::connect(send, &KJob::result, session, [finish](KJob *job) {
                                 finish(job->error() ? job->errorString() : QString());
@@ -905,11 +1185,11 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &s
 void MailClient::appendToSentFolder(const QByteArray &rawMessage)
 {
     if (!m_connected || !m_session) {
-        setStatus(tr("Sent — not copied to the Sent folder (IMAP offline)."));
+        setStatus(tr("Sent — not copied to the Sent folder (IMAP offline)"));
         return;
     }
     if (m_sentFolder.isEmpty()) {
-        setStatus(tr("Sent — no Sent folder found on the server to copy into."));
+        setStatus(tr("Sent — no Sent folder found on the server to copy into"));
         return;
     }
     auto *append = new KIMAP::AppendJob(m_session);
@@ -918,11 +1198,11 @@ void MailClient::appendToSentFolder(const QByteArray &rawMessage)
     append->setFlags({QByteArrayLiteral("\\Seen")});
     append->setInternalDate(QDateTime::currentDateTime());
     connect(append, &KJob::result, this, [this](KJob *job) {
+        // Success is silent — the closed compose window and the message showing
+        // up in Sent are confirmation enough. Only a copy failure is logged.
         if (job->error()) {
             Q_EMIT errorOccurred(
                 tr("Sent, but copying to %1 failed: %2").arg(m_sentFolder, job->errorString()));
-        } else {
-            setStatus(tr("Message sent and saved to %1.").arg(m_sentFolder));
         }
     });
     append->start();
@@ -950,6 +1230,29 @@ QString MailClient::signatureBlock() const
     if (const auto m = bodyRe.match(fragment); m.hasMatch())
         fragment = m.captured(1);
     return fragment;
+}
+
+// Inner <body> content of an HTML mail, prepared for embedding into the
+// compose editor: <style>/<script> blocks go (QTextDocument would render
+// their text), and cid: images go (the editor cannot resolve them).
+static QString quotableHtml(QString html)
+{
+    static const QRegularExpression bodyRe(
+        QStringLiteral("<body[^>]*>(.*)</body>"),
+        QRegularExpression::DotMatchesEverythingOption
+            | QRegularExpression::CaseInsensitiveOption);
+    if (const auto m = bodyRe.match(html); m.hasMatch())
+        html = m.captured(1);
+    static const QRegularExpression styleScriptRe(
+        QStringLiteral("<(style|script)\\b[^>]*>.*?</\\1\\s*>"),
+        QRegularExpression::DotMatchesEverythingOption
+            | QRegularExpression::CaseInsensitiveOption);
+    html.remove(styleScriptRe);
+    static const QRegularExpression cidImgRe(
+        QStringLiteral("<img\\b[^>]*\\bsrc\\s*=\\s*[\"']cid:[^>]*>"),
+        QRegularExpression::CaseInsensitiveOption);
+    html.remove(cidImgRe);
+    return html;
 }
 
 QString MailClient::newMessageBody() const
@@ -1018,11 +1321,12 @@ QVariantMap MailClient::replyData(bool replyAll)
     if (!subject.startsWith(QLatin1String("Re:"), Qt::CaseInsensitive))
         subject = QStringLiteral("Re: ") + subject;
 
-    // Quote the plain-text part (or the HTML stripped to text) — the compose
-    // editor is a QTextDocument, which would mangle full email HTML anyway.
-    QString quoted = m_currentTextBody.isEmpty()
-        ? QTextDocumentFragment::fromHtml(m_currentHtmlBody).toPlainText()
-        : m_currentTextBody;
+    // Quote the HTML part when there is one so the reply keeps the original's
+    // formatting; the plain-text part is the fallback.
+    const QString quoted = m_currentHtmlBody.isEmpty()
+        ? m_currentTextBody.trimmed().toHtmlEscaped()
+              .replace(QLatin1Char('\n'), QLatin1String("<br>"))
+        : quotableHtml(m_currentHtmlBody);
     const QString fromDisplay = msg->from() ? msg->from()->asUnicodeString() : QString();
     QString date;
     if (msg->date()) {
@@ -1033,8 +1337,7 @@ QVariantMap MailClient::replyData(bool replyAll)
     const QString body = QStringLiteral("<p><br></p>") + signatureBlock()
         + QStringLiteral("<p>")
         + tr("On %1, %2 wrote:").arg(date, fromDisplay).toHtmlEscaped()
-        + QStringLiteral("</p><blockquote>")
-        + quoted.trimmed().toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"))
+        + QStringLiteral("</p><blockquote>") + quoted
         + QStringLiteral("</blockquote>");
 
     return {{QStringLiteral("to"), to.join(QStringLiteral(", "))},
@@ -1054,9 +1357,10 @@ QVariantMap MailClient::forwardData()
         && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
         subject = QStringLiteral("Fwd: ") + subject;
 
-    QString quoted = m_currentTextBody.isEmpty()
-        ? QTextDocumentFragment::fromHtml(m_currentHtmlBody).toPlainText()
-        : m_currentTextBody;
+    const QString quoted = m_currentHtmlBody.isEmpty()
+        ? m_currentTextBody.trimmed().toHtmlEscaped()
+              .replace(QLatin1Char('\n'), QLatin1String("<br>"))
+        : quotableHtml(m_currentHtmlBody);
     const QString from = msg->from() ? msg->from()->asUnicodeString() : QString();
     const QString origTo = msg->to() ? msg->to()->asUnicodeString() : QString();
     const QString origSubject =
@@ -1076,8 +1380,7 @@ QVariantMap MailClient::forwardData()
     // Signature goes above the forwarded block, right under the cursor line.
     const QString body = QStringLiteral("<p><br></p>") + signatureBlock()
         + QStringLiteral("<p>") + header
-        + QStringLiteral("</p><blockquote>")
-        + quoted.trimmed().toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"))
+        + QStringLiteral("</p><blockquote>") + quoted
         + QStringLiteral("</blockquote>");
 
     return {{QStringLiteral("to"), QString()},
@@ -1113,12 +1416,120 @@ void MailClient::setBusy(bool busy)
     Q_EMIT busyChanged();
 }
 
+// Collapse key for the breadcrumb: statuses about the same subject replace
+// each other in place instead of stacking. Folder statuses are formatted as
+// "FOLDER — detail…", so the key is the part before the em-dash — every
+// "INBOX — checking… / cached, refreshing… / N of M headers…" update becomes
+// one INBOX crumb that updates in place. Statuses without an em-dash (errors,
+// "Loaded from cache", "Message sent") each key on their own digit-stripped
+// text, so distinct ones still accrue but repeats don't.
+static QString statusStem(const QString &s)
+{
+    const int dash = s.indexOf(QStringLiteral(" — "));
+    if (dash > 0)
+        return s.left(dash).simplified();
+    QString stem;
+    stem.reserve(s.size());
+    for (const QChar &c : s) {
+        if (!c.isDigit())
+            stem.append(c);
+    }
+    return stem.simplified();
+}
+
 void MailClient::setStatus(const QString &text)
 {
-    if (m_statusText == text)
+    // Keep a short breadcrumb of recent statuses instead of overwriting, so the
+    // user can see the recent history (e.g. "fetching older… · cached ·
+    // connected"), newest first. Progress updates that only change their
+    // numbers replace the head rather than piling up.
+    // An empty status means "the transient op finished" — don't add or wipe
+    // anything; the trail keeps showing the last real state (folder sync etc.).
+    if (text.isEmpty())
         return;
-    m_statusText = text;
+
+    const int maxTrail = 6;
+    if (!m_statusTrail.isEmpty() && statusStem(m_statusTrail.first()) == statusStem(text)) {
+        if (m_statusTrail.first() == text)
+            return; // identical — nothing changed
+        m_statusTrail.first() = text; // same subject, updated detail/numbers
+    } else {
+        m_statusTrail.prepend(text);
+        while (m_statusTrail.size() > maxTrail)
+            m_statusTrail.removeLast();
+    }
+
+    const QString composed = m_statusTrail.join(QStringLiteral("  ·  "));
+    if (m_statusText == composed)
+        return;
+    m_statusText = composed;
     Q_EMIT statusTextChanged();
+}
+
+void MailClient::copyToClipboard(const QString &text) const
+{
+    if (auto *cb = QGuiApplication::clipboard())
+        cb->setText(text);
+}
+
+QString MailClient::aboutText() const
+{
+    // ABOUT.md is compiled into the binary as a Qt resource at build time.
+    QFile f(QStringLiteral(":/ABOUT.md"));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+    return QString::fromUtf8(f.readAll());
+}
+
+/// Cached "how many bodies are still missing here". The underlying query is a
+/// LEFT JOIN over the whole folder — 200 ms on a large one — and the backfill
+/// asked for it on every 600 ms tick purely to word a status crumb. It is
+/// recomputed on folder change and when new headers arrive, and counted down
+/// locally as bodies land.
+int MailClient::missingBodiesIn(const QString &folder)
+{
+    if (folder != m_missingBodiesFolder || m_missingBodies < 0) {
+        m_missingBodiesFolder = folder;
+        m_missingBodies = m_store.missingBodyCount(folder);
+    }
+    return m_missingBodies;
+}
+
+void MailClient::noteBodyStored(const QString &folder)
+{
+    if (folder == m_missingBodiesFolder && m_missingBodies > 0)
+        --m_missingBodies;
+}
+
+void MailClient::invalidateMissingBodies()
+{
+    m_missingBodies = -1;
+}
+
+QString MailClient::openFolderSyncStatus(const QString &folder)
+{
+    if (folder.isEmpty() || folder != m_selectedFolder)
+        return {};
+
+    QStringList parts;
+    // Header sync: still older messages to pull from the server.
+    if (m_folderMessageCount > 0 && m_oldestFetchedSeq > 1) {
+        const qint64 synced = m_folderMessageCount - m_oldestFetchedSeq + 1;
+        parts << tr("%1 of %2 headers")
+                     .arg(synced)
+                     .arg(m_folderMessageCount);
+    }
+    // Body caching: message bodies still to fetch for offline/search.
+    const int missingBodies = missingBodiesIn(folder);
+    if (missingBodies > 0) {
+        parts << (missingBodies == 1
+                      ? tr("caching 1 body")
+                      : tr("caching %1 bodies").arg(missingBodies));
+    }
+    if (parts.isEmpty())
+        return {};
+    // "INBOX — 500 of 1200 headers · caching 42 bodies…"
+    return tr("%1 — %2").arg(folder, parts.join(QStringLiteral(" · ")));
 }
 
 void MailClient::teardownSession()
@@ -1127,15 +1538,35 @@ void MailClient::teardownSession()
     m_backfillTimer.stop();
     m_backfill = false;
     m_bodyBackfill = false;
+    resetBackfillBackoff();
+    m_folderBackfillQueue.clear();
+    m_backfillFolder.clear();
+    m_folderBackfillPassDone = false;
     m_prefetchQueue.clear();
+    m_prefetching = false;
+    for (const auto &conn : std::as_const(m_bodyPool)) {
+        if (conn->session)
+            conn->session->deleteLater();
+    }
+    m_bodyPool.clear();
+    m_bodyPoolBroken = false;
     stopIdle();
     m_syncReady = false;
     m_syncFolder.clear();
     if (m_syncSession) {
+        m_syncSession->disconnect(this); // same reason as the main session below
         m_syncSession->deleteLater();
         m_syncSession.clear();
     }
     if (m_session) {
+        // Drop our handlers before closing. close() makes the socket emit
+        // connectionLost, which is meant for an *unexpected* drop: it stashes
+        // the open folder in m_pendingFolder to reopen after reconnecting.
+        // During a deliberate teardown that signal arrives asynchronously —
+        // after openFolderInAccount() has already set m_pendingFolder to the
+        // folder the user clicked — and overwrote it with the new account's
+        // default INBOX, so switching accounts always landed on INBOX.
+        m_session->disconnect(this);
         m_session->close();
         m_session->deleteLater();
         m_session = nullptr;
@@ -1144,7 +1575,13 @@ void MailClient::teardownSession()
         m_connected = false;
         Q_EMIT connectedChanged();
     }
-    m_selectedFolder.clear();
+    // m_selectedFolder deliberately survives a teardown. connectAccount() tears
+    // the session down as its first step, so clearing here wiped the folder an
+    // account switch had just chosen — leaving every consumer (the sidebar
+    // highlight, openCurrent()'s "already open?" guard, and the keep-current
+    // fallback when the folder list arrives) comparing against an empty string.
+    // Everything that acts on it is already guarded by m_connected, and the
+    // paths that really mean "nothing is open" clear it themselves.
 }
 
 void MailClient::configureLogin(KIMAP::LoginJob *login) const
@@ -1237,12 +1674,20 @@ void MailClient::startSyncSession()
         return;
     m_syncSession = new KIMAP::Session(m_host, quint16(m_port), this);
     const auto drop = [this] {
+        // A connection dropped while a backfill fetch was in flight is the
+        // server pushing back on heavy fetching (Gmail does this rather than
+        // failing the job cleanly). Treat it as throttling: grow the backoff
+        // so we don't reconnect and immediately hammer it at full speed again.
+        const bool wasFetching = m_backfill || bodyFetchActive();
         m_syncReady = false;
         m_syncFolder.clear();
+        m_backfill = false;
         if (m_syncSession) {
             m_syncSession->deleteLater();
             m_syncSession.clear();
         }
+        if (wasFetching)
+            backoffBackfill();
     };
     connect(m_syncSession, &KIMAP::Session::connectionFailed, this, drop);
     connect(m_syncSession, &KIMAP::Session::connectionLost, this, drop);
@@ -1293,6 +1738,7 @@ void MailClient::refreshCurrentFolder()
     auto *select = new KIMAP::SelectJob(m_session);
     select->setMailBox(m_selectedFolder);
     select->setOpenReadOnly(true);
+    m_folderReadWrite = false;
     connect(select, &KJob::result, this, [this](KJob *job) {
         if (job->error())
             return;
@@ -1335,7 +1781,7 @@ void MailClient::acquireTokenAndConnect()
                 del->setKey(oauthWalletKey());
                 del->start();
             }
-            setStatus(tr("Sign-in failed."));
+            setStatus(tr("Sign-in failed"));
             Q_EMIT errorOccurred(message);
         });
     }
@@ -1359,10 +1805,10 @@ void MailClient::acquireTokenAndConnect()
 
     setBusy(true);
     if (!m_refreshToken.isEmpty()) {
-        setStatus(tr("Refreshing sign-in…"));
+        setStatus(tr("Refreshing sign-in"));
         m_oauth->refresh(provider, clientId, clientSecret, m_refreshToken);
     } else {
-        setStatus(tr("Complete the sign-in in your browser…"));
+        setStatus(tr("Sign in in your browser"));
         m_oauth->authorize(provider, clientId, clientSecret);
     }
 }
@@ -1376,7 +1822,7 @@ void MailClient::connectAccount()
     if (!m_secretReady) {
         // Wallet lookup still in flight — connect as soon as it lands.
         m_connectWhenReady = true;
-        setStatus(tr("Waiting for the system wallet…"));
+        setStatus(tr("Waiting for wallet"));
         return;
     }
     if (m_authType != 0) {
@@ -1397,7 +1843,7 @@ void MailClient::connectAccount()
     teardownSession();
 
     setBusy(true);
-    setStatus(tr("Connecting to %1:%2…").arg(m_host).arg(m_port));
+    setStatus(tr("Connecting to %1:%2").arg(m_host).arg(m_port));
 
     m_session = new KIMAP::Session(m_host, quint16(m_port), this);
     // No SessionUiProxy is installed on purpose: KIMAP then rejects invalid
@@ -1405,7 +1851,7 @@ void MailClient::connectAccount()
     connect(m_session, &KIMAP::Session::connectionFailed, this, [this] {
         setBusy(false);
         teardownSession();
-        setStatus(tr("Connection failed."));
+        setStatus(tr("Connection failed"));
         Q_EMIT errorOccurred(
             tr("Could not establish a secure connection to %1:%2 — wrong host/port, "
                "or the server's TLS certificate was rejected.")
@@ -1416,7 +1862,7 @@ void MailClient::connectAccount()
         setBusy(false);
         m_pendingFolder = m_selectedFolder; // restore it after reconnect
         teardownSession();
-        setStatus(tr("Connection lost. Reconnecting…"));
+        setStatus(tr("Reconnecting"));
         QTimer::singleShot(2000, this, [this] {
             if (!m_connected && hasAccount())
                 connectAccount();
@@ -1429,7 +1875,7 @@ void MailClient::connectAccount()
     connect(login, &KJob::result, this, [this](KJob *job) {
         if (job->error()) {
             setBusy(false);
-            setStatus(tr("Login failed."));
+            setStatus(tr("Login failed"));
             Q_EMIT errorOccurred(job->errorString());
             teardownSession();
             return;
@@ -1438,10 +1884,345 @@ void MailClient::connectAccount()
         Q_EMIT connectedChanged();
         m_keepAlive.start();
         startSyncSession();
-        setStatus(tr("Connected. Loading folders…"));
+        // No "loading folders" crumb — the busy spinner shows the activity.
         listFolders();
     });
     login->start();
+}
+
+/// Hands a fetched body to the writer thread. Writing one costs tens of ms —
+/// a ~100 KB blob plus its FTS rows — and bodies stream in 50 to a batch, so
+/// doing it inline was tens of stalls in a row on the GUI thread.
+void MailClient::queueBodyWrite(MailStore::BodyWrite &&write)
+{
+    {
+        QMutexLocker lock(&m_bodyWriteMutex);
+        m_bodyWriteQueue.append(std::move(write));
+    }
+    if (!m_bodyWriterThread) {
+        m_bodyWriterStop.storeRelaxed(0);
+        m_bodyWriterThread = QThread::create([this] { runBodyWriter(); });
+        m_bodyWriterThread->setPriority(QThread::LowPriority);
+        m_bodyWriterThread->start();
+    }
+    m_bodyWriteWake.wakeOne();
+}
+
+void MailClient::runBodyWriter()
+{
+    QSqlDatabase db = MailStore::openWorkerConnection(QStringLiteral("mailstore-bodies"));
+    while (!m_bodyWriterStop.loadRelaxed()) {
+        QList<MailStore::BodyWrite> batch;
+        {
+            QMutexLocker lock(&m_bodyWriteMutex);
+            if (m_bodyWriteQueue.isEmpty()) {
+                // 500 ms so a stop request is noticed promptly even when idle.
+                m_bodyWriteWake.wait(&m_bodyWriteMutex, 500);
+                if (m_bodyWriteQueue.isEmpty())
+                    continue;
+            }
+            // Whatever has piled up goes in one transaction, capped so a burst
+            // never builds an unbounded write.
+            const int take = qMin(m_bodyWriteQueue.size(), 25);
+            batch = m_bodyWriteQueue.mid(0, take);
+            m_bodyWriteQueue.remove(0, take);
+        }
+        // Lift the attachments out here rather than at queue time: hashing,
+        // compressing and writing a payload file is exactly the kind of work
+        // the GUI thread must never do. Parsing a private copy also keeps the
+        // caller's message object (which may be on screen) untouched.
+        for (MailStore::BodyWrite &w : batch) {
+            KMime::Message copy;
+            copy.setContent(KMime::CRLFtoLF(w.raw));
+            copy.parse();
+            w.parts = stripAttachments(&copy);
+            if (!w.parts.isEmpty()) {
+                copy.assemble();
+                w.raw = copy.encodedContent();
+            }
+        }
+        MailStore::writeBodiesOn(db, batch);
+    }
+    // Flush whatever is left so a quit does not lose fetched bodies.
+    QList<MailStore::BodyWrite> rest;
+    {
+        QMutexLocker lock(&m_bodyWriteMutex);
+        rest.swap(m_bodyWriteQueue);
+    }
+    MailStore::writeBodiesOn(db, rest);
+    db.close();
+    QSqlDatabase::removeDatabase(QStringLiteral("mailstore-bodies"));
+}
+
+/// Stops the writer thread and waits for it to flush. It restarts by itself on
+/// the next queueBodyWrite(), so callers only need this to reach a state where
+/// nothing else holds a write lock on the cache.
+void MailClient::stopBodyWriter()
+{
+    if (!m_bodyWriterThread)
+        return;
+    m_bodyWriterStop.storeRelaxed(1);
+    m_bodyWriteWake.wakeAll();
+    m_bodyWriterThread->wait();
+    delete m_bodyWriterThread;
+    m_bodyWriterThread = nullptr;
+}
+
+MailClient::~MailClient()
+{
+    // Shutdown joins five worker threads. If quitting ever hangs, these say
+    // which join it is sitting in rather than leaving a silent process behind.
+    qCDebug(logTrace, "shutdown: stopping body writer");
+    stopBodyWriter();
+    qCDebug(logTrace, "shutdown: stopping purge");
+    stopAllMailPurge();
+    qCDebug(logTrace, "shutdown: stopping attachment migration");
+    stopAttachmentMigration();
+    qCDebug(logTrace, "shutdown: joining reindex");
+    if (m_reindexThread)
+        m_reindexThread->wait();
+    // A vacuum cannot be interrupted; joining is the only safe option, and it
+    // is why the UI warns before starting one.
+    qCDebug(logTrace, "shutdown: joining vacuum");
+    if (m_vacuumThread)
+        m_vacuumThread->wait();
+    qCDebug(logTrace, "shutdown: workers joined");
+}
+
+namespace
+{
+/// Below this, rebuilding the file costs minutes to hand back nothing anyone
+/// would notice.
+constexpr qint64 kReclaimWorthwhile = 16 * 1024 * 1024;
+}
+
+bool MailClient::reclaimWorthwhile()
+{
+    return m_store.reclaimableBytes() >= kReclaimWorthwhile;
+}
+
+QString MailClient::cacheSizeText()
+{
+    // The cache is two stores now: the database and the attachment files.
+    // Reporting only the first would look like mail had gone missing.
+    const qint64 db = m_store.databaseBytes();
+    const qint64 files = m_store.attachmentBytes();
+    const qint64 free = m_store.reclaimableBytes();
+    const QLocale loc;
+    const QString total = loc.formattedDataSize(db + files);
+    if (free < kReclaimWorthwhile)
+        return tr("%1 (%2 attachments)").arg(total, loc.formattedDataSize(files));
+    return tr("%1 (%2 attachments, %3 reclaimable)")
+        .arg(total, loc.formattedDataSize(files), loc.formattedDataSize(free));
+}
+
+void MailClient::reclaimDiskSpace()
+{
+    if (m_reclaiming)
+        return;
+    m_reclaiming = true;
+    Q_EMIT reclaimingChanged();
+    // Pause every background writer: VACUUM takes an exclusive lock, and a
+    // backfill batch landing mid-rebuild would just block on it.
+    m_syncPaused = true;
+    m_backfillTimer.stop();
+    m_reindexTimer.stop();
+    // VACUUM takes an exclusive lock — every other writer must be finished,
+    // not merely asked to stop, before it starts.
+    stopAllMailPurge();
+    stopAttachmentMigration();
+    // The body writer was the one background writer left running through a
+    // rebuild: its batches would have sat on busy_timeout for 15 s a piece
+    // against the exclusive lock, and any that timed out would have lost a
+    // fetched body. Stopping it flushes the queue first.
+    stopBodyWriter();
+    const qint64 before = m_store.databaseBytes();
+    setStatus(tr("Reclaiming disk space — this can take several minutes"));
+
+    m_vacuumThread = QThread::create([this, before] {
+        QString error;
+        const bool ok = MailStore::vacuum(&error);
+        // Back to the GUI thread before touching any state it owns.
+        QMetaObject::invokeMethod(this, [this, ok, error, before] {
+            m_reclaiming = false;
+            Q_EMIT reclaimingChanged();
+            m_syncPaused = false;
+            m_reindexTimer.start();
+            scheduleBackfill(2000);
+            if (!m_allMailFolder.isEmpty())
+                startAllMailPurge();
+            startAttachmentMigration();
+            if (!ok) {
+                Q_EMIT errorOccurred(tr("Reclaiming disk space failed: %1").arg(error));
+                return;
+            }
+            const qint64 freed = before - m_store.databaseBytes();
+            const QLocale loc;
+            setStatus(freed > 0
+                          ? tr("Reclaimed %1").arg(loc.formattedDataSize(freed))
+                          : tr("Nothing to reclaim"));
+        }, Qt::QueuedConnection);
+    });
+    connect(m_vacuumThread, &QThread::finished, this, [this] {
+        m_vacuumThread->deleteLater();
+        m_vacuumThread = nullptr;
+    });
+    m_vacuumThread->start();
+}
+
+/// Walks the existing cache and moves attachment payloads out of the message
+/// BLOBs into the content-addressed file store. Runs on a worker thread with
+/// its own connection: every message has to be parsed and every payload
+/// hashed and compressed, which is far past anything the GUI thread may do.
+/// Progress is persisted, so quitting mid-way simply resumes next launch.
+void MailClient::startAttachmentMigration()
+{
+    if (m_migrateThread || m_reclaiming || !m_store.attachmentMigrationPending())
+        return;
+    m_migrateCancel.storeRelaxed(0);
+    m_migrateThread = QThread::create([this] {
+        QSqlDatabase db =
+            MailStore::openWorkerConnection(QStringLiteral("mailstore-migrate"));
+        if (!db.isOpen())
+            return;
+        qint64 cursor = 0;
+        {
+            QSqlQuery q(db);
+            q.prepare(QStringLiteral(
+                "SELECT value FROM meta_values WHERE key = 'attach_migrate_cursor'"));
+            if (q.exec() && q.next())
+                cursor = q.value(0).toLongLong();
+        }
+        qint64 saved = 0;
+        int done = 0;
+        // MIME work lives here, behind a callback, so MailStore stays free of
+        // any KMime dependency.
+        const auto split = [](const QByteArray &raw, QList<MailStore::PartRef> *parts) {
+            KMime::Message msg;
+            msg.setContent(KMime::CRLFtoLF(raw));
+            msg.parse();
+            *parts = stripAttachments(&msg);
+            if (parts->isEmpty())
+                return raw;
+            msg.assemble();
+            const QByteArray stub = msg.encodedContent();
+            // The original bytes are about to be overwritten, so prove the
+            // stub plus the stored payloads reproduces them first. Anything
+            // that fails is simply left inline — a message that stays big is
+            // an inconvenience, one that loses its attachment is a bug.
+            QString reason;
+            if (!verifyRoundTrip(stub, *parts, &reason)) {
+                qWarning() << "mailo: attachment migration skipped a message —" << reason;
+                parts->clear();
+                return raw;
+            }
+            return stub;
+        };
+        while (!m_migrateCancel.loadRelaxed()) {
+            const int n = MailStore::migrateAttachmentsChunk(db, cursor, 50, saved, split);
+            if (n == 0) {
+                MailStore::finishAttachmentMigration(db);
+                break;
+            }
+            done += n;
+            const qint64 savedSoFar = saved;
+            const int doneSoFar = done;
+            if (done % 2000 < 50) {
+                QMetaObject::invokeMethod(this, [this, doneSoFar, savedSoFar] {
+                    const QLocale loc;
+                    setStatus(tr("Compacting attachments — %1 messages, %2 saved")
+                                  .arg(doneSoFar)
+                                  .arg(loc.formattedDataSize(savedSoFar)));
+                }, Qt::QueuedConnection);
+            }
+            // Yield the write lock so the UI's own writes never queue behind
+            // a migration chunk.
+            QThread::msleep(25);
+        }
+        const bool finished = !m_migrateCancel.loadRelaxed();
+        const qint64 savedTotal = saved;
+        db.close();
+        QSqlDatabase::removeDatabase(QStringLiteral("mailstore-migrate"));
+        QMetaObject::invokeMethod(this, [this, finished, savedTotal] {
+            if (!finished)
+                return;
+            m_store.sweepOrphanAttachments();
+            const QLocale loc;
+            // The space is only handed back to the filesystem by a vacuum —
+            // deleting from a SQLite table just marks pages reusable.
+            setStatus(tr("Attachments compacted — %1 freed inside the cache; "
+                         "use Reclaim disk space in Settings")
+                          .arg(loc.formattedDataSize(savedTotal)));
+        }, Qt::QueuedConnection);
+    });
+    connect(m_migrateThread, &QThread::finished, this, [this] {
+        m_migrateThread->deleteLater();
+        m_migrateThread = nullptr;
+    });
+    m_migrateThread->setPriority(QThread::LowestPriority);
+    m_migrateThread->start();
+}
+
+void MailClient::stopAttachmentMigration()
+{
+    if (!m_migrateThread)
+        return;
+    m_migrateCancel.storeRelaxed(1);
+    m_migrateThread->wait();
+}
+
+/// Name fallback for servers that do not advertise RFC 6154 \All. Gmail always
+/// does, so this only catches an odd proxy — deliberately narrow, because a
+/// false positive would hide a folder the user actually wants.
+bool MailClient::isAllMailName(const QString &mailBox)
+{
+    return mailBox.compare(QLatin1String("[Gmail]/All Mail"), Qt::CaseInsensitive) == 0
+        || mailBox.compare(QLatin1String("[Google Mail]/All Mail"), Qt::CaseInsensitive) == 0;
+}
+
+/// Deletes the excluded archive's cached rows on a worker thread. Releasing the
+/// blob pages of a ~100 KB body is far too slow to do on the GUI thread, and at
+/// 200k messages there is no chunk size that both finishes this decade and
+/// stays inside the 20 ms budget — so it runs on its own connection instead,
+/// yielding the write lock between small chunks.
+void MailClient::startAllMailPurge()
+{
+    if (m_allMailFolder.isEmpty() || m_purgeThread || m_reclaiming)
+        return;
+    m_purgeCancel.storeRelaxed(0);
+    const QString key = m_store.scopedKey(m_allMailFolder);
+    m_purgeThread = QThread::create([this, key] {
+        MailStore::purgeFolder(key, m_purgeCancel, [this](int total) {
+            // Status text belongs to the GUI thread.
+            QMetaObject::invokeMethod(this, [this, total] {
+                m_purgedRows = total;
+                if (total % 5000 < 100)
+                    setStatus(tr("Clearing archive cache — %1 messages").arg(total));
+            }, Qt::QueuedConnection);
+        });
+        QMetaObject::invokeMethod(this, [this] {
+            if (!m_purgeCancel.loadRelaxed() && m_purgedRows > 0)
+                setStatus(tr("Archive cache cleared — reclaim disk space in Settings"));
+            m_purgedRows = 0;
+        }, Qt::QueuedConnection);
+    });
+    connect(m_purgeThread, &QThread::finished, this, [this] {
+        m_purgeThread->deleteLater();
+        m_purgeThread = nullptr;
+    });
+    m_purgeThread->start();
+    // Below the UI's own work: this must never make a folder switch wait.
+    m_purgeThread->setPriority(QThread::LowestPriority);
+}
+
+/// Stops the purge worker and waits for it, so no connection outlives the
+/// object that owns it (and so a vacuum never starts while it still writes).
+void MailClient::stopAllMailPurge()
+{
+    if (!m_purgeThread)
+        return;
+    m_purgeCancel.storeRelaxed(1);
+    m_purgeThread->wait();
 }
 
 void MailClient::listFolders()
@@ -1460,6 +2241,7 @@ void MailClient::listFolders()
                     const QChar sep = d.separator;
                     f.level = sep.isNull() ? 0 : int(d.name.count(sep));
                     f.displayName = sep.isNull() ? d.name : d.name.section(sep, -1);
+                    bool isAllMail = false;
                     if (i < flagList.size()) {
                         for (const QByteArray &flag : flagList.at(i)) {
                             if (flag.compare("\\Noselect", Qt::CaseInsensitive) == 0)
@@ -1468,7 +2250,19 @@ void MailClient::listFolders()
                             // sent mail belongs.
                             if (flag.compare("\\Sent", Qt::CaseInsensitive) == 0)
                                 m_sentFolder = d.name;
+                            // ...and which mailbox is the "everything" archive.
+                            if (flag.compare("\\All", Qt::CaseInsensitive) == 0)
+                                isAllMail = true;
                         }
+                    }
+                    // Gmail's All Mail duplicates every message that is already
+                    // in INBOX and in each label, so caching it stores the same
+                    // bytes two to four times over. Skipping it here keeps it
+                    // out of the folder list, out of storeFolders() and out of
+                    // the backfill queue in one go.
+                    if (isAllMail || isAllMailName(d.name)) {
+                        m_allMailFolder = d.name;
+                        continue;
                     }
                     folders->append(f);
                 }
@@ -1477,7 +2271,7 @@ void MailClient::listFolders()
     connect(list, &KJob::result, this, [this, folders](KJob *job) {
         setBusy(false);
         if (job->error()) {
-            setStatus(tr("Listing folders failed."));
+            setStatus(tr("Listing folders failed"));
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
@@ -1503,6 +2297,9 @@ void MailClient::listFolders()
             }
         }
         m_folderModel.setFolders(*folders);
+        // A fresh folder list restarts the all-folders background sync pass.
+        m_folderBackfillPassDone = false;
+        m_folderBackfillQueue.clear();
         QStringList names;
         names.reserve(folders->size());
         for (const auto &f : std::as_const(*folders))
@@ -1510,12 +2307,43 @@ void MailClient::listFolders()
         m_store.storeFolders(accountKey(), names);
         // Seed the compose autocompletion from cached Sent bodies (once per account).
         m_store.harvestSentRecipients(m_sentFolder);
-        setStatus(tr("%1.").arg(countNoun(folders->size(), "folder", "folders")));
-        const QString target = m_pendingFolder.isEmpty() ? QStringLiteral("INBOX") : m_pendingFolder;
+        setStatus(countNoun(folders->size(), "folder", "folders"));
+        // Drop whatever an earlier version cached for the now-excluded archive.
+        // Detection repeats on every connect, so an interrupted purge simply
+        // resumes next session instead of leaving rows stranded.
+        if (!m_allMailFolder.isEmpty())
+            startAllMailPurge();
+        QString target = m_pendingFolder;
+        qCDebug(logTrace, "listFolders done: pending=%s selected=%s folders=%d",
+                qUtf8Printable(m_pendingFolder), qUtf8Printable(m_selectedFolder),
+                int(names.size()));
         m_pendingFolder.clear();
+        if (target.isEmpty()) {
+            // Whatever is already open wins. Listing folders is a background
+            // step that also runs on every reconnect, and forcing INBOX here
+            // yanked the user out of the folder they had just opened — the
+            // account switch opens the clicked folder from cache first, and
+            // this landed a moment later and overrode it.
+            target = (!m_selectedFolder.isEmpty() && names.contains(m_selectedFolder))
+                ? m_selectedFolder
+                : QStringLiteral("INBOX");
+        }
+        if (!m_allMailFolder.isEmpty() && target == m_allMailFolder)
+            target = QStringLiteral("INBOX"); // it is no longer in the list
         openFolder(target);
     });
     list->start();
+}
+
+bool MailClient::isJunkFolder(const QString &mailBox) const
+{
+    static const QStringList junkNames = {
+        QStringLiteral("spam"), QStringLiteral("junk"),
+        QStringLiteral("junk e-mail"), QStringLiteral("junk email"),
+        QStringLiteral("junk mail"), QStringLiteral("bulk mail")};
+    const QChar sep = mailBox.contains(QLatin1Char('/')) ? QLatin1Char('/')
+                                                         : QLatin1Char('.');
+    return junkNames.contains(mailBox.section(sep, -1).toLower());
 }
 
 QString MailClient::trashFolderName() const
@@ -1534,6 +2362,16 @@ QString MailClient::trashFolderName() const
     return {};
 }
 
+QString MailClient::junkFolderName() const
+{
+    const QStringList boxes = m_folderModel.allMailBoxes();
+    for (const QString &mailBox : boxes) {
+        if (isJunkFolder(mailBox))
+            return mailBox;
+    }
+    return {};
+}
+
 bool MailClient::isTrashFolder() const
 {
     return !m_selectedFolder.isEmpty() && m_selectedFolder == trashFolderName();
@@ -1544,6 +2382,7 @@ void MailClient::purgeDeleted(const QList<qint64> &uids)
 {
     m_messageModel.removeByUids(uids);
     m_store.removeMessages(m_selectedFolder, uids);
+    invalidateMissingBodies();
 }
 
 void MailClient::deleteMessages(const QVariantList &rows)
@@ -1572,8 +2411,7 @@ void MailClient::deleteMessages(const QVariantList &rows)
     }
 
     setBusy(true);
-    setStatus(permanent ? tr("Deleting %1 permanently…").arg(countNoun(uids->size(), "message", "messages"))
-                        : tr("Moving %1 to trash…").arg(countNoun(uids->size(), "message", "messages")));
+    // No in-progress crumb — the busy spinner covers it; only the result shows.
 
     // The browsing SELECT is read-only (EXAMINE); STORE/MOVE need read-write.
     auto *select = new KIMAP::SelectJob(m_session);
@@ -1584,6 +2422,7 @@ void MailClient::deleteMessages(const QVariantList &rows)
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
+        m_folderReadWrite = true;
         if (permanent) {
             auto *store = new KIMAP::StoreJob(m_session);
             store->setUidBased(true);
@@ -1604,8 +2443,7 @@ void MailClient::deleteMessages(const QVariantList &rows)
                         return;
                     }
                     purgeDeleted(*uids);
-                    setStatus(tr("%1 deleted permanently.")
-                                  .arg(countNoun(uids->size(), "message", "messages")));
+                    setStatus(tr("%1 deleted permanently").arg(uids->size()));
                 });
                 expunge->start();
             });
@@ -1622,7 +2460,7 @@ void MailClient::deleteMessages(const QVariantList &rows)
                     return;
                 }
                 purgeDeleted(*uids);
-                setStatus(tr("%1 moved to trash.").arg(countNoun(uids->size(), "message", "messages")));
+                setStatus(tr("%1 moved to trash").arg(uids->size()));
             });
             move->start();
         }
@@ -1630,15 +2468,86 @@ void MailClient::deleteMessages(const QVariantList &rows)
     select->start();
 }
 
+void MailClient::markAsJunk(const QVariantList &rows)
+{
+    if (!m_connected || !m_session) {
+        Q_EMIT errorOccurred(tr("Not connected — cannot move messages to junk."));
+        return;
+    }
+    const QString junk = junkFolderName();
+    if (junk.isEmpty()) {
+        Q_EMIT errorOccurred(tr("No junk folder found on the server."));
+        return;
+    }
+    if (m_selectedFolder == junk)
+        return;
+
+    KIMAP::ImapSet set;
+    auto uids = std::make_shared<QList<qint64>>();
+    for (const QVariant &v : rows) {
+        const qint64 uid = m_messageModel.uidAt(v.toInt());
+        if (uid > 0) {
+            set.add(uid);
+            uids->append(uid);
+        }
+    }
+    if (uids->isEmpty())
+        return;
+
+    setBusy(true);
+    // No in-progress crumb — the busy spinner covers it; only the result shows.
+
+    // The browsing SELECT is read-only (EXAMINE); MOVE needs read-write.
+    auto *select = new KIMAP::SelectJob(m_session);
+    select->setMailBox(m_selectedFolder);
+    connect(select, &KJob::result, this, [this, set, uids, junk](KJob *job) {
+        if (job->error()) {
+            setBusy(false);
+            Q_EMIT errorOccurred(job->errorString());
+            return;
+        }
+        m_folderReadWrite = true;
+        auto *move = new KIMAP::MoveJob(m_session);
+        move->setUidBased(true);
+        move->setSequenceSet(set);
+        move->setMailBox(junk);
+        connect(move, &KJob::result, this, [this, uids](KJob *job) {
+            setBusy(false);
+            if (job->error()) {
+                Q_EMIT errorOccurred(job->errorString());
+                return;
+            }
+            purgeDeleted(*uids);
+            setStatus(tr("%1 moved to junk").arg(uids->size()));
+        });
+        move->start();
+    });
+    select->start();
+}
+
 void MailClient::openFolder(const QString &mailBox)
 {
+    qCDebug(logTrace, "openFolder(%s)  selected=%s pending=%s",
+            qUtf8Printable(mailBox), qUtf8Printable(m_selectedFolder),
+            qUtf8Printable(m_pendingFolder));
     m_backfillTimer.stop();
     m_backfill = false;
     m_bodyBackfill = false;
     m_searchActive = false;
+    // A deliberate folder change is a fresh start — un-pause any throttled
+    // backfill and clear the backoff so this folder syncs at full pace.
+    resetBackfillBackoff();
     // Queued prefetch uids belong to the folder that queued them.
     m_prefetchQueue.clear();
+    // Whatever an account switch or a reconnect meant to reopen, this call
+    // supersedes it. Leaving it set let listFolders() land a moment later and
+    // yank the user back to the folder they had switched accounts with —
+    // click a folder in account A, a non-INBOX folder in account B, then
+    // INBOX, and INBOX opened and was immediately replaced by the second one.
+    m_pendingFolder.clear();
     m_selectedFolder = mailBox;
+    Q_EMIT selectedFolderChanged();
+    m_folderReadWrite = false;
     m_messageModel.clear();
 
     // Show the cache instantly; the network refresh merges into it.
@@ -1648,15 +2557,17 @@ void MailClient::openFolder(const QString &mailBox)
         m_messageModel.setHeaders(cached);
 
     if (!m_connected || !m_session) {
-        setStatus(tr("%1 — offline, %2 cached.")
-                      .arg(mailBox, countNoun(cached.size(), "message", "messages")));
+        // Not cached.size(): that is one page (max 1000 rows), not the folder.
+        setStatus(tr("%1 — offline, %2 cached")
+                      .arg(mailBox)
+                      .arg(m_store.cachedHeaderCount(mailBox)));
         return;
     }
     setBusy(true);
     if (!cached.isEmpty())
-        setStatus(tr("%1 — %2 cached, refreshing…").arg(mailBox).arg(cached.size()));
+        setStatus(tr("%1 refreshing").arg(mailBox));
     else
-        setStatus(tr("Opening %1…").arg(mailBox));
+        setStatus(tr("Opening %1").arg(mailBox));
 
     auto *select = new KIMAP::SelectJob(m_session);
     select->setMailBox(mailBox);
@@ -1673,7 +2584,7 @@ void MailClient::openFolder(const QString &mailBox)
             return;
         if (job->error()) {
             setBusy(false);
-            setStatus(tr("Could not open %1.").arg(mailBox));
+            setStatus(tr("Could not open %1").arg(mailBox));
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
@@ -1686,6 +2597,7 @@ void MailClient::openFolder(const QString &mailBox)
             qWarning() << "mailo: UIDVALIDITY changed for" << mailBox
                        << cachedValidity << "->" << validity << "- clearing cache";
             m_store.clearFolder(mailBox);
+            invalidateMissingBodies();
             m_messageModel.clear();
             maxCachedUid = 0;
             cachedCount = 0;
@@ -1699,7 +2611,7 @@ void MailClient::openFolder(const QString &mailBox)
         startIdle(); // (re)watch the newly opened folder for pushed mail
         if (count == 0) {
             setBusy(false);
-            setStatus(tr("%1 is empty.").arg(mailBox));
+            setStatus(tr("%1 is empty").arg(mailBox));
             return;
         }
         if (cachedCount > 0 && maxCachedUid > 0) {
@@ -1717,7 +2629,7 @@ void MailClient::openFolder(const QString &mailBox)
 void MailClient::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
 {
     const QString folder = m_selectedFolder;
-    setStatus(tr("%1 — checking for new mail…").arg(folder));
+    setStatus(tr("%1 — checking").arg(folder));
 
     auto *fetch = new KIMAP::FetchJob(m_session);
     KIMAP::ImapSet set;
@@ -1743,11 +2655,12 @@ void MailClient::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
     connect(fetch, &KJob::result, this, [this, headers, cachedCount, folder](KJob *job) {
         setBusy(false);
         if (job->error()) {
-            setStatus(tr("Fetching headers failed."));
+            setStatus(tr("Fetching headers failed"));
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
         m_store.storeHeaders(folder, *headers);
+        invalidateMissingBodies();
         // Cache is updated above either way, but the visible list and the
         // backfill cursor belong to whatever folder is open NOW.
         if (folder != m_selectedFolder || m_searchActive)
@@ -1761,56 +2674,175 @@ void MailClient::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
         m_oldestFetchedSeq = qMax(
             qint64(1), m_folderMessageCount - cachedCount - headers->size() + 1);
         if (m_oldestFetchedSeq > 1) {
-            const qint64 synced = m_folderMessageCount - m_oldestFetchedSeq + 1;
-            setStatus(tr("%1 — %2 of %3 messages synced, fetching the rest in "
-                         "the background…")
-                          .arg(m_selectedFolder)
-                          .arg(synced)
-                          .arg(m_folderMessageCount));
+            setStatus(openFolderSyncStatus(m_selectedFolder));
         } else {
-            setStatus(tr("%1 — %2.")
-                          .arg(m_selectedFolder,
-                               countNoun(m_messageModel.rowCount(), "message", "messages")));
+            // rowCount is page-limited; report the folder's real size.
+            setStatus(tr("%1 — %2 cached")
+                          .arg(m_selectedFolder)
+                          .arg(m_folderMessageCount > 0
+                                   ? m_folderMessageCount
+                                   : m_messageModel.rowCount()));
         }
         scheduleBackfill(); // more headers, or the body-caching phase
     });
     fetch->start();
 }
 
-void MailClient::scheduleBackfill()
+void MailClient::scheduleBackfill(int delayMs)
 {
     // The timer tick decides what still needs doing: older header windows
     // first, then missing bodies; it stops arming itself when both are done.
-    m_backfillTimer.start();
+    m_backfillTimer.start(delayMs);
 }
 
-void MailClient::backfillBodies()
+void MailClient::backoffBackfill()
 {
-    if (m_selectedFolder.isEmpty())
+    ++m_backfillAttempt;
+    if (m_backfillAttempt > kBackoffMaxAttempts) {
+        // Give up retrying for now — the server is persistently pushing back.
+        // Sync resumes on the next (re)connect or when the user opens another
+        // folder (both reset the attempt counter via resetBackfillBackoff).
+        m_syncPaused = true;
+        m_backfillTimer.stop();
+        setStatus(tr("%1 — sync paused (server busy)")
+                      .arg(m_selectedFolder.isEmpty() ? tr("Mail")
+                                                       : m_selectedFolder));
+        qWarning() << "mailo: backfill paused after" << kBackoffMaxAttempts
+                   << "throttle/backoff attempts";
         return;
-    const auto missing = m_store.uidsWithoutBody(m_selectedFolder);
-    if (missing.isEmpty()) {
-        if (m_bodyBackfill) {
-            m_bodyBackfill = false;
-            setStatus(tr("%1 — fully synced, all message bodies cached.")
-                          .arg(m_selectedFolder));
-        }
-        return; // nothing left — the timer stays quiet until rescheduled
     }
-    m_bodyBackfill = true;
-    const int remaining = m_store.missingBodyCount(m_selectedFolder);
-    setStatus(remaining == 1
-                  ? tr("%1 — caching 1 message body in the background…")
-                        .arg(m_selectedFolder)
-                  : tr("%1 — caching %2 message bodies in the background…")
-                        .arg(m_selectedFolder)
-                        .arg(remaining));
+    // Wait = min(2^n * base + full jitter, cap).
+    const qint64 exp = qint64(kBackoffBaseMs) << m_backfillAttempt; // 2^n * base
+    const int jitter = int(QRandomGenerator::global()->bounded(kBackoffJitterMs + 1));
+    const int wait = int(qMin<qint64>(exp + jitter, kBackoffCapMs));
+    scheduleBackfill(wait);
+}
+
+void MailClient::resetBackfillBackoff()
+{
+    m_backfillAttempt = 0;
+    m_syncPaused = false;
+}
+
+bool MailClient::backfillBodies(const QString &folder)
+{
+    if (folder.isEmpty())
+        return false;
+    const auto missing = m_store.uidsWithoutBody(folder, 50);
+    if (missing.isEmpty()) {
+        if (folder == m_selectedFolder && m_bodyBackfill) {
+            m_bodyBackfill = false;
+            setStatus(tr("%1 — fully synced")
+                          .arg(folder));
+        }
+        return false; // nothing left in this folder
+    }
+    if (folder == m_selectedFolder)
+        m_bodyBackfill = true;
+    // Compose with any header-sync progress so this doesn't clobber the
+    // "N of M synced" figure while both phases are running.
+    const QString composed = openFolderSyncStatus(folder);
+    if (!composed.isEmpty()) {
+        setStatus(composed);
+    } else {
+        const int remaining = missingBodiesIn(folder);
+        setStatus(remaining == 1
+                      ? tr("%1 — caching 1 body").arg(folder)
+                      : tr("%1 — caching %2 bodies").arg(folder).arg(remaining));
+    }
     for (qint64 uid : missing) {
-        if (!m_prefetchQueue.contains(uid))
-            m_prefetchQueue.append(uid);
+        const auto item = qMakePair(folder, uid);
+        if (!m_prefetchQueue.contains(item))
+            m_prefetchQueue.append(item);
     }
     processPrefetchQueue();
     scheduleBackfill(); // next batch (or the "done" status) on a later tick
+    return true;
+}
+
+void MailClient::continueFolderBackfill()
+{
+    if (!m_connected || !m_syncSession || !m_syncReady || m_folderBackfillPassDone)
+        return; // needs the dedicated connection — never hijack the UI one
+    if (m_backfillFolder.isEmpty()) {
+        if (m_folderBackfillQueue.isEmpty())
+            m_folderBackfillQueue = m_folderModel.allMailBoxes();
+        while (!m_folderBackfillQueue.isEmpty()) {
+            const QString next = m_folderBackfillQueue.takeFirst();
+            if (next != m_selectedFolder) {
+                m_backfillFolder = next;
+                m_backfillOldestSeq = 0; // size unknown until the SELECT below
+                break;
+            }
+        }
+        if (m_backfillFolder.isEmpty()) {
+            // Every folder visited; a new pass starts on the next (re)connect
+            // or folder-list refresh.
+            m_folderBackfillPassDone = true;
+            setStatus(tr("All folders synced"));
+            return;
+        }
+    }
+    const QString folder = m_backfillFolder;
+    if (m_backfillOldestSeq == 0) {
+        // Fresh folder: learn its size (and UIDVALIDITY) on the sync session.
+        auto *select = new KIMAP::SelectJob(m_syncSession);
+        select->setMailBox(folder);
+        select->setOpenReadOnly(true);
+        connect(select, &KJob::result, this, [this, folder](KJob *job) {
+            if (folder != m_backfillFolder || !m_syncSession)
+                return; // pass was reshuffled meanwhile
+            if (job->error()) {
+                // Unselectable (\Noselect) or otherwise broken — skip it.
+                m_backfillFolder.clear();
+                scheduleBackfill(1000);
+                return;
+            }
+            auto *select = static_cast<KIMAP::SelectJob *>(job);
+            m_syncFolder = folder;
+            const qint64 validity = select->uidValidity();
+            const qint64 cachedValidity = m_store.uidValidity(folder);
+            if (validity > 0 && cachedValidity > 0 && validity != cachedValidity) {
+                qWarning() << "mailo: UIDVALIDITY changed for" << folder
+                           << cachedValidity << "->" << validity << "- clearing cache";
+                m_store.clearFolder(folder);
+                invalidateMissingBodies();
+            }
+            if (validity > 0 && validity != cachedValidity)
+                m_store.setUidValidity(folder, validity);
+            const qint64 count = select->messageCount();
+            // Everything already in the cache → straight to the body phase.
+            m_backfillOldestSeq =
+                (count <= 0 || m_store.cachedHeaderCount(folder) >= count)
+                ? 1
+                : count + 1;
+            scheduleBackfill(50);
+        });
+        select->start();
+        return;
+    }
+    if (m_backfillOldestSeq > 1) {
+        // Next header window; cache-only — fetchHeadersOn never touches the
+        // visible list for a folder that is not the open one.
+        m_headerFetch = true;
+        m_backfill = true;
+        const qint64 to = m_backfillOldestSeq - 1;
+        const qint64 from = qMax(qint64(1), to - 249);
+        withSyncSession(folder, [this, folder, from, to](KIMAP::Session *session) {
+            if (!session) {
+                m_headerFetch = false;
+                m_backfill = false;
+                return;
+            }
+            fetchHeadersOn(session, folder, from, to, true, true);
+        });
+        return;
+    }
+    if (!backfillBodies(folder)) {
+        // Headers and bodies complete — move on to the next folder.
+        m_backfillFolder.clear();
+        scheduleBackfill(50);
+    }
 }
 
 void MailClient::updatePageAnchor(const QList<MessageListModel::Header> &page)
@@ -1855,7 +2887,10 @@ void MailClient::fetchOlderFromServer()
     if (!m_backfill)
         setBusy(true);
     const qint64 to = m_oldestFetchedSeq - 1;
-    fetchHeaders(qMax(qint64(1), to - 99), to, true);
+    // Fetch older history in modest windows with a pause between them
+    // (scheduleBackfill below) so sustained backfill stays under server rate
+    // limits instead of hammering the connection until it drops.
+    fetchHeaders(qMax(qint64(1), to - (kHeaderWindow - 1)), to, true);
 }
 
 void MailClient::fetchHeaders(qint64 fromSeq, qint64 toSeq, bool append)
@@ -1883,10 +2918,16 @@ void MailClient::fetchHeadersOn(KIMAP::Session *session, const QString &folder,
                                 qint64 fromSeq, qint64 toSeq, bool append,
                                 bool background)
 {
-    if (background)
-        setStatus(tr("%1 — fetching older messages in the background…").arg(folder));
-    else
-        setStatus(tr("Fetching headers…"));
+    if (background) {
+        // Show header-sync AND body-caching progress together, so the two
+        // background phases don't overwrite each other's numbers.
+        const QString composed = openFolderSyncStatus(folder);
+        setStatus(!composed.isEmpty()
+                      ? composed
+                      : tr("%1 — fetching headers").arg(folder));
+    } else {
+        setStatus(tr("Fetching headers"));
+    }
 
     auto *fetch = new KIMAP::FetchJob(session);
     fetch->setSequenceSet(KIMAP::ImapSet(fromSeq, toSeq));
@@ -1916,12 +2957,30 @@ void MailClient::fetchHeadersOn(KIMAP::Session *session, const QString &folder,
             setBusy(false);
         if (job->error()) {
             if (!background) {
-                setStatus(tr("Fetching headers failed."));
+                setStatus(tr("Fetching headers failed"));
                 Q_EMIT errorOccurred(job->errorString());
+            } else {
+                // Server pushback (throttling NO/BAD, dropped connection…):
+                // retry with growing pauses instead of hammering it. If it is
+                // specifically the concurrent-connection cap, also drop back to
+                // fewer connections so retries don't hit the same wall.
+                if (isTooManyConnections(job->errorString()))
+                    shrinkBodyPool();
+                backoffBackfill();
             }
             return;
         }
+        resetBackfillBackoff();
         m_store.storeHeaders(folder, *headers);
+        invalidateMissingBodies();
+        // A background pass over a non-open folder: advance that folder's
+        // own cursor and keep chaining its windows.
+        if (folder != m_selectedFolder && folder == m_backfillFolder) {
+            if (m_backfillOldestSeq == 0 || fromSeq < m_backfillOldestSeq)
+                m_backfillOldestSeq = fromSeq;
+            scheduleBackfill(kHeaderPauseMs);
+            return;
+        }
         // The user may have moved on: results for a folder that is no longer
         // open go to the cache only — never into the visible list or the
         // current folder's backfill cursor.
@@ -1949,24 +3008,25 @@ void MailClient::fetchHeadersOn(KIMAP::Session *session, const QString &folder,
             Q_EMIT folderRefreshed();
         }
         if (m_oldestFetchedSeq > 1) {
-            // More history on the server — keep syncing it while nothing
-            // else is going on, telling the user how far along we are.
-            const qint64 synced = m_folderMessageCount - m_oldestFetchedSeq + 1;
-            setStatus(tr("%1 — %2 of %3 messages synced, fetching the rest in "
-                         "the background…")
-                          .arg(m_selectedFolder)
-                          .arg(synced)
-                          .arg(m_folderMessageCount));
-        } else if (background) {
-            setStatus(tr("%1 — fully synced, %2.")
-                          .arg(m_selectedFolder,
-                               countNoun(m_messageModel.rowCount(), "message", "messages")));
+            // More history on the server — keep syncing it while nothing else
+            // is going on, showing header progress together with any body
+            // caching so the two phases don't overwrite each other's numbers.
+            setStatus(openFolderSyncStatus(m_selectedFolder));
         } else {
-            setStatus(tr("%1 — %2.")
-                          .arg(m_selectedFolder,
-                               countNoun(m_messageModel.rowCount(), "message", "messages")));
+            // The visible model is page-limited (cachedHeaders caps at 1000
+            // rows) — the status must report the folder's real size.
+            const int total = m_folderMessageCount > 0
+                ? int(m_folderMessageCount)
+                : m_messageModel.rowCount();
+            if (background)
+                setStatus(tr("%1 — synced, %2 cached").arg(m_selectedFolder).arg(total));
+            else
+                setStatus(tr("%1 — %2 cached").arg(m_selectedFolder).arg(total));
         }
-        scheduleBackfill(); // more headers, or the body-caching phase
+        // Pace the next window: a deliberate pause between windows keeps the
+        // sustained fetch rate under server limits (see kHeaderPauseMs). The
+        // longer idle pause is only for entering the body-caching phase.
+        scheduleBackfill(m_oldestFetchedSeq > 1 ? kHeaderPauseMs : 500);
     });
     fetch->start();
 }
@@ -1991,7 +3051,7 @@ void MailClient::searchMessages(const QString &query, int field)
             return;
         }
         m_messageModel.applyFilter(re);
-        setStatus(tr("%1 in loaded messages.").arg(countNoun(m_messageModel.rowCount(), "match", "matches")));
+        setStatus(tr("%1 in loaded").arg(countNoun(m_messageModel.rowCount(), "match", "matches")));
         return;
     }
 
@@ -2001,7 +3061,7 @@ void MailClient::searchMessages(const QString &query, int field)
     }
 
     setBusy(true);
-    setStatus(tr("Searching…"));
+    setStatus(tr("Searching"));
 
     KIMAP::Term::SearchKey key = KIMAP::Term::Text;
     switch (field) {
@@ -2051,13 +3111,13 @@ void MailClient::localKeywordFilter(const QString &keyword, const QString &reaso
     if (!hits.isEmpty()) {
         m_oldestFetchedSeq = 1; // result list is complete; no load-more
         m_messageModel.setHeaders(hits);
-        setStatus(tr("%1 — %2 in local index.").arg(reason, countNoun(hits.size(), "match", "matches")));
+        setStatus(tr("%1 — %2 in local index").arg(reason, countNoun(hits.size(), "match", "matches")));
         return;
     }
     const QRegularExpression re(QRegularExpression::escape(keyword),
                                 QRegularExpression::CaseInsensitiveOption);
     m_messageModel.applyFilter(re);
-    setStatus(tr("%1 — %2 in loaded messages.")
+    setStatus(tr("%1 — %2 in loaded")
                   .arg(reason, countNoun(m_messageModel.rowCount(), "local match", "local matches")));
 }
 
@@ -2072,7 +3132,7 @@ void MailClient::clearSearch()
 void MailClient::fetchHeadersByUids(const QList<qint64> &uids,
                                     const QString &localMergeKeyword)
 {
-    setStatus(tr("Fetching results…"));
+    setStatus(tr("Fetching results"));
 
     KIMAP::ImapSet set;
     for (qint64 uid : uids)
@@ -2098,7 +3158,7 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids,
     connect(fetch, &KJob::result, this, [this, headers, localMergeKeyword](KJob *job) {
         setBusy(false);
         if (job->error()) {
-            setStatus(tr("Fetching results failed."));
+            setStatus(tr("Fetching results failed"));
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
@@ -2107,7 +3167,7 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids,
         if (!localMergeKeyword.isEmpty())
             m_messageModel.appendHeaders(
                 m_store.search(m_selectedFolder, localMergeKeyword));
-        setStatus(tr("%1.").arg(countNoun(m_messageModel.rowCount(), "search result", "search results")));
+        setStatus(countNoun(m_messageModel.rowCount(), "search result", "search results"));
     });
     fetch->start();
 }
@@ -2217,8 +3277,15 @@ QString MailClient::textViewUrl()
 {
     if (!m_viewerHandler)
         return {};
-    const QString text = m_currentTextBody.isEmpty() ? tr("(this message has no plain-text part)")
-                                                     : m_currentTextBody;
+    QString text = m_currentTextBody;
+    if (text.isEmpty() && !m_currentHtmlBody.isEmpty()) {
+        // HTML-only message: show its stripped text — the junk folders'
+        // text-only default must not degrade to an empty stub.
+        text = QTextDocumentFragment::fromHtml(m_currentHtmlBody.left(500000))
+                   .toPlainText();
+    }
+    if (text.isEmpty())
+        text = tr("(this message has no displayable text part)");
     return m_viewerHandler->setMessageHtml(preformattedPage(text, false));
 }
 
@@ -2259,7 +3326,7 @@ void MailClient::saveAttachment(int index, const QUrl &fileUrl)
     if (index < 0 || index >= m_attachmentParts.size())
         return;
     if (writeAttachment(index, fileUrl.toLocalFile()))
-        setStatus(tr("Saved %1.").arg(QFileInfo(fileUrl.toLocalFile()).fileName()));
+        setStatus(tr("Saved %1").arg(QFileInfo(fileUrl.toLocalFile()).fileName()));
 }
 
 bool MailClient::attachmentRisky(int index) const
@@ -2300,7 +3367,7 @@ void MailClient::openAttachment(int index)
     if (!writeAttachment(index, path))
         return;
     if (QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
-        setStatus(tr("Opened %1.").arg(attachmentName(index)));
+        setStatus(tr("Opened %1").arg(attachmentName(index)));
     else
         Q_EMIT errorOccurred(tr("No application could open %1.").arg(attachmentName(index)));
 }
@@ -2321,7 +3388,78 @@ void MailClient::saveAttachmentToDownloads(int index)
         candidate = QStringLiteral("%1/%2 (%3)%4").arg(dir, info.baseName()).arg(i).arg(suffix);
     }
     if (writeAttachment(index, candidate))
-        setStatus(tr("Saved to %1.").arg(candidate));
+        setStatus(tr("Saved to %1").arg(candidate));
+}
+
+void MailClient::markMessageColor(const QVariantList &rows, int color)
+{
+    if (color < 0 || color > 5)
+        return;
+    for (const QVariant &v : rows) {
+        const int row = v.toInt();
+        const qint64 uid = m_messageModel.uidAt(row);
+        if (uid < 0)
+            continue;
+        const int newColor = m_messageModel.colorLabelAt(row) == color ? 0 : color;
+        m_messageModel.setColorLabel(uid, newColor);
+        m_store.setColorLabel(m_selectedFolder, uid, newColor);
+    }
+}
+
+void MailClient::filterByColor(int color)
+{
+    m_messageModel.setColorFilter(color);
+    if (color <= 0)
+        return;
+    // The loaded page holds only the newest rows — pull every cached mark of
+    // this color from disk so older marks show as well (indexed query).
+    m_messageModel.appendHeaders(m_store.headersByColor(m_selectedFolder, color));
+}
+
+void MailClient::markMessageRead(int row)
+{
+    const qint64 uid = m_messageModel.uidAt(row);
+    if (uid < 0)
+        return;
+    const bool alreadySeen = m_messageModel.seenAt(row);
+    m_messageModel.markSeen(row);
+    m_store.setSeen(m_selectedFolder, uid);
+    if (alreadySeen || !m_connected || !m_session)
+        return;
+
+    // Push \Seen to the server so other clients (and our next header sync)
+    // agree. Best effort: the cache row above already carries the state, and
+    // KIMAP fetches with BODY.PEEK, so without this STORE the server would
+    // never learn the message was read.
+    const QString folder = m_selectedFolder;
+    const auto storeSeen = [this, folder, uid]() {
+        if (folder != m_selectedFolder || !m_session)
+            return;
+        auto *store = new KIMAP::StoreJob(m_session);
+        store->setUidBased(true);
+        store->setSequenceSet(KIMAP::ImapSet(uid));
+        store->setMode(KIMAP::StoreJob::AppendFlags);
+        store->setFlags({QByteArrayLiteral("\\Seen")});
+        connect(store, &KJob::result, this, [](KJob *job) {
+            if (job->error())
+                qWarning() << "mailo: storing \\Seen failed:" << job->errorString();
+        });
+        store->start();
+    };
+    if (m_folderReadWrite) {
+        storeSeen();
+        return;
+    }
+    // The browsing SELECT is read-only (EXAMINE); STORE needs read-write.
+    auto *select = new KIMAP::SelectJob(m_session);
+    select->setMailBox(folder);
+    connect(select, &KJob::result, this, [this, folder, storeSeen](KJob *job) {
+        if (job->error() || folder != m_selectedFolder)
+            return;
+        m_folderReadWrite = true;
+        storeSeen();
+    });
+    select->start();
 }
 
 void MailClient::fetchMessage(int row)
@@ -2335,23 +3473,35 @@ void MailClient::fetchMessage(int row)
     if (!cachedRaw.isEmpty()) {
         auto msg = std::make_shared<KMime::Message>();
         msg->setContent(KMime::CRLFtoLF(cachedRaw));
+        // The cached form is a stub: attachment payloads live in the file
+        // store. Put them back before anything looks at the message. If a
+        // payload has gone missing the cache entry is incomplete, so fall
+        // through and re-fetch rather than showing an empty attachment.
+        msg->parse();
+        if (!restoreAttachments(msg.get(), m_store.partsFor(m_selectedFolder, uid))
+            && m_connected && m_session) {
+            m_store.removeBodyOnly(m_selectedFolder, uid);
+        } else {
         presentMessage(msg);
         refineAttachKind(m_selectedFolder, uid, msg.get());
-        m_messageModel.markSeen(row);
-        setStatus(tr("Loaded from cache."));
+        markMessageRead(row);
+        // No status crumb for opening a cached message — it's silent, the
+        // message simply appears.
         // Read-ahead: sequential reading should never wait on the network.
         prefetchMessage(row + 1);
         prefetchMessage(row + 2);
         return;
+        }
     }
 
     if (!m_connected || !m_session) {
-        setStatus(tr("Message not cached — connect to load it."));
+        setStatus(tr("Not cached — connect to load"));
         return;
     }
 
     setBusy(true);
-    setStatus(tr("Loading message…"));
+    // No "loading…" crumb — the busy spinner already shows activity; only a
+    // failure is worth a status.
 
     auto *fetch = new KIMAP::FetchJob(m_session);
     fetch->setSequenceSet(KIMAP::ImapSet(uid));
@@ -2383,12 +3533,12 @@ void MailClient::fetchMessage(int row)
     connect(fetch, &KJob::result, this, [this, row, found](KJob *job) {
         setBusy(false);
         if (job->error()) {
-            setStatus(tr("Loading message failed."));
+            setStatus(tr("Message load failed"));
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
         if (!*found) {
-            setStatus(tr("Message could not be loaded."));
+            setStatus(tr("Message load failed"));
             return;
         }
         presentMessage(*found);
@@ -2399,7 +3549,7 @@ void MailClient::fetchMessage(int row)
         m_store.storeBody(m_selectedFolder, m_messageModel.uidAt(row), m_currentRaw, indexText);
         refineAttachKind(m_selectedFolder, m_messageModel.uidAt(row), found->get());
         setStatus({});
-        m_messageModel.markSeen(row);
+        markMessageRead(row);
         // Read-ahead: sequential reading should never wait on the network.
         prefetchMessage(row + 1);
         prefetchMessage(row + 2);
@@ -2416,7 +3566,7 @@ void MailClient::openExternalUrl(const QUrl &url)
         return;
     }
     if (QDesktopServices::openUrl(url))
-        setStatus(tr("Opened %1 in browser.").arg(url.host()));
+        setStatus(tr("Opened %1 in browser").arg(url.host()));
     else
         Q_EMIT errorOccurred(tr("Could not open %1.").arg(url.toString()));
 }
@@ -2424,8 +3574,8 @@ void MailClient::openExternalUrl(const QUrl &url)
 void MailClient::setRemoteContentAllowed(bool allow)
 {
     // User toggle: remember the choice for this sender.
-    qWarning() << "mailo: remote content toggle" << allow
-               << "for sender" << m_currentSenderAddress;
+    qCDebug(logTrace) << "remote content toggle" << allow
+                      << "for sender" << m_currentSenderAddress;
     m_store.setRemoteContentAllowedFor(m_currentSenderAddress, allow);
     applyRemoteContentAllowed(allow);
 }
@@ -2456,21 +3606,44 @@ static QString indexTextFor(KMime::Message *msg)
     return {};
 }
 
+/// Extracts the searchable text of a batch of cached bodies on a worker thread
+/// and writes it back to the index. A full MIME parse plus an HTML-to-text
+/// conversion of up to 100 KB is far past the 20 ms budget, and open() seeds
+/// the queue with every cached body — on a large cache that was hours of
+/// GUI-thread CPU. None of it touches the UI, so none of it belongs there.
 void MailClient::reindexPendingBodies()
 {
-    if (m_busy)
-        return; // never compete with user-visible work
-    const auto batch = m_store.pendingBodyIndex(2);
+    if (m_reindexThread || m_reclaiming)
+        return; // a batch is already in flight
+    // 10, not more: reading the batch still pulls raw blobs on this thread, so
+    // the read itself has to stay inside the frame budget. The win is in the
+    // parsing and the single commit, not in a bigger read.
+    const auto batch = m_store.pendingBodyIndex(10);
     if (batch.isEmpty()) {
         m_reindexTimer.stop();
         return;
     }
-    for (const auto &pending : batch) {
-        KMime::Message msg;
-        msg.setContent(KMime::CRLFtoLF(pending.raw));
-        msg.parse();
-        m_store.finishBodyIndex(pending.scopedFolder, pending.uid, indexTextFor(&msg));
-    }
+    m_reindexThread = QThread::create([this, batch] {
+        QList<std::tuple<QString, qint64, QString>> done;
+        done.reserve(batch.size());
+        for (const auto &pending : batch) {
+            KMime::Message msg;
+            msg.setContent(KMime::CRLFtoLF(pending.raw));
+            msg.parse();
+            done.append({pending.scopedFolder, pending.uid, indexTextFor(&msg)});
+        }
+        // The writes go back to the GUI thread's connection: they are small
+        // (no blobs) and keeping one writer avoids lock contention entirely.
+        QMetaObject::invokeMethod(this, [this, done] {
+            m_store.finishBodyIndexBatch(done);
+        }, Qt::QueuedConnection);
+    });
+    connect(m_reindexThread, &QThread::finished, this, [this] {
+        m_reindexThread->deleteLater();
+        m_reindexThread = nullptr;
+    });
+    m_reindexThread->setPriority(QThread::LowestPriority);
+    m_reindexThread->start();
 }
 
 void MailClient::prefetchMessage(int row)
@@ -2478,65 +3651,260 @@ void MailClient::prefetchMessage(int row)
     const qint64 uid = m_messageModel.uidAt(row);
     if (uid < 0 || !m_connected || !m_session)
         return;
-    if (m_prefetchQueue.contains(uid))
+    const auto item = qMakePair(m_selectedFolder, uid);
+    if (m_prefetchQueue.contains(item))
         return;
     if (!m_store.cachedBody(m_selectedFolder, uid).isEmpty())
         return;
     // Newest request first; keep the queue tiny — this is opportunistic.
-    m_prefetchQueue.prepend(uid);
+    // (Trimmed background-backfill entries are re-derived on a later tick.)
+    m_prefetchQueue.prepend(item);
     while (m_prefetchQueue.size() > 4)
         m_prefetchQueue.removeLast();
     processPrefetchQueue();
 }
 
+// Same-folder run of up to 50 queued uids, removed from the queue. One FETCH
+// per batch: the server streams the bodies back to back instead of paying a
+// full round trip per message.
+static KIMAP::ImapSet takeBodyBatch(QList<QPair<QString, qint64>> &queue,
+                                    QString *folderOut)
+{
+    const QString folder = queue.first().first;
+    KIMAP::ImapSet set;
+    int taken = 0;
+    for (int i = 0; i < queue.size() && taken < 50;) {
+        if (queue.at(i).first != folder) {
+            ++i;
+            continue;
+        }
+        set.add(KIMAP::ImapSet::Id(queue.at(i).second));
+        queue.removeAt(i);
+        ++taken;
+    }
+    *folderOut = folder;
+    return set;
+}
+
+bool MailClient::bodyFetchActive() const
+{
+    if (m_prefetching)
+        return true;
+    for (const auto &conn : m_bodyPool) {
+        if (conn->busy)
+            return true;
+    }
+    return false;
+}
+
+void MailClient::shrinkBodyPool()
+{
+    // Stop growing the pool, and shed one idle connection so the concurrent
+    // count actually drops. A busy one is left to finish and reused; the cap
+    // flag keeps us from re-adding.
+    m_bodyPoolBroken = true;
+    for (int i = 0; i < m_bodyPool.size(); ++i) {
+        if (!m_bodyPool.at(i)->busy) {
+            auto conn = m_bodyPool.takeAt(i);
+            if (conn->session)
+                conn->session->deleteLater();
+            break;
+        }
+    }
+    qWarning() << "mailo: reduced body-fetch pool to" << m_bodyPool.size()
+               << "after connection-cap refusal";
+}
+
+void MailClient::ensureBodyPool()
+{
+    // Extra connections only once the server has proven it grants us a
+    // second one at all (the sync session), and never after a refusal.
+    if (!m_connected || !m_syncReady || m_bodyPoolBroken)
+        return;
+    // Keep the total concurrent connection count low (main + IDLE + sync +
+    // these) — well under the ~15 servers like Gmail cap, and near the 2–3
+    // recommended to avoid throttling.
+    while (m_bodyPool.size() < 2) {
+        auto conn = std::make_shared<BodyConn>();
+        conn->session = new KIMAP::Session(m_host, quint16(m_port), this);
+        m_bodyPool.append(conn);
+        const auto drop = [this, conn] {
+            if (conn->session)
+                conn->session->deleteLater();
+            m_bodyPool.removeAll(conn);
+        };
+        connect(conn->session, &KIMAP::Session::connectionFailed, this, drop);
+        connect(conn->session, &KIMAP::Session::connectionLost, this, drop);
+        auto *login = new KIMAP::LoginJob(conn->session);
+        configureLogin(login);
+        connect(login, &KJob::result, this, [this, conn, drop](KJob *job) {
+            if (job->error() || !conn->session) {
+                qWarning() << "mailo: body-pool login failed:" << job->errorString();
+                // The server likely caps concurrent connections — settle for
+                // what we have until the next (re)connect.
+                m_bodyPoolBroken = true;
+                drop();
+                return;
+            }
+            conn->ready = true;
+            processPrefetchQueue(); // put the fresh connection to work
+        });
+        login->start();
+    }
+}
+
+void MailClient::dispatchBodyBatch(const std::shared_ptr<BodyConn> &conn)
+{
+    QString folder;
+    const KIMAP::ImapSet set = takeBodyBatch(m_prefetchQueue, &folder);
+    conn->busy = true;
+    const auto release = [conn] { conn->busy = false; };
+    if (conn->folder == folder) {
+        startBodyFetchJob(conn->session.data(), folder, set, release);
+        return;
+    }
+    auto *select = new KIMAP::SelectJob(conn->session);
+    select->setMailBox(folder);
+    select->setOpenReadOnly(true);
+    connect(select, &KJob::result, this,
+            [this, conn, folder, set, release](KJob *job) {
+                if (job->error() || !conn->session) {
+                    // Dropped uids reappear via uidsWithoutBody on a later tick.
+                    release();
+                    return;
+                }
+                conn->folder = folder;
+                startBodyFetchJob(conn->session.data(), folder, set, release);
+            });
+    select->start();
+}
+
 void MailClient::processPrefetchQueue()
 {
-    if (m_prefetching || m_prefetchQueue.isEmpty() || !m_connected || !m_session)
+    if (m_prefetchQueue.isEmpty() || !m_connected || !m_session)
         return;
-    const qint64 uid = m_prefetchQueue.takeFirst();
-    const QString folder = m_selectedFolder;
+    ensureBodyPool();
+    // Preferred path: one in-flight batch per pool connection, in parallel.
+    bool poolReady = false;
+    for (const auto &conn : m_bodyPool) {
+        if (!conn->session || !conn->ready)
+            continue;
+        poolReady = true;
+        if (m_prefetchQueue.isEmpty())
+            break;
+        if (!conn->busy)
+            dispatchBodyBatch(conn);
+    }
+    if (poolReady || m_prefetching || m_prefetchQueue.isEmpty())
+        return;
+    // Fallback while the pool is still logging in (or was refused): a single
+    // batch on the shared sync connection, so bodies flow either way.
+    QString folder;
+    const KIMAP::ImapSet set = takeBodyBatch(m_prefetchQueue, &folder);
     m_prefetching = true;
-
-    // Body downloads can take seconds — run them on the sync connection so
-    // they never delay a user's folder switch or message open.
-    withSyncSession(folder, [this, folder, uid](KIMAP::Session *session) {
+    withSyncSession(folder, [this, folder, set](KIMAP::Session *session) {
         if (!session) {
             m_prefetching = false;
             return;
         }
-        auto *fetch = new KIMAP::FetchJob(session);
-        fetch->setSequenceSet(KIMAP::ImapSet(uid));
-        fetch->setUidBased(true);
-        KIMAP::FetchJob::FetchScope scope;
-        scope.mode = KIMAP::FetchJob::FetchScope::Full;
-        fetch->setScope(scope);
-
-        auto found = std::make_shared<std::shared_ptr<KMime::Message>>();
-        connect(fetch, &KIMAP::FetchJob::messagesAvailable, this,
-                [found](const QMap<qint64, KIMAP::Message> &messages) {
-                    for (const KIMAP::Message &m : messages) {
-                        if (!m.message)
-                            continue;
-                        if (!*found || !m.message->body().isEmpty()
-                            || !m.message->contents().isEmpty())
-                            *found = m.message;
-                    }
-                });
-        connect(fetch, &KJob::result, this, [this, found, folder, uid](KJob *job) {
-            m_prefetching = false;
-            if (!job->error() && *found) {
-                KMime::Message *msg = found->get();
-                if (msg->contents().isEmpty())
-                    msg->parse();
-                m_store.storeBody(folder, uid, msg->encodedContent(), indexTextFor(msg));
-                refineAttachKind(folder, uid, msg);
-                if (!m_sentFolder.isEmpty() && folder == m_sentFolder)
-                    harvestRecipients(msg);
-            }
-            processPrefetchQueue();
-        });
-        fetch->start();
+        startBodyFetchJob(session, folder, set, [this] { m_prefetching = false; });
     });
+}
+
+void MailClient::startBodyFetchJob(KIMAP::Session *session, const QString &folder,
+                                   const KIMAP::ImapSet &set,
+                                   const std::function<void()> &release)
+{
+    auto *fetch = new KIMAP::FetchJob(session);
+    fetch->setSequenceSet(set);
+    fetch->setUidBased(true);
+    KIMAP::FetchJob::FetchScope scope;
+    scope.mode = KIMAP::FetchJob::FetchScope::Full;
+    fetch->setScope(scope);
+
+    // Store each body the moment its delivery streams in: memory stays
+    // flat (roughly one body at a time) however big the batch is, and
+    // the parse/index work spreads across the socket events. `found`
+    // only stashes content-less deliveries — a message's attributes may
+    // arrive split across several emissions.
+    auto found =
+        std::make_shared<QHash<qint64, std::shared_ptr<KMime::Message>>>();
+    auto stored = std::make_shared<QSet<qint64>>();
+    connect(fetch, &KIMAP::FetchJob::messagesAvailable, this,
+            [this, folder, found, stored](
+                const QMap<qint64, KIMAP::Message> &messages) {
+                for (const KIMAP::Message &m : messages) {
+                    if (!m.message || m.uid <= 0 || stored->contains(m.uid))
+                        continue;
+                    if (!m.message->body().isEmpty()
+                        || !m.message->contents().isEmpty()) {
+                        stored->insert(m.uid);
+                        found->remove(m.uid);
+                        storeFetchedBody(folder, m.uid, m.message);
+                    } else if (!found->contains(m.uid)) {
+                        (*found)[m.uid] = m.message;
+                    }
+                }
+            });
+    connect(fetch, &KJob::result, this, [this, found, folder, release](KJob *job) {
+        if (job->error()) {
+            release();
+            // Server pushback: pause the backfill loop instead of
+            // immediately re-requesting the same bodies. On the concurrent-
+            // connection cap, also shed a pool connection.
+            if (isTooManyConnections(job->errorString()))
+                shrinkBodyPool();
+            backoffBackfill();
+            return;
+        }
+        resetBackfillBackoff();
+        // Leftovers whose deliveries never showed content (rare): store
+        // what we got, one per event-loop pass to keep the GUI fluid.
+        auto drain = std::make_shared<std::function<void()>>();
+        *drain = [this, found, folder, release, drain]() {
+            if (!found->isEmpty()) {
+                const qint64 uid = found->cbegin().key();
+                storeFetchedBody(folder, uid, found->take(uid));
+                if (!found->isEmpty()) {
+                    QTimer::singleShot(0, this, *drain);
+                    return;
+                }
+            }
+            release();
+            processPrefetchQueue();
+            // Body backfill: pace the next batch so bulk body downloads stay
+            // under server bandwidth limits (bodies are far heavier than
+            // headers), rather than requesting the next batch immediately.
+            if (m_prefetchQueue.isEmpty() && !bodyFetchActive())
+                scheduleBackfill(kBodyPauseMs);
+        };
+        (*drain)();
+    });
+    fetch->start();
+}
+
+void MailClient::storeFetchedBody(const QString &folder, qint64 uid,
+                                  const std::shared_ptr<KMime::Message> &message)
+{
+    KMime::Message *msg = message.get();
+    if (msg->contents().isEmpty())
+        msg->parse();
+    const QByteArray raw = msg->encodedContent();
+    const qint64 cap = qint64(m_maxBodyMB) * 1024 * 1024;
+    if (cap > 0 && raw.size() > cap) {
+        // A single mail with a big attachment can outweigh thousands of normal
+        // ones. Remember the refusal (so the backfill drops it) and move on —
+        // opening the message still fetches it on demand.
+        m_store.skipBody(folder, uid, raw.size());
+        refineAttachKind(folder, uid, msg);
+        noteBodyStored(folder);
+        return;
+    }
+    queueBodyWrite({m_store.scopedKey(folder), uid, raw, indexTextFor(msg)});
+    noteBodyStored(folder);
+    refineAttachKind(folder, uid, msg);
+    if (!m_sentFolder.isEmpty() && folder == m_sentFolder)
+        harvestRecipients(msg);
 }
 
 void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
@@ -2557,9 +3925,16 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
         m_currentSenderAddress =
             QString::fromLatin1(from->mailboxes().first().address()).toLower();
     const bool remembered = m_store.remoteContentAllowedFor(m_currentSenderAddress);
-    qWarning() << "mailo: presenting message from" << m_currentSenderAddress
-               << "remembered remote-content" << remembered;
-    applyRemoteContentAllowed(remembered);
+    qCDebug(logTrace) << "presenting message from" << m_currentSenderAddress
+                      << "remembered remote-content" << remembered;
+    // Junk gets hostile-content handling: no remembered remote-content
+    // allowance either — the user can still toggle it per view.
+    const bool junk = isJunkFolder(m_selectedFolder);
+    applyRemoteContentAllowed(remembered && !junk);
+    if (junk != m_junkTextOnly) {
+        m_junkTextOnly = junk;
+        Q_EMIT junkTextOnlyChanged();
+    }
     // A message in the Sent folder means its To/Cc were once our recipients —
     // feed them to the compose autocompletion.
     if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder)
@@ -2604,7 +3979,9 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     }
     collectAttachments(msg);
 
-    const QString bodyUrl = htmlPart ? htmlViewUrl() : textViewUrl();
+    // Junk folders open as plain text, always — HTML (still sandboxed)
+    // renders only when the user explicitly clicks the HTML view button.
+    const QString bodyUrl = (htmlPart && !junk) ? htmlViewUrl() : textViewUrl();
 
     const KMime::Message *cmsg = msg;
     const QString subject = cmsg->subject() ? cmsg->subject()->asUnicodeString() : QString();

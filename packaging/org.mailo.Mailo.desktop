@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Mailo
+GenericName=Mail Client
+Comment=A fast, security-minded IMAP mail client for the KDE desktop
+Exec=mailo %U
+Icon=org.mailo.Mailo
+Terminal=false
+Categories=Network;Email;Qt;KDE;
+Keywords=mail;email;imap;smtp;
+MimeType=x-scheme-handler/mailto;
+StartupNotify=true

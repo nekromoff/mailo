@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #include "foldermodel.h"
 
 #include <QSettings>
@@ -8,6 +11,31 @@ static QString collapsedSettingsKey(const QString &accountKey)
     QString safe = accountKey;
     safe.replace(QLatin1Char('/'), QLatin1Char('_'));
     return QStringLiteral("ui/collapsedFolders/") + safe;
+}
+
+int FolderModel::rowForMailBox(const QString &mailBox) const
+{
+    if (mailBox.isEmpty())
+        return -1;
+    for (int row = 0; row < m_visible.size(); ++row) {
+        if (m_all.at(m_visible.at(row)).mailBox == mailBox)
+            return row;
+    }
+    return -1;
+}
+
+QString FolderModel::mailBoxAt(int row) const
+{
+    if (row < 0 || row >= m_visible.size())
+        return {};
+    return m_all.at(m_visible.at(row)).mailBox;
+}
+
+bool FolderModel::selectableAt(int row) const
+{
+    if (row < 0 || row >= m_visible.size())
+        return false;
+    return m_all.at(m_visible.at(row)).selectable;
 }
 
 int FolderModel::rowCount(const QModelIndex &parent) const
@@ -127,6 +155,16 @@ void FolderModel::toggleExpanded(int row)
     beginResetModel();
     rebuildVisible();
     endResetModel();
+}
+
+void FolderModel::expandRow(int row)
+{
+    if (row < 0 || row >= m_visible.size())
+        return;
+    const int allIndex = m_visible.at(row);
+    if (!hasChildren(allIndex) || !m_collapsed.contains(m_all.at(allIndex).mailBox))
+        return;
+    toggleExpanded(row);
 }
 
 void FolderModel::rebuildVisible()

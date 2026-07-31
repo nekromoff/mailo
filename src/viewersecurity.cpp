@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
 #include "viewersecurity.h"
 
 #include <QBuffer>
@@ -35,6 +38,15 @@ void ViewerSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
         auto *buffer = new QBuffer(job);
         buffer->setData(it->data);
         job->reply(it->mimeType, buffer);
+        return;
+    }
+
+    // Only the document URL itself gets the body. Mail that references
+    // root-relative assets ("/packs/assets/x.woff2") resolves them against
+    // this scheme, and answering those with the message HTML made Chromium
+    // try to parse an email as a font. Those requests have no answer here.
+    if (!path.startsWith(QLatin1String("message/"))) {
+        job->fail(QWebEngineUrlRequestJob::UrlNotFound);
         return;
     }
 
