@@ -28,17 +28,25 @@ tools_dir="$here/tools"
 output="${OUTPUT:-Mailo-x86_64.AppImage}"
 jobs="${JOBS:-$(nproc)}"
 
-# Where Qt keeps its bits on this distro. Override if autodetection is wrong.
-qml_dir="${QML_DIR:-/usr/lib/x86_64-linux-gnu/qt6/qml}"
-qt_libexec="${QT_LIBEXEC:-/usr/lib/qt6/libexec}"
-qt_resources="${QT_RESOURCES:-/usr/share/qt6/resources}"
-qt_translations="${QT_TRANSLATIONS:-/usr/share/qt6/translations}"
-
 # linuxdeploy-plugin-qt queries qmake; the bare `qmake` wrapper may point at
 # Qt5, so force the Qt6 one unless the caller overrides it.
 export QMAKE="${QMAKE:-qmake6}"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+# Where Qt keeps its bits varies per distro (Debian buries libs under an arch
+# triplet, Fedora/Arch do not), so ask qmake instead of hardcoding a layout.
+# Every value stays overridable for the cases where the answer is wrong.
+qt_query() { "$QMAKE" -query "$1" 2>/dev/null || true; }
+command -v "$QMAKE" >/dev/null || { echo "$QMAKE not found in PATH" >&2; exit 1; }
+
+qml_dir="${QML_DIR:-$(qt_query QT_INSTALL_QML)}"
+qt_libexec="${QT_LIBEXEC:-$(qt_query QT_INSTALL_LIBEXECS)}"
+qt_translations="${QT_TRANSLATIONS:-$(qt_query QT_INSTALL_TRANSLATIONS)}"
+qt_plugins="${QT_PLUGINS:-$(qt_query QT_INSTALL_PLUGINS)}"
+# There is no QT_INSTALL_RESOURCES; WebEngine's *.pak/ICU data sit next to the
+# rest of Qt's arch-independent data.
+qt_resources="${QT_RESOURCES:-$(qt_query QT_INSTALL_DATA)/resources}"
 
 # --- 1. fetch tooling ----------------------------------------------------
 mkdir -p "$tools_dir"
@@ -87,7 +95,9 @@ fi
 #     linuxdeploy-plugin-qt scans imports it can see, but the style is loaded
 #     by string at runtime (QQuickStyle::setStyle) so copy the trees wholesale.
 log "Bundling KDE QML style + Kirigami"
-dest_qml="$appdir/usr/lib/x86_64-linux-gnu/qt6/qml"
+# usr/qml is where linuxdeploy-plugin-qt puts imports and what the qt.conf it
+# generates points Qml2Imports at, so land in the same tree — no arch triplet.
+dest_qml="$appdir/usr/qml"
 mkdir -p "$dest_qml/org/kde"
 for mod in org/kde/desktop org/kde/kirigami org/kde/kirigamiaddons; do
   if [[ -d "$qml_dir/$mod" ]]; then
@@ -102,22 +112,25 @@ done
 #     but not the former, so every named icon in the UI came out as an empty
 #     square no matter how the theme was configured.
 log "Bundling the SVG icon engine"
-for plugin_root in /usr/lib/x86_64-linux-gnu/qt6/plugins /usr/lib/qt6/plugins; do
-  if [[ -d "$plugin_root/iconengines" ]]; then
-    mkdir -p "$appdir/usr/plugins/iconengines"
-    cp -a "$plugin_root/iconengines/." "$appdir/usr/plugins/iconengines/"
-    break
-  fi
-done
+if [[ -d "$qt_plugins/iconengines" ]]; then
+  mkdir -p "$appdir/usr/plugins/iconengines"
+  cp -a "$qt_plugins/iconengines/." "$appdir/usr/plugins/iconengines/"
+fi
 
 # 3d. Breeze icon theme so named icons in the UI actually render.
+# Search the XDG data dirs rather than one fixed prefix: the theme lives under
+# a different root on distros that install KDE outside /usr/share.
 log "Bundling Breeze icons"
-for base_theme in /usr/share/icons/breeze /usr/share/icons/breeze-dark; do
-  if [[ -d "$base_theme" ]]; then
-    dest="$appdir/usr/share/icons/$(basename "$base_theme")"
+icon_roots="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+for theme in breeze breeze-dark; do
+  IFS=: read -r -a _roots <<< "$icon_roots"
+  for root in "${_roots[@]}"; do
+    [[ -d "$root/icons/$theme" ]] || continue
+    dest="$appdir/usr/share/icons/$theme"
     mkdir -p "$dest"
-    cp -a "$base_theme/." "$dest/"
-  fi
+    cp -a "$root/icons/$theme/." "$dest/"
+    break
+  done
 done
 
 # --- 4. runtime hook: env for the bundled Qt/WebEngine/style -------------
@@ -135,7 +148,7 @@ export QTWEBENGINE_RESOURCES_PATH="$here/usr/resources"
 export QTWEBENGINE_LOCALES_PATH="$here/usr/translations/qtwebengine_locales"
 # Force the bundled KDE style; without a KDE session it would fall back to Basic.
 export QT_QUICK_CONTROLS_STYLE="org.kde.desktop"
-export QML2_IMPORT_PATH="$here/usr/lib/x86_64-linux-gnu/qt6/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
+export QML2_IMPORT_PATH="$here/usr/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
 # Prefer the bundled Breeze icons.
 export XDG_DATA_DIRS="$here/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
 HOOK
