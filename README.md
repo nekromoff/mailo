@@ -1,10 +1,12 @@
 # Mailo
 
-A fast, security-minded IMAP mail client for the KDE desktop.
+The fast KDE email client.
 
 (c) 2026 Daniel Duris, dusoft@staznosti.sk
 
 ## What it does
+
+Security-minded KDE-only IMAP mail client, blazing fast.
 
 - **IMAP mail reading** — connect to any IMAP server (SSL/TLS, STARTTLS, or plain),
   browse the folder tree, read messages. Auth is PLAIN/LOGIN (no OAuth yet, so use
@@ -32,6 +34,14 @@ A fast, security-minded IMAP mail client for the KDE desktop.
   pane switching), sortable Subject/From/Date columns.
 - **Secure credential storage** — the password lives in KWallet (or any Secret
   Service keyring) via Qt6Keychain, never in a config file.
+
+## Screenshots
+<img width="1920" height="1024" alt="0" src="https://github.com/user-attachments/assets/638d2514-dd1b-41fd-901a-850f130fe2cc" />
+<img width="997" height="681" alt="compose" src="https://github.com/user-attachments/assets/4c14c43f-62d2-4bb0-a039-cc86447e5294" />
+<img width="899" height="575" alt="2" src="https://github.com/user-attachments/assets/bd762b0c-f9e0-43be-8bb8-c3a9b6d04f08" />
+<img width="1198" height="748" alt="1" src="https://github.com/user-attachments/assets/e4fef71e-93d8-4291-b69d-ee0845f24e5b" />
+<img width="900" height="573" alt="3" src="https://github.com/user-attachments/assets/386c741a-f78e-420e-9820-8cb2d27acaa7" />
+<img width="901" height="576" alt="4" src="https://github.com/user-attachments/assets/980494f3-a786-4da6-aba1-0aadd4540cb5" />
 
 ## Technology
 
@@ -71,6 +81,4 @@ cmake --build build
 
 ## Status / roadmap
 
-Early but usable single-account client. Not yet implemented: OAuth (Gmail/O365),
-IMAP IDLE push, UIDVALIDITY tracking, message flags sync back to server (read state
-is local), folder management, threading, GPG/S-MIME.
+Working, multiple accounts supported.
