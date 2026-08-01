@@ -17,6 +17,7 @@
 #include <QSettings>
 #include <QSqlQuery>
 #include <QLoggingCategory>
+#include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
 
@@ -242,19 +243,101 @@ static bool isTooManyConnections(const QString &err)
         || err.toUpper().contains(QStringLiteral("SIMULTANEOUS CONNECTIONS"));
 }
 
+/// Drops RFC 8601 comments "(…)" and quoted strings from an
+/// Authentication-Results value. Both carry sender-supplied text — a genuine
+/// header echoes the envelope sender in smtp.mailfrom= — and both may contain
+/// ';' or the literal "dkim=pass", so they have to go before the value is
+/// split into fields or a sender could smuggle a verdict into the display.
+static QString stripAuthCommentsAndQuotes(const QString &value)
+{
+    QString out;
+    out.reserve(value.size());
+    int commentDepth = 0;
+    bool inQuotes = false;
+    for (int i = 0; i < value.size(); ++i) {
+        const QChar c = value.at(i);
+        if (c == QLatin1Char('\\') && (inQuotes || commentDepth > 0)) {
+            ++i; // skip the escaped character
+            continue;
+        }
+        if (inQuotes) {
+            if (c == QLatin1Char('"'))
+                inQuotes = false;
+            continue;
+        }
+        if (commentDepth > 0) {
+            if (c == QLatin1Char('('))
+                ++commentDepth;
+            else if (c == QLatin1Char(')'))
+                --commentDepth;
+            continue;
+        }
+        if (c == QLatin1Char('"')) {
+            inQuotes = true;
+        } else if (c == QLatin1Char('(')) {
+            ++commentDepth;
+            out.append(QLatin1Char(' '));
+        } else {
+            out.append(c);
+        }
+    }
+    return out;
+}
+
+/// The "method=result" verdicts of an Authentication-Results value, lowercased
+/// and in header order. Only the leading token of each ';'-delimited field
+/// counts: everything after it (smtp.mailfrom=, header.from=, reason=) echoes
+/// sender-supplied data, so scanning the whole value would let a sender inject
+/// a passing verdict into an otherwise genuine header.
+static QStringList authResultVerdicts(const QString &value)
+{
+    static const QRegularExpression methodRe(
+        QStringLiteral("^\\s*(spf|dkim|dmarc)\\s*=\\s*([a-z]+)"),
+        QRegularExpression::CaseInsensitiveOption);
+    QStringList out;
+    const QStringList fields =
+        stripAuthCommentsAndQuotes(value).split(QLatin1Char(';'));
+    // Field 0 is the authserv-id, never a verdict.
+    for (qsizetype i = 1; i < fields.size(); ++i) {
+        const auto m = methodRe.match(fields.at(i));
+        if (m.hasMatch())
+            out.append(m.captured(1).toLower() + QLatin1Char('=') + m.captured(2).toLower());
+    }
+    return out;
+}
+
+/// True when \a authservId is exactly one of \a trustedDomains or a host under
+/// one. Must not be a substring test: "contains" would accept an authserv-id
+/// of "gmail.com.attacker.example", which any sender can stamp on their own
+/// message, turning the SPF/DKIM badge into attacker-controlled text.
+static bool authservIdTrusted(const QString &authservId, const QStringList &trustedDomains)
+{
+    for (const QString &domain : trustedDomains) {
+        if (authservId == domain || authservId.endsWith(QLatin1Char('.') + domain))
+            return true;
+    }
+    return false;
+}
+
 /// First Authentication-Results header stamped by our own receiving server
 /// (senders can forge their own AR headers, so foreign authserv-ids are
 /// ignored). Empty when the message carries no trusted verdict.
 static QString trustedAuthResults(const KMime::Message *msg,
-                                  const QString &trustedAuthDomain)
+                                  const QStringList &trustedAuthDomains)
 {
+    if (trustedAuthDomains.isEmpty())
+        return {}; // nobody to trust — show nothing rather than a forgery
     const auto arHeaders = msg->headersByType("Authentication-Results");
     for (const KMime::Headers::Base *ar : arHeaders) {
         const QString value = ar->asUnicodeString();
-        // authserv-id is the first token, e.g. "purelymail.com; spf=pass …"
-        const QString authservId =
-            value.section(QLatin1Char(';'), 0, 0).trimmed().toLower();
-        if (!trustedAuthDomain.isEmpty() && !authservId.contains(trustedAuthDomain))
+        // authserv-id is the first field, optionally followed by a version
+        // number: "purelymail.com 1; spf=pass …".
+        const QString authservId = stripAuthCommentsAndQuotes(value)
+                                       .section(QLatin1Char(';'), 0, 0)
+                                       .simplified()
+                                       .section(QLatin1Char(' '), 0, 0)
+                                       .toLower();
+        if (!authservIdTrusted(authservId, trustedAuthDomains))
             continue; // forged or foreign AR header — ignore
         return value; // first trusted header wins (newest — servers prepend)
     }
@@ -272,7 +355,7 @@ static bool imapEntryUsable(const KIMAP::Message &m)
 /// Builds a list header from a KIMAP delivery, including the sender-
 /// authentication verdict our receiving server stamped into the message.
 static MessageListModel::Header headerFromImap(const KIMAP::Message &m,
-                                               const QString &trustedAuthDomain)
+                                               const QStringList &trustedAuthDomains)
 {
     MessageListModel::Header h;
     h.uid = m.uid;
@@ -283,6 +366,8 @@ static MessageListModel::Header headerFromImap(const KIMAP::Message &m,
         h.from = from->asUnicodeString();
     if (const auto *date = msg->date())
         h.date = date->dateTime();
+    if (const auto *mid = msg->messageID(); mid && !mid->isEmpty())
+        h.msgid = QString::fromLatin1(mid->identifier());
     for (const QByteArray &flag : m.flags) {
         if (flag.compare("\\Seen", Qt::CaseInsensitive) == 0)
             h.seen = true;
@@ -293,29 +378,63 @@ static MessageListModel::Header headerFromImap(const KIMAP::Message &m,
     h.attachKind = MailStore::headIndicatesAttachment(msg->head())
         ? MessageListModel::GenericAttachment
         : MessageListModel::NoAttachment;
-    h.authInfo = trustedAuthResults(m.message.get(), trustedAuthDomain);
-    if (!h.authInfo.isEmpty()) {
-        static const QRegularExpression verdictRe(
-            QStringLiteral("\\b(spf|dkim|dmarc)=([a-z]+)"));
-        auto it = verdictRe.globalMatch(h.authInfo.toLower());
-        while (it.hasNext()) {
-            const QString verdict = it.next().captured(2);
-            // fail, softfail, hardfail, permerror — anything but pass/neutral/none
-            if (verdict.endsWith(QLatin1String("fail"))
-                || verdict == QLatin1String("permerror"))
-                h.suspicious = true;
-        }
+    h.authInfo = trustedAuthResults(m.message.get(), trustedAuthDomains);
+    const QStringList verdicts = authResultVerdicts(h.authInfo);
+    for (const QString &verdict : verdicts) {
+        const QString result = verdict.section(QLatin1Char('='), 1);
+        // fail, softfail, hardfail, permerror — anything but pass/neutral/none
+        if (result.endsWith(QLatin1String("fail")) || result == QLatin1String("permerror"))
+            h.suspicious = true;
     }
     return h;
 }
 
-/// "imap.purelymail.com" → "purelymail.com"; two-label hosts stay as-is.
-static QString authDomainForHost(const QString &host)
+/// The authserv-id domains whose Authentication-Results headers we trust for a
+/// given IMAP host. Providers rarely stamp the domain you connect to — Gmail is
+/// reached at imap.gmail.com but stamps "mx.google.com" — so deriving the
+/// registrable domain of the host alone would discard every genuine header and
+/// leave only forged ones able to match.
+static QStringList trustedAuthDomainsForHost(const QString &host)
 {
-    const QStringList labels = host.toLower().split(QLatin1Char('.'), Qt::SkipEmptyParts);
+    const QString h = host.toLower();
+    struct Provider {
+        const char *hostSuffix;
+        const char *authDomains; // space-separated
+    };
+    static const Provider providers[] = {
+        {"gmail.com", "mx.google.com google.com"},
+        {"googlemail.com", "mx.google.com google.com"},
+        {"google.com", "mx.google.com google.com"},
+        {"outlook.com", "outlook.com protection.outlook.com"},
+        {"office365.com", "outlook.com protection.outlook.com"},
+        {"hotmail.com", "outlook.com protection.outlook.com"},
+        {"live.com", "outlook.com protection.outlook.com"},
+        {"yahoo.com", "yahoo.com"},
+        {"fastmail.com", "messagingengine.com fastmail.com"},
+        {"messagingengine.com", "messagingengine.com fastmail.com"},
+        {"icloud.com", "icloud.com me.com"},
+        {"me.com", "icloud.com me.com"},
+        {"zoho.com", "zoho.com zohomail.com"},
+        {"zohomail.com", "zoho.com zohomail.com"},
+        {"proton.me", "proton.me protonmail.ch"},
+        {"protonmail.ch", "proton.me protonmail.ch"},
+        {"yandex.ru", "yandex.ru"},
+        {"gmx.net", "gmx.net"},
+        {"web.de", "web.de"},
+        {"mail.ru", "mail.ru"},
+    };
+    for (const Provider &p : providers) {
+        const QString suffix = QLatin1String(p.hostSuffix);
+        if (h == suffix || h.endsWith(QLatin1Char('.') + suffix))
+            return QString::fromLatin1(p.authDomains).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    }
+    // Unknown provider: the host itself and its registrable domain, which is
+    // what a self-hosted or small-provider server stamps.
+    QStringList out{h};
+    const QStringList labels = h.split(QLatin1Char('.'), Qt::SkipEmptyParts);
     if (labels.size() >= 3)
-        return labels.mid(1).join(QLatin1Char('.'));
-    return host.toLower();
+        out.append(labels.mid(1).join(QLatin1Char('.')));
+    return out;
 }
 
 /// "1 message" / "42 messages". Qt only picks plural forms for %n when a
@@ -348,6 +467,40 @@ static QString shortenError(const QString &err)
 MailClient::MailClient(QObject *parent)
     : QObject(parent)
 {
+    // The reading pane's message context. Detached windows clone it; this one
+    // lives as long as the client. The legacy Mail.* message properties
+    // delegate to it, so its change signals feed theirs.
+    m_reading = new MessageContext(this);
+    connect(m_reading, &MessageContext::messageChanged,
+            this, &MailClient::attachmentsChanged);
+    connect(m_reading, &MessageContext::messageChanged,
+            this, &MailClient::junkTextOnlyChanged);
+    connect(m_reading, &MessageContext::remoteContentAllowedChanged,
+            this, &MailClient::remoteContentAllowedChanged);
+
+    // DKIM verification lives on its own thread for its whole life: the DNS
+    // round trip alone would stall the GUI for as long as a resolver takes.
+    qRegisterMetaType<DkimResult>();
+    m_dkimThread = new QThread(this);
+    m_dkimThread->setObjectName(QStringLiteral("dkim"));
+    m_dkimVerifier = new DkimVerifier;
+    m_dkimVerifier->moveToThread(m_dkimThread);
+    connect(m_dkimThread, &QThread::finished, m_dkimVerifier, &QObject::deleteLater);
+    connect(m_dkimVerifier, &DkimVerifier::finished, this, &MailClient::applyDkimResult);
+    m_dkimThread->start();
+
+    // One-time Message-ID backfill for rows cached before the column existed.
+    // 100 rows a tick reads roughly 1.5 MB of message heads — well inside a
+    // frame — and the timer stops itself the moment there is nothing left.
+    m_msgidBackfillTimer.setInterval(2000);
+    connect(&m_msgidBackfillTimer, &QTimer::timeout, this, [this] {
+        if (m_store.backfillMessageIds(100) == 0) {
+            m_msgidBackfillTimer.stop();
+            qCDebug(logTrace, "message-id backfill complete");
+        }
+    });
+    QTimer::singleShot(10000, this, [this] { m_msgidBackfillTimer.start(); });
+
     // Errors go into the status breadcrumb (short), not passive popups.
     connect(this, &MailClient::errorOccurred, this, [this](const QString &msg) {
         setStatus(shortenError(msg));
@@ -1366,9 +1519,14 @@ QString MailClient::loadHtmlFile(const QUrl &fileUrl)
 
 QVariantMap MailClient::replyData(bool replyAll)
 {
-    if (!m_currentMessage)
+    return replyDataFor(m_reading, replyAll);
+}
+
+QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
+{
+    if (!ctx->m_message)
         return {};
-    const KMime::Message *msg = m_currentMessage.get();
+    const KMime::Message *msg = ctx->m_message.get();
 
     // Bare addr-specs only — that is the shape sendMail() accepts back.
     auto addressesOf = [](const auto *header) {
@@ -1411,10 +1569,10 @@ QVariantMap MailClient::replyData(bool replyAll)
 
     // Quote the HTML part when there is one so the reply keeps the original's
     // formatting; the plain-text part is the fallback.
-    const QString quoted = m_currentHtmlBody.isEmpty()
-        ? m_currentTextBody.trimmed().toHtmlEscaped()
+    const QString quoted = ctx->m_htmlBody.isEmpty()
+        ? ctx->m_textBody.trimmed().toHtmlEscaped()
               .replace(QLatin1Char('\n'), QLatin1String("<br>"))
-        : quotableHtml(m_currentHtmlBody);
+        : quotableHtml(ctx->m_htmlBody);
     const QString fromDisplay = msg->from() ? msg->from()->asUnicodeString() : QString();
     QString date;
     if (msg->date()) {
@@ -1439,9 +1597,10 @@ QVariantMap MailClient::replyData(bool replyAll)
 /// not responded to.
 QVariantMap MailClient::draftData()
 {
-    if (!m_currentMessage)
+    MessageContext *ctx = m_reading;
+    if (!ctx->m_message)
         return {};
-    const KMime::Message *msg = m_currentMessage.get();
+    const KMime::Message *msg = ctx->m_message.get();
 
     auto addressesOf = [](const auto *header) {
         QStringList out;
@@ -1458,9 +1617,9 @@ QVariantMap MailClient::draftData()
 
     // The HTML part when the draft has one, so formatting survives a
     // save/reopen round trip; the plain part is the fallback.
-    const QString body = !m_currentHtmlBody.isEmpty()
-        ? m_currentHtmlBody
-        : m_currentTextBody.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
+    const QString body = !ctx->m_htmlBody.isEmpty()
+        ? ctx->m_htmlBody
+        : ctx->m_textBody.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
 
     return {{QStringLiteral("to"), addressesOf(msg->to()).join(QStringLiteral(", "))},
             {QStringLiteral("cc"), addressesOf(msg->cc()).join(QStringLiteral(", "))},
@@ -1468,7 +1627,7 @@ QVariantMap MailClient::draftData()
             {QStringLiteral("subject"),
              msg->subject() ? msg->subject()->asUnicodeString() : QString()},
             {QStringLiteral("body"), body},
-            {QStringLiteral("uid"), m_currentUid}};
+            {QStringLiteral("uid"), ctx->m_uid}};
 }
 
 /// Removes the draft a composer was opened from, once its replacement has been
@@ -1516,19 +1675,24 @@ void MailClient::discardDraft(qint64 uid)
 
 QVariantMap MailClient::forwardData()
 {
-    if (!m_currentMessage)
+    return forwardDataFor(m_reading);
+}
+
+QVariantMap MailClient::forwardDataFor(MessageContext *ctx)
+{
+    if (!ctx->m_message)
         return {};
-    const KMime::Message *msg = m_currentMessage.get();
+    const KMime::Message *msg = ctx->m_message.get();
 
     QString subject = msg->subject() ? msg->subject()->asUnicodeString() : QString();
     if (!subject.startsWith(QLatin1String("Fwd:"), Qt::CaseInsensitive)
         && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
         subject = QStringLiteral("Fwd: ") + subject;
 
-    const QString quoted = m_currentHtmlBody.isEmpty()
-        ? m_currentTextBody.trimmed().toHtmlEscaped()
+    const QString quoted = ctx->m_htmlBody.isEmpty()
+        ? ctx->m_textBody.trimmed().toHtmlEscaped()
               .replace(QLatin1Char('\n'), QLatin1String("<br>"))
-        : quotableHtml(m_currentHtmlBody);
+        : quotableHtml(ctx->m_htmlBody);
     const QString from = msg->from() ? msg->from()->asUnicodeString() : QString();
     const QString origTo = msg->to() ? msg->to()->asUnicodeString() : QString();
     const QString origSubject =
@@ -2140,6 +2304,13 @@ MailClient::~MailClient()
 {
     // Shutdown joins five worker threads. If quitting ever hangs, these say
     // which join it is sitting in rather than leaving a silent process behind.
+    qCDebug(logTrace, "shutdown: stopping DKIM verifier");
+    if (m_dkimThread) {
+        m_dkimThread->quit();
+        // A verification in flight may be inside a DNS wait; that wait is
+        // capped at 10s, so this join is bounded.
+        m_dkimThread->wait();
+    }
     qCDebug(logTrace, "shutdown: stopping body writer");
     stopBodyWriter();
     qCDebug(logTrace, "shutdown: stopping purge");
@@ -2536,13 +2707,38 @@ void MailClient::listFolders()
 
 bool MailClient::isJunkFolder(const QString &mailBox) const
 {
+    // This drives the hostile-content defaults (plain text, no remote content),
+    // so a miss here silently downgrades protection. Matching on names is a
+    // heuristic — the robust answer is the IMAP SPECIAL-USE "\Junk" attribute,
+    // which is not plumbed through the folder model yet.
     static const QStringList junkNames = {
-        QStringLiteral("spam"), QStringLiteral("junk"),
-        QStringLiteral("junk e-mail"), QStringLiteral("junk email"),
-        QStringLiteral("junk mail"), QStringLiteral("bulk mail")};
+        QStringLiteral("spam"),         QStringLiteral("junk"),
+        QStringLiteral("junk e-mail"),  QStringLiteral("junk email"),
+        QStringLiteral("junk mail"),    QStringLiteral("bulk mail"),
+        QStringLiteral("bulk"),         QStringLiteral("quarantine"),
+        // Localized names used by the major providers' web UIs
+        QStringLiteral("correo no deseado"), QStringLiteral("no deseado"),
+        QStringLiteral("courrier indésirable"), QStringLiteral("indésirables"),
+        QStringLiteral("pourriel"),     QStringLiteral("unerwünscht"),
+        QStringLiteral("posta indesiderata"), QStringLiteral("indesiderata"),
+        QStringLiteral("lixo eletrônico"), QStringLiteral("lixo eletronico"),
+        QStringLiteral("ongewenst"),    QStringLiteral("ongewenste e-mail"),
+        QStringLiteral("uønsket e-post"), QStringLiteral("skräppost"),
+        QStringLiteral("roskaposti"),   QStringLiteral("uønsket post"),
+        QStringLiteral("wiadomości-śmieci"), QStringLiteral("niechciane"),
+        QStringLiteral("nevyžádaná pošta"), QStringLiteral("nevyžiadaná pošta"),
+        QStringLiteral("levélszemét"),  QStringLiteral("спам"),
+        QStringLiteral("нежелательная почта"), QStringLiteral("垃圾邮件"),
+        QStringLiteral("垃圾郵件"),      QStringLiteral("迷惑メール"),
+        QStringLiteral("스팸")};
     const QChar sep = mailBox.contains(QLatin1Char('/')) ? QLatin1Char('/')
                                                          : QLatin1Char('.');
-    return junkNames.contains(mailBox.section(sep, -1).toLower());
+    const QString leaf = mailBox.section(sep, -1).toLower();
+    if (junkNames.contains(leaf))
+        return true;
+    // Providers decorate the leaf ("Spam (2)", "Junk-E-Mail"); a substring test
+    // on these two roots costs nothing and catches the decorated variants.
+    return leaf.contains(QLatin1String("spam")) || leaf.contains(QLatin1String("junk"));
 }
 
 QString MailClient::trashFolderName() const
@@ -3174,14 +3370,14 @@ void MailClient::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
     fetch->setScope(scope);
 
     auto headers = std::make_shared<QList<MessageListModel::Header>>();
-    const QString authDomain = authDomainForHost(m_host);
+    const QStringList authDomains = trustedAuthDomainsForHost(m_host);
     connect(fetch, &KIMAP::FetchJob::messagesAvailable, this,
-            [headers, authDomain, maxCachedUid](const QMap<qint64, KIMAP::Message> &messages) {
+            [headers, authDomains, maxCachedUid](const QMap<qint64, KIMAP::Message> &messages) {
                 for (auto it = messages.cbegin(); it != messages.cend(); ++it) {
                     // "uid:*" always returns at least the mailbox's newest
                     // message, even when its uid is below the requested range.
                     if (imapEntryUsable(it.value()) && it.value().uid > maxCachedUid)
-                        headers->append(headerFromImap(it.value(), authDomain));
+                        headers->append(headerFromImap(it.value(), authDomains));
                 }
             });
 
@@ -3472,12 +3668,12 @@ void MailClient::fetchHeadersOn(KIMAP::Session *session, const QString &folder,
     fetch->setScope(scope);
 
     auto headers = std::make_shared<QList<MessageListModel::Header>>();
-    const QString authDomain = authDomainForHost(m_host);
+    const QStringList authDomains = trustedAuthDomainsForHost(m_host);
     connect(fetch, &KIMAP::FetchJob::messagesAvailable, this,
-            [headers, authDomain](const QMap<qint64, KIMAP::Message> &messages) {
+            [headers, authDomains](const QMap<qint64, KIMAP::Message> &messages) {
                 for (auto it = messages.cbegin(); it != messages.cend(); ++it) {
                     if (imapEntryUsable(it.value()))
-                        headers->append(headerFromImap(it.value(), authDomain));
+                        headers->append(headerFromImap(it.value(), authDomains));
                 }
             });
 
@@ -3679,12 +3875,12 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids,
     fetch->setScope(scope);
 
     auto headers = std::make_shared<QList<MessageListModel::Header>>();
-    const QString authDomain = authDomainForHost(m_host);
+    const QStringList authDomains = trustedAuthDomainsForHost(m_host);
     connect(fetch, &KIMAP::FetchJob::messagesAvailable, this,
-            [headers, authDomain](const QMap<qint64, KIMAP::Message> &messages) {
+            [headers, authDomains](const QMap<qint64, KIMAP::Message> &messages) {
                 for (auto it = messages.cbegin(); it != messages.cend(); ++it) {
                     if (imapEntryUsable(it.value()))
-                        headers->append(headerFromImap(it.value(), authDomain));
+                        headers->append(headerFromImap(it.value(), authDomains));
                 }
             });
 
@@ -3739,23 +3935,47 @@ void MailClient::refineAttachKind(const QString &folder, qint64 uid, KMime::Mess
         m_messageModel.setAttachKind(uid, MessageListModel::CalendarAttachment);
 }
 
-void MailClient::collectInlineParts(KMime::Content *root)
+void MailClient::collectInlineParts(MessageContext *ctx, KMime::Content *root)
 {
     if (const auto *cid = std::as_const(*root).contentID(); cid && !cid->identifier().isEmpty()) {
         const auto *ct = std::as_const(*root).contentType();
-        m_viewerHandler->setInlinePart(QString::fromLatin1(cid->identifier()),
+        m_viewerHandler->setInlinePart(ctx->viewerContext(),
+                                       QString::fromLatin1(cid->identifier()),
                                        ct ? ct->mimeType() : QByteArray(),
                                        root->decodedBody());
     }
     const auto children = root->contents();
     for (KMime::Content *child : children)
-        collectInlineParts(child);
+        collectInlineParts(ctx, child);
 }
 
-void MailClient::collectAttachments(KMime::Content *root)
+/// Strips the parts of a sender-supplied filename that can misrepresent what
+/// the file is: directory components, C0/C1 control characters, and the Unicode
+/// direction overrides that make "invoice<U+202E>cod.exe" render as
+/// "invoiceexe.doc" in every label we put it in.
+static QString sanitizeFileName(const QString &raw)
 {
-    m_attachmentParts.clear();
-    m_attachments.clear();
+    QString out;
+    out.reserve(raw.size());
+    for (const QChar c : raw) {
+        const char16_t u = c.unicode();
+        const bool bidiControl = (u >= 0x202A && u <= 0x202E) // LRE…RLO, PDF
+            || (u >= 0x2066 && u <= 0x2069)                   // LRI…PDI
+            || u == 0x200E || u == 0x200F || u == 0x061C;     // LRM, RLM, ALM
+        if (u < 0x20 || (u >= 0x7F && u <= 0x9F) || bidiControl)
+            continue;
+        out.append(c == QLatin1Char('/') || c == QLatin1Char('\\') ? QLatin1Char('_') : c);
+    }
+    out = out.trimmed();
+    while (out.startsWith(QLatin1Char('.'))) // no hidden files, no "." or ".."
+        out.remove(0, 1);
+    return out.left(200); // stay under NAME_MAX once a suffix is appended
+}
+
+void MailClient::collectAttachments(MessageContext *ctx, KMime::Content *root)
+{
+    ctx->m_attachmentParts.clear();
+    ctx->m_attachments.clear();
     const auto parts = root->attachments();
     for (KMime::Content *part : parts) {
         QString name;
@@ -3765,124 +3985,247 @@ void MailClient::collectAttachments(KMime::Content *root)
             if (const auto *ct = std::as_const(*part).contentType())
                 name = ct->name();
         }
+        // Sanitize once, here, so the list label, the confirmation dialog, the
+        // risky-extension check and the on-disk name all agree on one string.
+        name = sanitizeFileName(QFileInfo(name).fileName());
         if (name.isEmpty())
-            name = tr("attachment %1").arg(m_attachmentParts.size() + 1);
+            name = tr("attachment %1").arg(ctx->m_attachmentParts.size() + 1);
 
-        m_attachmentParts.append(part);
-        m_attachments.append(QVariantMap{
+        ctx->m_attachmentParts.append(part);
+        ctx->m_attachments.append(QVariantMap{
             {QStringLiteral("name"), name},
             {QStringLiteral("sizeText"), QLocale().formattedDataSize(part->decodedBody().size())},
         });
     }
-    Q_EMIT attachmentsChanged();
 }
 
-static QByteArray preformattedPage(const QString &content, bool monospace)
+/// Escapes \a text for HTML with web links wrapped in anchors, so the
+/// plain-text view gets clickable URLs. Detection runs on the raw text and
+/// each piece is escaped separately — a match on already-escaped text would
+/// trip over the &amp; entities inside query strings. Only ever produces
+/// http(s) hrefs, and the viewer opens link clicks externally anyway (the
+/// WebEngineView never navigates), so this adds no surface beyond the text.
+static QString escapeAndLinkify(const QString &text)
+{
+    static const QRegularExpression urlRe(
+        QStringLiteral("\\b(?:https?://|www\\.)[^\\s<>\"]+"),
+        QRegularExpression::CaseInsensitiveOption);
+    QString out;
+    out.reserve(text.size() + text.size() / 8);
+    qsizetype pos = 0;
+    auto it = urlRe.globalMatch(text);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        QString url = m.captured();
+        // Trailing punctuation belongs to the sentence, not the URL —
+        // "see https://a.b/c." must not link the dot. Brackets only come off
+        // while unbalanced, so Wikipedia-style "…/Foo_(bar)" paths survive.
+        static const QString trailing = QStringLiteral(".,;:!?'\"");
+        while (!url.isEmpty()) {
+            const QChar last = url.back();
+            if (trailing.contains(last)) {
+                url.chop(1);
+                continue;
+            }
+            if ((last == QLatin1Char(')')
+                 && url.count(QLatin1Char('(')) < url.count(QLatin1Char(')')))
+                || (last == QLatin1Char(']')
+                    && url.count(QLatin1Char('[')) < url.count(QLatin1Char(']')))) {
+                url.chop(1);
+                continue;
+            }
+            break;
+        }
+        // "www." alone (or all-punctuation leftovers) is not a link.
+        if (url.length() <= 4) {
+            out += text.mid(pos, m.capturedEnd() - pos).toHtmlEscaped();
+            pos = m.capturedEnd();
+            continue;
+        }
+        out += text.mid(pos, m.capturedStart() - pos).toHtmlEscaped();
+        const QString href = url.startsWith(QLatin1String("www."), Qt::CaseInsensitive)
+            ? QStringLiteral("https://") + url
+            : url;
+        out += QStringLiteral("<a href=\"") + href.toHtmlEscaped() + QStringLiteral("\">")
+            + url.toHtmlEscaped() + QStringLiteral("</a>");
+        pos = m.capturedStart() + url.size();
+    }
+    out += text.mid(pos).toHtmlEscaped();
+    return out;
+}
+
+static QByteArray preformattedPage(const QString &content, bool monospace, bool linkify = false)
 {
     return QByteArrayLiteral("<html><head><meta charset=\"utf-8\"></head><body><pre style=\""
                              "white-space:pre-wrap;word-break:break-word;font-family:")
         + (monospace ? QByteArrayLiteral("monospace") : QByteArrayLiteral("sans-serif"))
-        + QByteArrayLiteral(";\">") + content.toHtmlEscaped().toUtf8()
+        + QByteArrayLiteral(";\">")
+        + (linkify ? escapeAndLinkify(content) : content.toHtmlEscaped()).toUtf8()
         + QByteArrayLiteral("</pre></body></html>");
 }
 
 QString MailClient::htmlViewUrl()
 {
+    return htmlViewUrlFor(m_reading);
+}
+
+QString MailClient::htmlViewUrlFor(MessageContext *ctx)
+{
     if (!m_viewerHandler)
         return {};
-    if (m_currentHtmlBody.isEmpty())
-        return textViewUrl();
+    ctx->m_handler = m_viewerHandler;
+    if (ctx->m_htmlBody.isEmpty())
+        return textViewUrlFor(ctx);
+    // Strip scripting hooks and embedded documents before anything else looks
+    // at the markup. Backed by the CSP below — see sanitizeMessageHtml().
+    QString html = sanitizeMessageHtml(ctx->m_htmlBody);
     // Point inline references at our scheme handler — but only actual
     // src/href attributes and CSS url() values, not arbitrary body text.
-    QString html = m_currentHtmlBody;
     static const QRegularExpression attrCidRe(
         QStringLiteral("((?:src|href|background)\\s*=\\s*[\"'])cid:"),
         QRegularExpression::CaseInsensitiveOption);
     static const QRegularExpression cssCidRe(
         QStringLiteral("(url\\(\\s*[\"']?)cid:"), QRegularExpression::CaseInsensitiveOption);
-    html.replace(attrCidRe, QStringLiteral("\\1mailo:cid/"));
-    html.replace(cssCidRe, QStringLiteral("\\1mailo:cid/"));
-    return m_viewerHandler->setMessageHtml(QByteArrayLiteral("<meta charset=\"utf-8\">")
-                                           + html.toUtf8());
+    const QString cidBase =
+        QStringLiteral("\\1mailo:cid/") + QString::number(ctx->viewerContext())
+        + QLatin1Char('/');
+    html.replace(attrCidRe, cidBase);
+    html.replace(cssCidRe, cidBase);
+    return m_viewerHandler->setMessageHtml(
+        ctx->viewerContext(),
+        QByteArrayLiteral("<meta charset=\"utf-8\">")
+            + messageCsp(ctx->remoteContentAllowed()) + html.toUtf8());
 }
 
 QString MailClient::textViewUrl()
 {
+    return textViewUrlFor(m_reading);
+}
+
+QString MailClient::textViewUrlFor(MessageContext *ctx)
+{
     if (!m_viewerHandler)
         return {};
-    QString text = m_currentTextBody;
-    if (text.isEmpty() && !m_currentHtmlBody.isEmpty()) {
+    ctx->m_handler = m_viewerHandler;
+    QString text = ctx->m_textBody;
+    if (text.isEmpty() && !ctx->m_htmlBody.isEmpty()) {
         // HTML-only message: show its stripped text — the junk folders'
         // text-only default must not degrade to an empty stub.
-        text = QTextDocumentFragment::fromHtml(m_currentHtmlBody.left(500000))
+        text = QTextDocumentFragment::fromHtml(ctx->m_htmlBody.left(500000))
                    .toPlainText();
     }
     if (text.isEmpty())
         text = tr("(this message has no displayable text part)");
-    return m_viewerHandler->setMessageHtml(preformattedPage(text, false));
+    // Monospace: plain-text mail (patches, tables, ASCII art — the Bugzilla
+    // change tables are the classic case) is written for a fixed-width grid
+    // and falls apart in a proportional font. Linkified so URLs are clickable
+    // like in the HTML view; the source view stays verbatim.
+    return m_viewerHandler->setMessageHtml(ctx->viewerContext(),
+                                           preformattedPage(text, true, true));
 }
 
 QString MailClient::sourceViewUrl()
 {
+    return sourceViewUrlFor(m_reading);
+}
+
+QString MailClient::sourceViewUrlFor(MessageContext *ctx)
+{
     if (!m_viewerHandler)
         return {};
-    // HTML part when there is one; otherwise the complete raw RFC-822
-    // message (headers + MIME structure) — the debugging view.
-    const QString source = m_currentHtmlBody.isEmpty() ? QString::fromUtf8(m_currentRaw)
-                                                       : m_currentHtmlBody;
-    return m_viewerHandler->setMessageHtml(preformattedPage(source, true));
+    ctx->m_handler = m_viewerHandler;
+    // Always the complete raw RFC-822 message — headers, MIME structure and
+    // every part, verbatim. Showing just the HTML part here (as this once
+    // did) left HTML mail with a "source" view that had no headers at all.
+    return m_viewerHandler->setMessageHtml(
+        ctx->viewerContext(), preformattedPage(QString::fromUtf8(ctx->m_raw), true));
 }
 
 
-QString MailClient::attachmentName(int index) const
+QString MailClient::attachmentNameFor(const MessageContext *ctx, int index) const
 {
-    // Basename only — a hostile filename must not traverse directories.
-    const QString name =
-        QFileInfo(m_attachments.at(index).toMap().value(QStringLiteral("name")).toString())
-            .fileName();
+    // Basename only — a hostile filename must not traverse directories — and
+    // sanitized again so this never depends on collectAttachments() having run.
+    const QString name = sanitizeFileName(
+        QFileInfo(ctx->m_attachments.at(index).toMap().value(QStringLiteral("name")).toString())
+            .fileName());
     return name.isEmpty() ? QStringLiteral("attachment") : name;
 }
 
-bool MailClient::writeAttachment(int index, const QString &path)
+bool MailClient::writeAttachmentFor(const MessageContext *ctx, int index, const QString &path)
 {
     QFile file(path);
     if (!file.open(QIODevice::WriteOnly)) {
         Q_EMIT errorOccurred(tr("Could not write %1: %2").arg(path, file.errorString()));
         return false;
     }
-    file.write(m_attachmentParts.at(index)->decodedBody());
+    file.write(ctx->m_attachmentParts.at(index)->decodedBody());
     return true;
 }
 
 void MailClient::saveAttachment(int index, const QUrl &fileUrl)
 {
-    if (index < 0 || index >= m_attachmentParts.size())
+    saveAttachmentFor(m_reading, index, fileUrl);
+}
+
+void MailClient::saveAttachmentFor(MessageContext *ctx, int index, const QUrl &fileUrl)
+{
+    if (index < 0 || index >= ctx->m_attachmentParts.size())
         return;
-    if (writeAttachment(index, fileUrl.toLocalFile()))
+    if (writeAttachmentFor(ctx, index, fileUrl.toLocalFile()))
         setStatus(tr("Saved %1").arg(QFileInfo(fileUrl.toLocalFile()).fileName()));
 }
 
 bool MailClient::attachmentRisky(int index) const
 {
-    if (index < 0 || index >= m_attachmentParts.size())
+    return attachmentRiskyFor(m_reading, index);
+}
+
+bool MailClient::attachmentRiskyFor(const MessageContext *ctx, int index) const
+{
+    if (index < 0 || index >= ctx->m_attachmentParts.size())
         return false;
     const QString name =
-        m_attachments.at(index).toMap().value(QStringLiteral("name")).toString().toLower();
+        ctx->m_attachments.at(index).toMap().value(QStringLiteral("name")).toString().toLower();
     static const QStringList riskyExtensions = {
-        QStringLiteral(".sh"),       QStringLiteral(".bash"),   QStringLiteral(".zsh"),
-        QStringLiteral(".run"),      QStringLiteral(".bin"),    QStringLiteral(".appimage"),
-        QStringLiteral(".desktop"),  QStringLiteral(".exe"),    QStringLiteral(".msi"),
-        QStringLiteral(".bat"),      QStringLiteral(".cmd"),    QStringLiteral(".com"),
-        QStringLiteral(".scr"),      QStringLiteral(".jar"),    QStringLiteral(".py"),
-        QStringLiteral(".pl"),       QStringLiteral(".ps1"),    QStringLiteral(".vbs"),
-        QStringLiteral(".flatpakref")};
+        // Shells and interpreters
+        QStringLiteral(".sh"),        QStringLiteral(".bash"),    QStringLiteral(".zsh"),
+        QStringLiteral(".ksh"),       QStringLiteral(".csh"),     QStringLiteral(".fish"),
+        QStringLiteral(".py"),        QStringLiteral(".pyc"),     QStringLiteral(".pyo"),
+        QStringLiteral(".pl"),        QStringLiteral(".rb"),      QStringLiteral(".lua"),
+        QStringLiteral(".php"),       QStringLiteral(".tcl"),     QStringLiteral(".awk"),
+        // Native executables and libraries
+        QStringLiteral(".run"),       QStringLiteral(".bin"),     QStringLiteral(".elf"),
+        QStringLiteral(".so"),        QStringLiteral(".out"),     QStringLiteral(".exe"),
+        QStringLiteral(".dll"),       QStringLiteral(".scr"),     QStringLiteral(".com"),
+        QStringLiteral(".pif"),       QStringLiteral(".cpl"),     QStringLiteral(".msc"),
+        // Packages and installers — opening these hands off to a package tool
+        QStringLiteral(".appimage"),  QStringLiteral(".flatpakref"),
+        QStringLiteral(".flatpakrepo"), QStringLiteral(".snap"),  QStringLiteral(".deb"),
+        QStringLiteral(".rpm"),       QStringLiteral(".msi"),     QStringLiteral(".msix"),
+        QStringLiteral(".appx"),      QStringLiteral(".pkg"),     QStringLiteral(".dmg"),
+        // Windows scripting hosts
+        QStringLiteral(".bat"),       QStringLiteral(".cmd"),     QStringLiteral(".ps1"),
+        QStringLiteral(".psm1"),      QStringLiteral(".vbs"),     QStringLiteral(".vbe"),
+        QStringLiteral(".js"),        QStringLiteral(".jse"),     QStringLiteral(".wsf"),
+        QStringLiteral(".wsh"),       QStringLiteral(".hta"),     QStringLiteral(".reg"),
+        // Launchers and shortcuts — these run something else
+        QStringLiteral(".desktop"),   QStringLiteral(".lnk"),     QStringLiteral(".url"),
+        QStringLiteral(".appref-ms"), QStringLiteral(".jar"),     QStringLiteral(".jnlp"),
+        // Mountable images: opening one exposes whatever is inside it
+        QStringLiteral(".iso"),       QStringLiteral(".img"),     QStringLiteral(".vhd"),
+        QStringLiteral(".vhdx"),      QStringLiteral(".udf")};
     for (const QString &ext : riskyExtensions) {
         if (name.endsWith(ext))
             return true;
     }
+    // No extension at all: nothing tells the desktop what this is, so the
+    // handler is decided by content sniffing. Treat it as needing confirmation.
+    if (!name.contains(QLatin1Char('.')))
+        return true;
     // Also honor what the sender *declared* — a lie either way is suspicious.
-    const QByteArray mime = std::as_const(*m_attachmentParts.at(index)).contentType()
-        ? std::as_const(*m_attachmentParts.at(index)).contentType()->mimeType().toLower()
+    const QByteArray mime = std::as_const(*ctx->m_attachmentParts.at(index)).contentType()
+        ? std::as_const(*ctx->m_attachmentParts.at(index)).contentType()->mimeType().toLower()
         : QByteArray();
     return mime.contains("executable") || mime.contains("x-sharedlib")
         || mime.contains("x-desktop") || mime.contains("shellscript")
@@ -3891,28 +4234,49 @@ bool MailClient::attachmentRisky(int index) const
 
 void MailClient::openAttachment(int index)
 {
-    if (index < 0 || index >= m_attachmentParts.size())
+    openAttachmentFor(m_reading, index);
+}
+
+void MailClient::openAttachmentFor(MessageContext *ctx, int index)
+{
+    if (index < 0 || index >= ctx->m_attachmentParts.size())
         return;
-    const QString dir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
-        + QStringLiteral("/mailo-attachments");
-    QDir().mkpath(dir);
-    const QString path = dir + QLatin1Char('/') + attachmentName(index);
-    if (!writeAttachment(index, path))
+    // A fixed path under /tmp is reachable by every other user on the machine:
+    // they can pre-create the directory, plant a symlink at a plausible file
+    // name so our write lands somewhere else, or swap the contents between the
+    // write and the open. QTemporaryDir gives us a 0700 directory with an
+    // unpredictable name, which closes all three. Process-lifetime static:
+    // cleaned up on exit, and files must outlive this call so the handler
+    // application can still read them.
+    static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailo-attachments-XXXXXX"));
+    if (!tempDir.isValid()) {
+        Q_EMIT errorOccurred(tr("Could not create a private temporary directory: %1")
+                                 .arg(tempDir.errorString()));
+        return;
+    }
+    const QString path = tempDir.filePath(attachmentNameFor(ctx, index));
+    if (!writeAttachmentFor(ctx, index, path))
         return;
     if (QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
-        setStatus(tr("Opened %1").arg(attachmentName(index)));
+        setStatus(tr("Opened %1").arg(attachmentNameFor(ctx, index)));
     else
-        Q_EMIT errorOccurred(tr("No application could open %1.").arg(attachmentName(index)));
+        Q_EMIT errorOccurred(tr("No application could open %1.")
+                                 .arg(attachmentNameFor(ctx, index)));
 }
 
 void MailClient::saveAttachmentToDownloads(int index)
 {
-    if (index < 0 || index >= m_attachmentParts.size())
+    saveAttachmentToDownloadsFor(m_reading, index);
+}
+
+void MailClient::saveAttachmentToDownloadsFor(MessageContext *ctx, int index)
+{
+    if (index < 0 || index >= ctx->m_attachmentParts.size())
         return;
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
     QDir().mkpath(dir);
 
-    const QFileInfo info(attachmentName(index));
+    const QFileInfo info(attachmentNameFor(ctx, index));
     QString candidate = dir + QLatin1Char('/') + info.fileName();
     for (int i = 1; QFile::exists(candidate); ++i) {
         const QString suffix = info.completeSuffix().isEmpty()
@@ -3920,7 +4284,7 @@ void MailClient::saveAttachmentToDownloads(int index)
             : QLatin1Char('.') + info.completeSuffix();
         candidate = QStringLiteral("%1/%2 (%3)%4").arg(dir, info.baseName()).arg(i).arg(suffix);
     }
-    if (writeAttachment(index, candidate))
+    if (writeAttachmentFor(ctx, index, candidate))
         setStatus(tr("Saved to %1").arg(candidate));
 }
 
@@ -3998,10 +4362,12 @@ void MailClient::markMessageRead(int row)
 void MailClient::fetchMessage(int row)
 {
     const qint64 uid = m_messageModel.uidAt(row);
-    if (uid < 0)
+    if (uid < 0) {
+        m_detachPending = false;
         return;
+    }
     // Remembered so draftData() can name the message it came from.
-    m_currentUid = uid;
+    m_reading->m_uid = uid;
 
     // Previously read message → serve from cache, no network needed.
     const QByteArray cachedRaw = m_store.cachedBody(m_selectedFolder, uid);
@@ -4017,7 +4383,9 @@ void MailClient::fetchMessage(int row)
             && m_connected && m_session) {
             m_store.removeBodyOnly(m_selectedFolder, uid);
         } else {
+        m_presentingFromCache = true;
         presentMessage(msg);
+        m_presentingFromCache = false;
         refineAttachKind(m_selectedFolder, uid, msg.get());
         markMessageRead(row);
         // No status crumb for opening a cached message — it's silent, the
@@ -4030,6 +4398,7 @@ void MailClient::fetchMessage(int row)
     }
 
     if (!m_connected || !m_session) {
+        m_detachPending = false;
         setStatus(tr("Not cached — connect to load"));
         return;
     }
@@ -4068,20 +4437,23 @@ void MailClient::fetchMessage(int row)
     connect(fetch, &KJob::result, this, [this, row, found](KJob *job) {
         setBusy(false);
         if (job->error()) {
+            m_detachPending = false;
             setStatus(tr("Message load failed"));
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
         if (!*found) {
+            m_detachPending = false;
             setStatus(tr("Message load failed"));
             return;
         }
         presentMessage(*found);
         // Index text: prefer the plain part, else strip the HTML.
-        const QString indexText = !m_currentTextBody.isEmpty()
-            ? m_currentTextBody
-            : QTextDocumentFragment::fromHtml(m_currentHtmlBody).toPlainText();
-        m_store.storeBody(m_selectedFolder, m_messageModel.uidAt(row), m_currentRaw, indexText);
+        const QString indexText = !m_reading->m_textBody.isEmpty()
+            ? m_reading->m_textBody
+            : QTextDocumentFragment::fromHtml(m_reading->m_htmlBody).toPlainText();
+        m_store.storeBody(m_selectedFolder, m_messageModel.uidAt(row), m_reading->m_raw,
+                          indexText);
         refineAttachKind(m_selectedFolder, m_messageModel.uidAt(row), found->get());
         setStatus({});
         markMessageRead(row);
@@ -4108,21 +4480,14 @@ void MailClient::openExternalUrl(const QUrl &url)
 
 void MailClient::setRemoteContentAllowed(bool allow)
 {
-    // User toggle: remember the choice for this sender.
-    qCDebug(logTrace) << "remote content toggle" << allow
-                      << "for sender" << m_currentSenderAddress;
-    m_store.setRemoteContentAllowedFor(m_currentSenderAddress, allow);
-    applyRemoteContentAllowed(allow);
+    m_reading->setRemoteContentAllowed(allow);
 }
 
-void MailClient::applyRemoteContentAllowed(bool allow)
+void MailClient::rememberRemoteContent(const QString &senderAddress, bool allow)
 {
-    if (m_remoteContentAllowed == allow)
-        return;
-    m_remoteContentAllowed = allow;
-    if (m_viewerHandler)
-        m_viewerHandler->setRemoteContentAllowed(allow);
-    Q_EMIT remoteContentAllowedChanged();
+    // User toggle: remember the choice for this sender.
+    qCDebug(logTrace) << "remote content toggle" << allow << "for sender" << senderAddress;
+    m_store.setRemoteContentAllowedFor(senderAddress, allow);
 }
 
 static QString indexTextFor(KMime::Message *msg)
@@ -4442,6 +4807,124 @@ void MailClient::storeFetchedBody(const QString &folder, qint64 uid,
         harvestRecipients(msg);
 }
 
+void MailClient::startDkimVerification(MessageContext *ctx)
+{
+    ctx->m_dkimStatus.clear();
+    ctx->m_dkimDetail.clear();
+    ctx->m_dkimTrusted = false;
+    ctx->m_dkimChecking = false;
+    ctx->m_dkimAttempt = 0;
+    if (!m_dkimVerifier || ctx->m_raw.isEmpty()) {
+        Q_EMIT ctx->dkimChanged();
+        return;
+    }
+    submitDkimVerification(ctx);
+}
+
+void MailClient::submitDkimVerification(MessageContext *ctx)
+{
+    if (!m_dkimVerifier || ctx->m_raw.isEmpty())
+        return;
+
+    // The signature covers the octets as they travelled. KMime holds the
+    // message in LF form, and LFtoCRLF restores the wire form byte for byte
+    // as long as nothing re-assembled the MIME tree — which is why the raw
+    // bytes are kept rather than rebuilt from the parsed parts.
+    const QByteArray wire = KMime::LFtoCRLF(ctx->m_raw);
+
+    // Alignment is judged against the From: header's domain.
+    QString fromDomain;
+    if (ctx->m_message) {
+        if (const auto *from = std::as_const(*ctx->m_message).from();
+            from && !from->mailboxes().isEmpty()) {
+            const QString addr = QString::fromLatin1(from->mailboxes().first().address());
+            fromDomain = addr.section(QLatin1Char('@'), 1).toLower();
+        }
+    }
+
+    // Which path produced these bytes is the single most useful fact when a
+    // body hash fails: a message straight off the wire and the same message
+    // rebuilt from the cache are not the same byte sequence.
+    qCDebug(logTrace) << "dkim: verifying uid" << ctx->m_uid
+                      << "source" << (m_presentingFromCache ? "cache" : "network")
+                      << "bytes" << wire.size();
+
+    const quint64 requestId = ++m_dkimNextRequest;
+    m_dkimPending.insert(requestId, ctx);
+    ctx->m_dkimChecking = true;
+    Q_EMIT ctx->dkimChanged();
+
+    QMetaObject::invokeMethod(m_dkimVerifier, "verify", Qt::QueuedConnection,
+                              Q_ARG(quint64, requestId), Q_ARG(QByteArray, wire),
+                              Q_ARG(QString, fromDomain));
+}
+
+bool MailClient::scheduleDkimRetry(MessageContext *ctx)
+{
+    static constexpr int delaysMs[] = {15000, 60000, 180000};
+    static constexpr int maxAttempts = int(std::size(delaysMs));
+    if (ctx->m_dkimAttempt >= maxAttempts)
+        return false;
+    const int delay = delaysMs[ctx->m_dkimAttempt];
+    ++ctx->m_dkimAttempt;
+
+    // Pin the message this retry belongs to. The user may open something else
+    // in the meantime, and a verdict for the old message must never be
+    // attached to the new one.
+    const QPointer<MessageContext> guard(ctx);
+    const qint64 uid = ctx->m_uid;
+    QTimer::singleShot(delay, this, [this, guard, uid] {
+        if (!guard || !guard->m_hasMessage || guard->m_uid != uid)
+            return;
+        submitDkimVerification(guard);
+    });
+    return true;
+}
+
+void MailClient::applyDkimResult(quint64 requestId, const DkimResult &result)
+{
+    const QPointer<MessageContext> ctx = m_dkimPending.take(requestId);
+    if (!ctx)
+        return; // the window closed while the check was in flight
+
+    bool retrying = false;
+    switch (result.status) {
+    case DkimResult::None:
+        // No signature at all. Plenty of legitimate mail is unsigned, so this
+        // stays distinct from a failure and shows nothing.
+        ctx->m_dkimStatus = QStringLiteral("none");
+        break;
+    case DkimResult::Pass:
+        ctx->m_dkimStatus = QStringLiteral("pass");
+        break;
+    case DkimResult::Fail:
+    case DkimResult::PermError:
+        // A permanent error means a signature was offered and we established
+        // it cannot be trusted — obsolete algorithm, revoked or unusable key,
+        // no key published. That is a failed signature from the reader's point
+        // of view; the reason survives in the tooltip.
+        ctx->m_dkimStatus = QStringLiteral("fail");
+        break;
+    case DkimResult::TempError:
+        ctx->m_dkimStatus = QStringLiteral("temperror");
+        retrying = scheduleDkimRetry(ctx);
+        break;
+    case DkimResult::BodyMismatch:
+        // Not a failure claim: we cannot tell tampering from our own copy not
+        // being byte-exact, and today it is usually the latter.
+        ctx->m_dkimStatus = QStringLiteral("unverified");
+        break;
+    }
+    qCDebug(logTrace) << "dkim: uid" << ctx->m_uid << "verdict" << ctx->m_dkimStatus
+                      << "d=" << result.domain << "aligned" << result.aligned
+                      << "-" << result.detail;
+    ctx->m_dkimDetail = result.detail;
+    ctx->m_dkimTrusted = result.trustworthy();
+    // Still "checking" while a retry is pending — we have not given up yet.
+    ctx->m_dkimChecking = retrying;
+    Q_EMIT ctx->dkimChanged();
+}
+
 void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
 {
     KMime::Message *msg = message.get();
@@ -4452,30 +4935,30 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     if (msg->contents().isEmpty())
         msg->parse();
 
+    MessageContext *ctx = m_reading;
+    ctx->m_handler = m_viewerHandler;
+
     // Privacy default: remote content blocked, unless the user previously
     // chose "load remote content" for this exact sender address. Must run
     // AFTER the parse guard — cache-served messages have no headers before it.
-    m_currentSenderAddress.clear();
+    ctx->m_senderAddress.clear();
     if (const auto *from = std::as_const(*msg).from(); from && !from->mailboxes().isEmpty())
-        m_currentSenderAddress =
+        ctx->m_senderAddress =
             QString::fromLatin1(from->mailboxes().first().address()).toLower();
-    const bool remembered = m_store.remoteContentAllowedFor(m_currentSenderAddress);
-    qCDebug(logTrace) << "presenting message from" << m_currentSenderAddress
+    const bool remembered = m_store.remoteContentAllowedFor(ctx->m_senderAddress);
+    qCDebug(logTrace) << "presenting message from" << ctx->m_senderAddress
                       << "remembered remote-content" << remembered;
     // Junk gets hostile-content handling: no remembered remote-content
     // allowance either — the user can still toggle it per view.
     const bool junk = isJunkFolder(m_selectedFolder);
-    applyRemoteContentAllowed(remembered && !junk);
-    if (junk != m_junkTextOnly) {
-        m_junkTextOnly = junk;
-        Q_EMIT junkTextOnlyChanged();
-    }
+    ctx->applyRemoteAllowed(remembered && !junk);
+    ctx->m_junk = junk;
     // A message in the Sent folder means its To/Cc were once our recipients —
     // feed them to the compose autocompletion.
     if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder)
         harvestRecipients(msg);
-    m_currentMessage = message; // keeps all parts alive
-    m_currentRaw = msg->encodedContent();
+    ctx->m_message = message; // keeps all parts alive
+    ctx->m_raw = msg->encodedContent();
 
     KMime::Content *htmlPart = msg->mainBodyPart("text/html");
     if (!htmlPart)
@@ -4486,37 +4969,37 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     if (!textPart && !htmlPart)
         textPart = msg->textContent();
 
-    m_currentHtmlBody = htmlPart ? htmlPart->decodedText() : QString();
-    m_currentTextBody = textPart ? textPart->decodedText() : QString();
+    ctx->m_htmlBody = htmlPart ? htmlPart->decodedText() : QString();
+    ctx->m_textBody = textPart ? textPart->decodedText() : QString();
 
-    if (m_currentHtmlBody.isEmpty() && m_currentTextBody.isEmpty()) {
+    if (ctx->m_htmlBody.isEmpty() && ctx->m_textBody.isEmpty()) {
         const auto *ct = std::as_const(*msg).contentType();
         qWarning() << "mailo: no displayable part found. content-type:"
                    << (ct ? ct->mimeType() : QByteArrayLiteral("(none)"))
                    << "children:" << msg->contents().size()
-                   << "raw size:" << m_currentRaw.size();
+                   << "raw size:" << ctx->m_raw.size();
     }
 
     // Plain-text stand-in shown while Chromium renders the HTML view.
-    if (!m_currentTextBody.isEmpty()) {
-        m_textPreview = m_currentTextBody;
+    if (!ctx->m_textBody.isEmpty()) {
+        m_textPreview = ctx->m_textBody;
     } else {
         // Cap the input: stripping hundreds of KB of HTML would defeat the
         // purpose of an *instant* preview.
         m_textPreview =
-            QTextDocumentFragment::fromHtml(m_currentHtmlBody.left(100000)).toPlainText();
+            QTextDocumentFragment::fromHtml(ctx->m_htmlBody.left(100000)).toPlainText();
     }
     Q_EMIT textPreviewChanged();
 
     if (m_viewerHandler) {
-        m_viewerHandler->clearInlineParts();
-        collectInlineParts(msg);
+        m_viewerHandler->clearInlineParts(ctx->viewerContext());
+        collectInlineParts(ctx, msg);
     }
-    collectAttachments(msg);
+    collectAttachments(ctx, msg);
 
     // Junk folders open as plain text, always — HTML (still sandboxed)
     // renders only when the user explicitly clicks the HTML view button.
-    const QString bodyUrl = (htmlPart && !junk) ? htmlViewUrl() : textViewUrl();
+    const QString bodyUrl = (htmlPart && !junk) ? htmlViewUrlFor(ctx) : textViewUrlFor(ctx);
 
     const KMime::Message *cmsg = msg;
     const QString subject = cmsg->subject() ? cmsg->subject()->asUnicodeString() : QString();
@@ -4530,6 +5013,78 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
             ? local.toString(QStringLiteral("hh:mm"))
             : local.toString(m_dateFormat + QStringLiteral(" hh:mm"));
     }
-    const QString authInfo = trustedAuthResults(cmsg, authDomainForHost(m_host));
+    const QString authInfo = trustedAuthResults(cmsg, trustedAuthDomainsForHost(m_host));
+
+    ctx->m_subject = subject;
+    ctx->m_from = from;
+    ctx->m_to = to;
+    ctx->m_cc = cc;
+    ctx->m_date = date;
+    ctx->m_authInfo = authInfo;
+    ctx->m_bodyUrl = bodyUrl;
+    ctx->m_hasMessage = true;
+    Q_EMIT ctx->messageChanged();
     Q_EMIT messageLoaded(subject, from, to, cc, date, bodyUrl, authInfo);
+
+    // Verify the signature ourselves. This is the one place it is started:
+    // opening a message, not listing or prefetching one.
+    startDkimVerification(ctx);
+
+    // A double-click asked for this message in its own window; now that it is
+    // presentable, hand a standalone copy to QML. The uid guard drops stale
+    // requests — e.g. the user moved on to another message before the fetch
+    // for the double-clicked one came back.
+    if (m_detachPending) {
+        m_detachPending = false;
+        if (ctx->m_uid == m_detachUid)
+            Q_EMIT messageWindowReady(detachReading());
+    }
+}
+
+MessageContext *MailClient::detachReading()
+{
+    MessageContext *src = m_reading;
+    auto *ctx = new MessageContext(this);
+    ctx->m_handler = m_viewerHandler;
+    ctx->m_message = src->m_message; // shared — parts stay alive for both
+    ctx->m_attachmentParts = src->m_attachmentParts;
+    ctx->m_attachments = src->m_attachments;
+    ctx->m_htmlBody = src->m_htmlBody;
+    ctx->m_textBody = src->m_textBody;
+    ctx->m_raw = src->m_raw;
+    ctx->m_uid = src->m_uid;
+    ctx->m_senderAddress = src->m_senderAddress;
+    ctx->m_junk = src->m_junk;
+    ctx->m_remoteAllowed = src->m_remoteAllowed;
+    ctx->m_subject = src->m_subject;
+    ctx->m_from = src->m_from;
+    ctx->m_to = src->m_to;
+    ctx->m_cc = src->m_cc;
+    ctx->m_date = src->m_date;
+    ctx->m_authInfo = src->m_authInfo;
+    ctx->m_hasMessage = src->m_hasMessage;
+    // Own scheme-handler slot: the window keeps its body and inline images
+    // however the reading pane moves on.
+    if (m_viewerHandler && ctx->m_message)
+        collectInlineParts(ctx, ctx->m_message.get());
+    ctx->m_bodyUrl = ctx->m_junk ? textViewUrlFor(ctx) : htmlViewUrlFor(ctx);
+    return ctx;
+}
+
+void MailClient::openMessageInWindow(int row)
+{
+    const qint64 uid = m_messageModel.uidAt(row);
+    if (uid < 0)
+        return;
+    // The usual case: the first click of the double-click already loaded the
+    // message into the reading pane — copy it straight into a window.
+    if (m_reading->m_hasMessage && m_reading->m_uid == uid) {
+        Q_EMIT messageWindowReady(detachReading());
+        return;
+    }
+    // Still loading (or the click never fetched): ask for the message and
+    // open the window when it arrives — see presentMessage().
+    m_detachPending = true;
+    m_detachUid = uid;
+    fetchMessage(row);
 }

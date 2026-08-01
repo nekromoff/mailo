@@ -10,14 +10,46 @@
 
 #include "documenthandler.h"
 #include "mailclient.h"
+#include "messagecontext.h"
 #include "viewersecurity.h"
 
 #include <QLoggingCategory>
 
+#include <cstdio>
+
 Q_DECLARE_LOGGING_CATEGORY(logTrace)
+
+/// Drops two Qt warnings that say nothing about mailo and everything about the
+/// mail being read. Both come out of QTextDocument while it parses a sender's
+/// HTML for the plain-text preview and the search index:
+///
+///   QFont::setPixelSize: Pixel size <= 0        — "font-size:0", the standard
+///                                                 way to hide preheader text
+///   QTextHtmlParser: Unknown color name '#abc ' — a colour with a stray space,
+///                                                 which Qt does not trim
+///
+/// Neither is actionable, both fire per message, and their volume is chosen by
+/// the sender — a single message can bury the log in them, which is enough to
+/// make real diagnostics unreadable. Anything else is passed through untouched.
+static QtMessageHandler g_previousHandler = nullptr;
+
+static void filterMailHtmlNoise(QtMsgType type, const QMessageLogContext &context,
+                                const QString &message)
+{
+    if (message.startsWith(QLatin1String("QFont::setPixelSize: Pixel size <= 0"))
+        || message.startsWith(QLatin1String("QTextHtmlParser::applyAttributes: "
+                                            "Unknown color name")))
+        return;
+    if (g_previousHandler)
+        g_previousHandler(type, context, message);
+    else
+        fprintf(stderr, "%s\n", qPrintable(qFormatLogMessage(type, context, message)));
+}
 
 int main(int argc, char *argv[])
 {
+    g_previousHandler = qInstallMessageHandler(filterMailHtmlNoise);
+
     ViewerSchemeHandler::registerScheme();
     QtWebEngineQuick::initialize();
 
@@ -55,6 +87,10 @@ int main(int argc, char *argv[])
     QQmlApplicationEngine engine;
     qmlRegisterSingletonInstance("Mailo.Core", 1, 0, "Mail", &client);
     qmlRegisterType<DocumentHandler>("Mailo.Core", 1, 0, "DocumentHandler");
+    // Created only by MailClient (reading pane + detached message windows).
+    qmlRegisterUncreatableType<MessageContext>(
+        "Mailo.Core", 1, 0, "MessageContext",
+        QStringLiteral("MessageContext instances come from Mail"));
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
                      &app, [] { QCoreApplication::exit(1); },
                      Qt::QueuedConnection);

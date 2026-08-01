@@ -15,11 +15,15 @@ Kirigami.ApplicationWindow {
     height: windowSettings.height
 
     // Last window geometry; restored at startup, captured on close.
+    // x/y are best effort: Wayland compositors place windows themselves and
+    // ignore programmatic positions. -1 = never saved, let the WM place it.
     Settings {
         id: windowSettings
         category: "window"
         property int width: 1200
         property int height: 760
+        property int x: -1
+        property int y: -1
         property bool maximized: false
     }
     onClosing: close => {
@@ -30,11 +34,13 @@ Kirigami.ApplicationWindow {
             return
         }
         windowSettings.maximized = root.visibility === Window.Maximized
-        // Keep the last windowed size — maximized dimensions would make
+        // Keep the last windowed geometry — maximized dimensions would make
         // un-maximizing on the next run a no-op.
         if (root.visibility === Window.Windowed) {
             windowSettings.width = root.width
             windowSettings.height = root.height
+            windowSettings.x = root.x
+            windowSettings.y = root.y
         }
         // Closing the mail window means quitting. Left to
         // quitOnLastWindowClosed, the process kept running in its event loop
@@ -72,6 +78,9 @@ Kirigami.ApplicationWindow {
         // Compose-window shortcuts (full QKeySequence strings with modifiers).
         property string shortcutAttach: "Ctrl+Shift+A"
         property string shortcutSend: "Ctrl+Return"
+        // Message-viewer shortcuts (reading pane and detached message window).
+        property string shortcutFind: "Ctrl+F"
+        property string shortcutSource: "Ctrl+U"
         // Color scale 1–5: shortcut + color per slot, both "" = undefined.
         // A slot with a shortcut but no color clears the mark instead.
         property string scaleKey1: ""
@@ -167,6 +176,11 @@ Kirigami.ApplicationWindow {
     }
 
     Component.onCompleted: {
+        // Position before maximizing, so un-maximizing lands where it was.
+        if (windowSettings.x >= 0) {
+            root.x = windowSettings.x
+            root.y = windowSettings.y
+        }
         if (windowSettings.maximized)
             root.showMaximized()
         if (Mail.hasAccount) {
@@ -184,13 +198,17 @@ Kirigami.ApplicationWindow {
         // Errors are folded into the status breadcrumb (Mail.setStatus), not
         // shown as passive popups — the status line already carries them, kept
         // short. No onErrorOccurred handler on purpose.
+        // The reading pane itself renders from Mail.readingContext; this
+        // handler only routes drafts into the composer.
         function onMessageLoaded(subject, from, to, cc, date, bodyUrl, authInfo) {
             if (root.draftEditPending) {
                 root.draftEditPending = false
                 composeSheet().openDraft(Mail.draftData())
-                return
             }
-            viewer.showMessage(subject, from, to, cc, date, bodyUrl, authInfo)
+        }
+        // A double-clicked message is ready: show it in its own window.
+        function onMessageWindowReady(context) {
+            root.openMessageWindow(context)
         }
         // Once the server refresh lands, (re)load the selected message —
         // the startup auto-select may have fired while still offline.
@@ -200,6 +218,24 @@ Kirigami.ApplicationWindow {
             else
                 messageList.autoSelect()
         }
+    }
+
+    // One window per double-clicked message; each owns its context and frees
+    // it (and destroys itself) on close — no bookkeeping needed here.
+    Component {
+        id: messageWindowComponent
+        MessageWindow {}
+    }
+    function openMessageWindow(context) {
+        const w = messageWindowComponent.createObject(root, {
+            context: context,
+            ui: uiSettings
+        })
+        w.replyRequested.connect(replyAll =>
+            composeSheet().openReply(context.replyData(replyAll)))
+        w.forwardRequested.connect(() =>
+            composeSheet().openForward(context.forwardData()))
+        w.present()
     }
 
     // Both of these are built on first use, not at startup. Between them they
@@ -241,11 +277,8 @@ Kirigami.ApplicationWindow {
     // regardless of currentIndex) and ComposeSheet a full editor window — for
     // UI that many sessions never open.
     //
-    // Component + createObject, not a Loader: AccountSheet is a Dialog that
-    // centers itself with anchors.centerIn: parent, so it must be parented to
-    // the window's contentItem exactly as the old declarative form was. A
-    // Loader would make its 0x0 self the parent and the dialog would size and
-    // position against nothing.
+    // AccountSheet is a top-level Window of its own now (like ComposeSheet),
+    // so it is parented to root only for lifetime.
     property var accountDialog: null
     Component {
         id: accountComponent
@@ -253,7 +286,7 @@ Kirigami.ApplicationWindow {
     }
     function accountSheet() {
         if (!accountDialog)
-            accountDialog = accountComponent.createObject(root.contentItem)
+            accountDialog = accountComponent.createObject(root)
         return accountDialog
     }
 
@@ -454,6 +487,14 @@ Kirigami.ApplicationWindow {
             Kirigami.Heading {
                 text: "Mailo"
                 level: 2
+            }
+            // Version straight from QCoreApplication (main.cpp sets it from
+            // MAILO_VERSION), so it can never drift from the built binary.
+            QQC2.Label {
+                text: "v" + Qt.application.version
+                opacity: 0.7
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                Layout.alignment: Qt.AlignBaseline
             }
             // Plain arc spinner — the desktop-style BusyIndicator draws a
             // cogwheel, which reads as "settings" rather than "loading".
@@ -1194,6 +1235,12 @@ Kirigami.ApplicationWindow {
                         id: searchField
                         Layout.fillWidth: true
                         placeholderText: "Search… (/pattern/ = regex on loaded)"
+                        // Kirigami claims Ctrl+F (StandardKey.Find) here by
+                        // default, which collided with the viewer's find bar —
+                        // two shortcuts on one sequence and Qt activates
+                        // neither. Ctrl+F searches inside the open message;
+                        // Ctrl+Shift+F searches the mailbox.
+                        focusSequences: ["Ctrl+Shift+F"]
                         onAccepted: Mail.searchMessages(text, searchFieldBox.currentIndex)
                         onTextChanged: {
                             if (text.length === 0)
@@ -1785,6 +1832,19 @@ Kirigami.ApplicationWindow {
                                     root.draftEditPending = Mail.viewingDrafts
                                     Mail.fetchMessage(msgDelegate.index)
                                 }
+                                // Double-click: the message in its own window.
+                                // The first click of the pair has already
+                                // selected and fetched it, so this usually
+                                // detaches instantly from the reading pane.
+                                // Drafts open in the composer instead (the
+                                // single-click path above), never in a window.
+                                onDoubleClicked: mouse => {
+                                    if (mouse.modifiers & (Qt.ControlModifier | Qt.ShiftModifier))
+                                        return
+                                    if (Mail.viewingDrafts)
+                                        return
+                                    Mail.openMessageInWindow(msgDelegate.index)
+                                }
                             }
 
                             contentItem: Row {
@@ -1874,6 +1934,8 @@ Kirigami.ApplicationWindow {
             // Viewer pane — bottom half of the right side
             MessageViewer {
                 id: viewer
+                context: Mail.readingContext
+                ui: uiSettings
                 QQC2.SplitView.fillHeight: true
                 QQC2.SplitView.minimumHeight: 160
                 onReplyRequested: replyAll => composeSheet().openReply(Mail.replyData(replyAll))

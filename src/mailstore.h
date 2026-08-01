@@ -232,6 +232,20 @@ public:
     /// Works on the raw bytes because KMime downgrades multipart/* to
     /// text/plain when parsing a header-only (body-less) message shell.
     static bool headIndicatesAttachment(const QByteArray &head);
+    /// Message-ID from a raw header block, angle brackets stripped. Empty when
+    /// the message has none (which is legal, if rare).
+    static QString messageIdFromHead(const QByteArray &head);
+
+    /// Fills in msgid for up to \a limit cached rows that do not have one yet,
+    /// reading only each message's head rather than its payload. Returns how
+    /// many rows it touched; 0 means there is nothing left to do. Deliberately
+    /// chunked and resumable — the bodies table is multiple gigabytes and this
+    /// must never become one long scan.
+    int backfillMessageIds(int limit);
+
+    /// Every cached copy of \a msgid, as (folder, uid). More than one is normal:
+    /// the same message commonly exists in a folder and in All Mail.
+    QList<QPair<QString, qint64>> locateByMessageId(const QString &msgid);
 
 private:
     /// Folder key as stored in messages/bodies/fts: "account\x1ffolder".

@@ -41,6 +41,9 @@ public:
         QString authInfo;        ///< raw Authentication-Results header
         int attachKind = NoAttachment; ///< 1 = multipart/mixed head, 2 = all-.ics attachments
         int colorLabel = 0;      ///< local color-scale mark (0 = none, 1..5)
+        /// RFC 5322 Message-ID with the angle brackets stripped. Stable across
+        /// folders and UIDVALIDITY resets, unlike uid.
+        QString msgid;
     };
 
     using QAbstractListModel::QAbstractListModel;

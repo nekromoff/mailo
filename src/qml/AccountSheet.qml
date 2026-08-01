@@ -3,140 +3,91 @@
 
 import QtCore
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import Mailo.Core
 
-QQC2.Dialog {
+Window {
     id: sheet
     title: "Settings"
-    modal: true
+    // A real top-level window: the system title bar provides close, minimize
+    // and maximize, the window manager handles resizing (the old hand-rolled
+    // corner grip is gone), and it gets its own taskbar entry.
+    flags: Qt.Window
+    transientParent: null
     // No Cancel: everything outside the Accounts page applies live, so the
     // button only ever discarded account edits while silently keeping the
-    // rest. Escape still dismisses without saving.
-    // Not anchored — the corner grip resizes from the bottom right, which only
-    // reads correctly if the top left stays where it is.
-    // The requested size, remembered across restarts. Clamped to the window
-    // below, so dragging past the edge stops growing instead of pushing the
-    // dialog off screen — and a size saved on a large monitor cannot strand
-    // the dialog when it is next opened on a small one.
+    // rest. Escape (and the title bar's close) dismisses without saving.
+    // The last geometry, remembered across restarts. x/y are best effort
+    // (Wayland places windows itself); -1 = never saved, let the WM place it.
     Settings {
         id: dialogSettings
         category: "settingsDialog"
         property real width: 820
         property real height: Kirigami.Units.gridUnit * 30
+        property int x: -1
+        property int y: -1
+        property bool maximized: false
     }
-    property alias prefWidth: dialogSettings.width
-    property alias prefHeight: dialogSettings.height
-
-    // Same clamp the fixed-size version used, so the default geometry is
-    // unchanged and only dragging the grip departs from it.
-    width: Math.min(prefWidth,
-                    parent ? parent.width - Kirigami.Units.gridUnit * 4 : prefWidth)
-    // Sized rather than fitted, so switching between sections never resizes it.
-    height: Math.min(prefHeight,
-                     parent ? parent.height - Kirigami.Units.gridUnit * 4 : prefHeight)
-
-    // Centred once per opening rather than bound: a binding would re-centre on
-    // every drag, so the dialog would creep away under the cursor.
-    onAboutToShow: {
-        if (!parent)
-            return
-        x = Math.round((parent.width - width) / 2)
-        y = Math.round((parent.height - height) / 2)
-    }
-
-    footer: RowLayout {
-        spacing: 0
-        QQC2.Label {
-            visible: sheet.page === 0 && sheet.detailsMissing !== ""
-            Layout.leftMargin: Kirigami.Units.largeSpacing
-            text: "Needs " + sheet.detailsMissing
-            opacity: 0.8
-            font.pointSize: Kirigami.Theme.smallFont.pointSize
-        }
-        QQC2.DialogButtonBox {
-            Layout.fillWidth: true
-            // Only the Accounts page has anything to save — every other page
-            // applies as you change it, so offering Save there implied the
-            // settings were pending, and on About that there was something to
-            // save at all.
-            visible: sheet.page === 0
-            enabled: sheet.detailsMissing === ""
-            standardButtons: QQC2.Dialog.Save
-            onAccepted: sheet.accept()
-        }
-        // Keeps the grip at the right edge when the button box is hidden.
-        Item {
-            Layout.fillWidth: true
-            visible: sheet.page !== 0
-        }
-        Item {
-            id: resizeGrip
-            // Dots on a fixed grid rather than rotated rules: a rotated
-            // Rectangle draws outside its own bounds by ~35% of its length,
-            // so the old ticks spilled past the dialog's corner.
-            readonly property int dot: 2
-            readonly property int step: dot + 2
-
-            implicitWidth: step * 3
-            implicitHeight: step * 3
-            Layout.alignment: Qt.AlignBottom
-            Layout.rightMargin: Kirigami.Units.largeSpacing
-            Layout.bottomMargin: Kirigami.Units.largeSpacing
-
-            Repeater {
-                // Lower-right triangle, the conventional grip. Drawn rather
-                // than themed so it cannot depend on an icon name existing.
-                model: [[2, 0], [2, 1], [2, 2], [1, 1], [1, 2], [0, 2]]
-                Rectangle {
-                    required property var modelData
-                    width: resizeGrip.dot
-                    height: resizeGrip.dot
-                    radius: 1
-                    color: Kirigami.Theme.textColor
-                    opacity: 0.4
-                    x: modelData[1] * resizeGrip.step
-                    y: modelData[0] * resizeGrip.step
-                }
-            }
-
-            MouseArea {
-                // Grab area is larger than the dots — but grows inward and
-                // stays within the dialog, unlike the negative margins it
-                // replaces.
-                anchors.fill: parent
-                anchors.leftMargin: -Kirigami.Units.largeSpacing
-                anchors.topMargin: -Kirigami.Units.largeSpacing
-                cursorShape: Qt.SizeFDiagCursor
-                property point origin
-                property real startWidth
-                property real startHeight
-                onPressed: mouse => {
-                    // Scene coordinates: this item moves as the dialog grows,
-                    // so a delta measured in local ones would compound.
-                    origin = mapToItem(null, mouse.x, mouse.y)
-                    startWidth = sheet.width
-                    startHeight = sheet.height
-                }
-                onPositionChanged: mouse => {
-                    if (!pressed)
-                        return
-                    const p = mapToItem(null, mouse.x, mouse.y)
-                    sheet.prefWidth = startWidth + (p.x - origin.x)
-                    sheet.prefHeight = startHeight + (p.y - origin.y)
-                }
-            }
+    width: dialogSettings.width
+    height: dialogSettings.height
+    minimumWidth: 560
+    minimumHeight: 360
+    Component.onCompleted: {
+        if (dialogSettings.x >= 0) {
+            x = dialogSettings.x
+            y = dialogSettings.y
         }
     }
+    onClosing: {
+        dialogSettings.maximized = sheet.visibility === Window.Maximized
+        // Keep the last windowed geometry — see Main.qml.
+        if (sheet.visibility === Window.Windowed) {
+            dialogSettings.width = sheet.width
+            dialogSettings.height = sheet.height
+            dialogSettings.x = sheet.x
+            dialogSettings.y = sheet.y
+        }
+    }
+
+    // Chrome-gray panel (Window color set), same treatment as the compose
+    // window; the user's bgColor override wins.
+    color: ui && ui.bgColor !== "" ? ui.bgColor
+                                   : content.Kirigami.Theme.backgroundColor
 
     /// The window's persisted UI settings object (set by Main.qml).
     property var ui
 
     /// 0 = Accounts, 1 = General, 2 = Look and feel, 3 = Shortcuts
     property int page: 0
+
+    /// True while a shortcut-capture button is reading raw key presses — the
+    /// Esc shortcut below stands down so Esc can cancel the capture instead
+    /// of closing the window.
+    property bool captureActive: false
+
+    /// Shows the window (the Dialog-era entry point, kept so callers and the
+    /// old open() semantics — reload the account form on every opening —
+    /// stay unchanged).
+    function open() {
+        editIndex = Mail.accountNames.length > 0 ? Mail.currentAccount : -1
+        loadDetails()
+        if (dialogSettings.maximized)
+            showMaximized()
+        else
+            show()
+        raise()
+        requestActivate()
+    }
+
+    Shortcut {
+        sequence: "Esc"
+        enabled: !sheet.captureActive
+        onActivated: sheet.close()
+    }
 
     /// Account being edited; -1 = creating a new one.
     property int editIndex: -1
@@ -179,16 +130,13 @@ QQC2.Dialog {
         htmlMailBox.checked = d.htmlMail ?? true
     }
 
-    onOpened: {
-        editIndex = Mail.accountNames.length > 0 ? Mail.currentAccount : -1
-        loadDetails()
-    }
-
-    onAccepted: {
+    /// Persists the account form (the Save button). Closes the window on
+    /// success — the same flow the Dialog's accept() used to run.
+    function saveAccount() {
         // Look-page settings apply live; Save only persists account edits.
         if (page !== 0)
             return
-        // Belt and braces: the button is disabled, but Enter reaches accept()
+        // Belt and braces: the button is disabled, but Enter reaches here
         // without going through it.
         if (detailsMissing !== "")
             return
@@ -216,6 +164,7 @@ QQC2.Dialog {
             signature: signatureEdit.text,
             htmlMail: htmlMailBox.checked
         })
+        close()
     }
 
     QQC2.Dialog {
@@ -282,7 +231,20 @@ QQC2.Dialog {
         onAccepted: sheet.ui["scaleColor" + scaleIndex] = selectedColor.toString()
     }
 
-    contentItem: RowLayout {
+    ColumnLayout {
+        id: content
+        anchors.fill: parent
+        anchors.margins: Kirigami.Units.largeSpacing
+        spacing: Kirigami.Units.smallSpacing
+
+        // Chrome-gray panel (dialog-like); the style still draws the pages'
+        // input fields with their own backgrounds.
+        Kirigami.Theme.colorSet: Kirigami.Theme.Window
+        Kirigami.Theme.inherit: false
+
+        RowLayout {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
         spacing: Kirigami.Units.largeSpacing
 
         // Settings sections
@@ -858,6 +820,9 @@ QQC2.Dialog {
                     QQC2.Button {
                         id: scaleCapture
                         property bool capturing: false
+                        // Hold the window's Esc shortcut off while capturing,
+                        // so Esc cancels the capture instead of closing.
+                        onCapturingChanged: sheet.captureActive = capturing
                         implicitWidth: Kirigami.Units.gridUnit * 8
                         text: capturing ? "Press keys…"
                                         : (sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
@@ -992,7 +957,9 @@ QQC2.Dialog {
                     {label: "Reply:", key: "shortcutReply", def: "R"},
                     {label: "Forward:", key: "shortcutForward", def: "F"},
                     {label: "Attach file:", key: "shortcutAttach", def: "Ctrl+Shift+A"},
-                    {label: "Send message:", key: "shortcutSend", def: "Ctrl+Return"}
+                    {label: "Send message:", key: "shortcutSend", def: "Ctrl+Return"},
+                    {label: "Find in message:", key: "shortcutFind", def: "Ctrl+F"},
+                    {label: "View source:", key: "shortcutSource", def: "Ctrl+U"}
                 ]
                 RowLayout {
                     required property var modelData
@@ -1002,6 +969,8 @@ QQC2.Dialog {
                     QQC2.Button {
                         id: captureButton
                         property bool capturing: false
+                        // See scaleCapture: keeps Esc for the capture.
+                        onCapturingChanged: sheet.captureActive = capturing
                         implicitWidth: Kirigami.Units.gridUnit * 8
                         text: capturing ? "Press keys…"
                                         : (sheet.ui ? sheet.ui[modelData.key]
@@ -1072,7 +1041,9 @@ QQC2.Dialog {
                 width: aboutScroll.availableWidth
 
                 Kirigami.Separator {
-                    Kirigami.FormData.label: "Mailo"
+                    // Same source as the main-bar version label: whatever the
+                    // binary was built with.
+                    Kirigami.FormData.label: "Mailo v" + Qt.application.version
                     Kirigami.FormData.isSection: true
                 }
                 QQC2.Label {
@@ -1087,5 +1058,29 @@ QQC2.Dialog {
             }
         } // about ScrollView
         } // StackLayout
+        } // content RowLayout
+
+        // Footer: the Save button (and its "what's missing" hint), only on
+        // the Accounts page — every other page applies as you change it.
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 0
+            visible: sheet.page === 0
+
+            QQC2.Label {
+                visible: sheet.detailsMissing !== ""
+                Layout.leftMargin: Kirigami.Units.largeSpacing
+                text: "Needs " + sheet.detailsMissing
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            Item { Layout.fillWidth: true }
+            QQC2.Button {
+                text: "Save"
+                icon.name: "document-save"
+                enabled: sheet.detailsMissing === ""
+                onClicked: sheet.saveAccount()
+            }
+        }
     }
 }

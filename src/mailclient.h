@@ -18,9 +18,13 @@
 #include <functional>
 #include <memory>
 
+#include "dkimverifier.h"
 #include "foldermodel.h"
 #include "mailstore.h"
+#include "messagecontext.h"
 #include "messagelistmodel.h"
+
+class QThread;
 
 class QThread;
 
@@ -63,6 +67,9 @@ class MailClient : public QObject
     Q_PROPERTY(QString aboutText READ aboutText CONSTANT)
     Q_PROPERTY(FolderModel *folderModel READ folderModel CONSTANT)
     Q_PROPERTY(MessageListModel *messageModel READ messageModel CONSTANT)
+    /// The reading pane's message context — the state MessageViewer binds to.
+    /// Detached message windows get their own context via messageWindowReady.
+    Q_PROPERTY(MessageContext *readingContext READ readingContext CONSTANT)
     /// Attachments of the last fetched message: [{name, sizeText}, …]
     Q_PROPERTY(QVariantList attachments READ attachments NOTIFY attachmentsChanged)
     /// Per-message opt-in for remote images/CSS/fonts; resets on every message.
@@ -130,6 +137,7 @@ public:
     QString aboutText() const;
     FolderModel *folderModel() { return &m_folderModel; }
     MessageListModel *messageModel() { return &m_messageModel; }
+    MessageContext *readingContext() { return m_reading; }
 
     QString accountHost() const { return m_host; }
     int accountPort() const { return m_port; }
@@ -230,6 +238,10 @@ public:
     Q_INVOKABLE void connectAccount();
     Q_INVOKABLE void openFolder(const QString &mailBox);
     Q_INVOKABLE void fetchMessage(int row);
+    /// Opens the message at \a row in its own top-level window: fetches it
+    /// (cache or server) and emits messageWindowReady() with a fresh
+    /// MessageContext once it is presentable.
+    Q_INVOKABLE void openMessageInWindow(int row);
     /// Quietly fetch a message's body into the cache (hover / read-ahead).
     /// No viewer or status changes; skipped when cached or offline.
     Q_INVOKABLE void prefetchMessage(int row);
@@ -294,14 +306,18 @@ public:
     Q_INVOKABLE QString htmlViewUrl();
     /// Plain-text part of the message ("discard HTML").
     Q_INVOKABLE QString textViewUrl();
-    /// Raw HTML source, escaped, monospace — our "view page source".
+    /// The complete raw RFC-822 message (headers + MIME structure + parts),
+    /// escaped, monospace — our "view message source".
     Q_INVOKABLE QString sourceViewUrl();
 
-    QVariantList attachments() const { return m_attachments; }
-    bool remoteContentAllowed() const { return m_remoteContentAllowed; }
+    // The message-state properties delegate to the reading pane's context —
+    // kept on Mail so existing callers keep working; per-window state lives
+    // on each window's own MessageContext.
+    QVariantList attachments() const { return m_reading->attachments(); }
+    bool remoteContentAllowed() const { return m_reading->remoteContentAllowed(); }
     void setRemoteContentAllowed(bool allow);
     QString textPreview() const { return m_textPreview; }
-    bool junkTextOnly() const { return m_junkTextOnly; }
+    bool junkTextOnly() const { return m_reading->junkTextOnly(); }
     /// Writes attachment \a index of the current message to \a fileUrl.
     Q_INVOKABLE void saveAttachment(int index, const QUrl &fileUrl);
     /// True when the attachment could execute code if opened (.sh, .desktop,
@@ -340,6 +356,10 @@ Q_SIGNALS:
                        const QString &date, const QString &bodyUrl,
                        const QString &authInfo);
     void errorOccurred(const QString &message);
+    /// A double-clicked message is ready to show in its own window. The
+    /// context is parented to this client; the window calls release() on it
+    /// when it closes.
+    void messageWindowReady(MessageContext *context);
     void mailSent();
     void draftSaved();
     void draftsFolderChanged();
@@ -362,6 +382,8 @@ Q_SIGNALS:
     void dateFormatChanged();
 
 private:
+    friend class MessageContext; // thin QML front for the *For methods below
+
     QString accountKey() const { return m_user + QLatin1Char('@') + m_host; }
     /// Fills the folder model from the disk cache (instant sidebar).
     void loadCachedFolderModel();
@@ -496,11 +518,30 @@ private:
         const QString &html, const QList<QUrl> &attachments, bool strict,
         QStringList *toList = nullptr, QStringList *ccList = nullptr,
         QStringList *bccList = nullptr);
-    void collectInlineParts(KMime::Content *root);
-    void collectAttachments(KMime::Content *root);
-    QString attachmentName(int index) const;
-    bool writeAttachment(int index, const QString &path);
+    // --- Per-context message presentation (reading pane + detached windows) ---
+    void collectInlineParts(MessageContext *ctx, KMime::Content *root);
+    void collectAttachments(MessageContext *ctx, KMime::Content *root);
+    QString attachmentNameFor(const MessageContext *ctx, int index) const;
+    bool writeAttachmentFor(const MessageContext *ctx, int index, const QString &path);
+    /// Presents \a message in the reading pane's context.
     void presentMessage(const std::shared_ptr<KMime::Message> &message);
+    /// A standalone copy of the reading context for a detached window. Shares
+    /// the parsed KMime message; gets its own scheme-handler slot so the
+    /// window keeps rendering after the reading pane moves on.
+    MessageContext *detachReading();
+    // Context-parameterised backends of the public message API; MessageContext
+    // delegates here (friend both ways keeps the logic in one place).
+    QVariantMap replyDataFor(MessageContext *ctx, bool replyAll);
+    QVariantMap forwardDataFor(MessageContext *ctx);
+    QString htmlViewUrlFor(MessageContext *ctx);
+    QString textViewUrlFor(MessageContext *ctx);
+    QString sourceViewUrlFor(MessageContext *ctx);
+    bool attachmentRiskyFor(const MessageContext *ctx, int index) const;
+    void openAttachmentFor(MessageContext *ctx, int index);
+    void saveAttachmentToDownloadsFor(MessageContext *ctx, int index);
+    void saveAttachmentFor(MessageContext *ctx, int index, const QUrl &fileUrl);
+    /// Persists the per-sender remote-content choice (MessageContext toggle).
+    void rememberRemoteContent(const QString &senderAddress, bool allow);
     /// Records the To/Cc addresses of a message from the Sent folder in the
     /// recipient-autocompletion store.
     void harvestRecipients(const KMime::Message *msg);
@@ -514,6 +555,19 @@ private:
     QString junkFolderName() const;
     /// Junk/spam folders get hostile-content handling in the viewer.
     bool isJunkFolder(const QString &mailBox) const;
+    /// Hands \a ctx's message to the DKIM worker thread. Called only when a
+    /// message is actually opened — never during sync or prefetch, so the
+    /// mailbox does not turn into a stream of DNS queries to the resolver.
+    void startDkimVerification(MessageContext *ctx);
+    /// Hands the current message to the worker without resetting the retry
+    /// count — the retry path re-enters here.
+    void submitDkimVerification(MessageContext *ctx);
+    /// DNS was unreachable rather than authoritative, so the key may well
+    /// exist. Backs off and tries again a few times before giving up.
+    /// Returns false when the attempts are exhausted.
+    bool scheduleDkimRetry(MessageContext *ctx);
+    /// Applies a verdict that arrived from the worker thread.
+    void applyDkimResult(quint64 requestId, const DkimResult &result);
     void purgeDeleted(const QList<qint64> &uids);
     void configureLogin(KIMAP::LoginJob *login) const;
     QString oauthWalletKey() const;
@@ -526,8 +580,6 @@ private:
     void refreshCurrentFolder();
     /// Arms the idle-time fetch of the next older header window.
     void scheduleBackfill(int delayMs = 4000);
-    /// Updates viewer remote-content policy without persisting a preference.
-    void applyRemoteContentAllowed(bool allow);
     void processPrefetchQueue();
     /// Parses and caches one prefetched body (raw + search text + refined
     /// attachment kind; recipient harvesting for the Sent folder).
@@ -641,21 +693,34 @@ private:
     qint64 m_pageDate = 0;   ///< disk-cache paging anchor: oldest shown date
     qint64 m_pageUid = 0;    ///< …and its uid (keyset pagination tiebreaker)
 
-    QString m_currentHtmlBody; ///< raw HTML part of the last fetched message
-    QString m_currentTextBody; ///< plain-text part of the last fetched message
-    QByteArray m_currentRaw;   ///< complete RFC-822 source of the last message
-    qint64 m_currentUid = -1;  ///< uid of the message on screen (draft editing)
-    std::shared_ptr<KMime::Message> m_currentMessage; ///< keeps attachment parts alive
-    QList<KMime::Content *> m_attachmentParts; ///< owned by m_currentMessage
-    QVariantList m_attachments;
-    bool m_remoteContentAllowed = false;
-    QString m_currentSenderAddress; ///< addr-spec of the shown message's sender
+    MessageContext *m_reading = nullptr; ///< the reading pane's message state
+
+    /// DKIM verification runs off the GUI thread: it is a DNS round trip plus
+    /// SHA-256 over the whole message and a public-key operation.
+    QThread *m_dkimThread = nullptr;
+    DkimVerifier *m_dkimVerifier = nullptr;
+    quint64 m_dkimNextRequest = 0;
+
+    /// Fills in Message-IDs for rows cached before the column existed. Small
+    /// chunks on a slow timer: the work is one-time and must never be felt.
+    QTimer m_msgidBackfillTimer;
+
+    /// True while presenting a message rebuilt from the cache rather than one
+    /// straight off the wire. Purely diagnostic: the cached form is a stub with
+    /// attachment payloads stripped and re-inserted on read, so it cannot be
+    /// assumed byte-identical to what arrived. Logged next to the DKIM verdict
+    /// so the two paths can be told apart — see doc/roadmap.md.
+    bool m_presentingFromCache = false;
+    /// In-flight verifications by request id. QPointer because a detached
+    /// window may close while its message is still being checked.
+    QHash<quint64, QPointer<MessageContext>> m_dkimPending;
+    bool m_detachPending = false; ///< a double-click is waiting for its fetch
+    qint64 m_detachUid = -1;      ///< the message that double-click asked for
     QString m_textPreview;
     QList<QPair<QString, qint64>> m_prefetchQueue; ///< (folder, uid) waiting for a background body fetch
     bool m_prefetching = false;
     QList<std::shared_ptr<BodyConn>> m_bodyPool; ///< parallel body-fetch connections
     bool m_bodyPoolBroken = false; ///< server refused extra connections — stop trying
-    bool m_junkTextOnly = false; ///< shown message is from a junk folder
     bool m_connected = false;
     bool m_busy = false;
     QString m_statusText;        ///< breadcrumb shown in the UI (newest first)

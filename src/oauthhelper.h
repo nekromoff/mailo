@@ -53,7 +53,14 @@ private:
     void requestToken(Provider provider, const QString &clientId,
                       const QString &clientSecret, const QList<std::pair<QString, QString>> &grant);
 
+    /// Tears the loopback listener down and forgets the one-shot flow state,
+    /// so a late or replayed redirect cannot be redeemed.
+    void endRedirectListener();
+
     QNetworkAccessManager *m_nam = nullptr;
     QTcpServer *m_server = nullptr;
     QString m_codeVerifier;
+    /// CSRF nonce tying the redirect back to the authorize() we started.
+    /// Empty whenever no sign-in is in flight.
+    QString m_state;
 };

@@ -175,6 +175,13 @@ bool MailStore::open()
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN auth TEXT DEFAULT ''"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN attach INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN color INTEGER DEFAULT 0"));
+    // Message-ID is the only stable identity a message has: IMAP UIDs are
+    // per-folder and do not survive a move or a UIDVALIDITY reset. NULL means
+    // "not known yet" and is what backfillMessageIds() looks for; '' means
+    // "looked, and the message has no Message-ID".
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN msgid TEXT"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_msgid"
+                          " ON messages(msgid)"));
     // (folder, color) alone could find the rows but not order them, so the
     // colour filter still sorted the whole folder. Carrying the sort keys in
     // the index makes it a seek plus a LIMIT.
@@ -484,10 +491,13 @@ void MailStore::storeHeaders(const QString &folder,
     // refined kind (2 = calendar invite) learned from the full body survives.
     q.prepare(QStringLiteral(
         "INSERT INTO messages"
-        " (folder, uid, subject, sender, date, seen, suspicious, auth, attach)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " (folder, uid, subject, sender, date, seen, suspicious, auth, attach, msgid)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(folder, uid) DO UPDATE SET"
         " subject = excluded.subject, sender = excluded.sender, date = excluded.date,"
+        // Never overwrite a known Message-ID with an unknown one: a header
+        // refresh that could not read it must not erase what a body gave us.
+        " msgid = COALESCE(excluded.msgid, messages.msgid),"
         // A locally-read message stays read even if the server still reports
         // \Unseen — e.g. it was read offline and the STORE never went out.
         " seen = MAX(messages.seen, excluded.seen),"
@@ -514,6 +524,7 @@ void MailStore::storeHeaders(const QString &folder,
         q.addBindValue(h.suspicious ? 1 : 0);
         q.addBindValue(h.authInfo);
         q.addBindValue(h.attachKind);
+        q.addBindValue(h.msgid.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : h.msgid);
         q.exec();
         if (m_ftsAvailable) {
             ins.addBindValue(h.subject);
@@ -1397,6 +1408,85 @@ bool MailStore::vacuum(QString *error)
     }
     QSqlDatabase::removeDatabase(name);
     return ok;
+}
+
+QString MailStore::messageIdFromHead(const QByteArray &head)
+{
+    static const QRegularExpression re(
+        QStringLiteral("^Message-ID\\s*:(.*?)(?=\\r?\\n[^ \\t]|\\z)"),
+        QRegularExpression::MultilineOption | QRegularExpression::DotMatchesEverythingOption
+            | QRegularExpression::CaseInsensitiveOption);
+    const auto m = re.match(QString::fromLatin1(head));
+    if (!m.hasMatch())
+        return {};
+    QString v = m.captured(1);
+    v.remove(QLatin1Char('\r'));
+    v.remove(QLatin1Char('\n'));
+    const int lt = v.indexOf(QLatin1Char('<'));
+    const int gt = v.lastIndexOf(QLatin1Char('>'));
+    if (lt >= 0 && gt > lt)
+        v = v.mid(lt + 1, gt - lt - 1);
+    return v.trimmed();
+}
+
+int MailStore::backfillMessageIds(int limit)
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery sel(m_db);
+    // Reads only the head of each body: pulling whole payloads here would drag
+    // gigabytes through for a value that always lives in the first few KB.
+    // Rows with no cached body are not joined and stay NULL, which is honest —
+    // we genuinely do not know their Message-ID yet.
+    sel.prepare(QStringLiteral(
+        "SELECT m.folder, m.uid, substr(b.raw, 1, 16384) FROM messages m"
+        " JOIN bodies b ON b.folder = m.folder AND b.uid = m.uid"
+        " WHERE m.msgid IS NULL LIMIT ?"));
+    sel.addBindValue(limit);
+    if (!sel.exec())
+        return 0;
+
+    struct Row {
+        QString folder;
+        qint64 uid;
+        QString msgid;
+    };
+    QList<Row> rows;
+    while (sel.next()) {
+        rows.append({sel.value(0).toString(), sel.value(1).toLongLong(),
+                     messageIdFromHead(sel.value(2).toByteArray())});
+    }
+    if (rows.isEmpty())
+        return 0;
+
+    QSqlQuery upd(m_db);
+    upd.prepare(QStringLiteral("UPDATE messages SET msgid = ? WHERE folder = ? AND uid = ?"));
+    m_db.transaction();
+    for (const Row &r : rows) {
+        // '' rather than NULL when the message carries no Message-ID, so the
+        // next pass does not pick the same rows up again forever.
+        upd.addBindValue(r.msgid);
+        upd.addBindValue(r.folder);
+        upd.addBindValue(r.uid);
+        upd.exec();
+    }
+    m_db.commit();
+    return rows.size();
+}
+
+QList<QPair<QString, qint64>> MailStore::locateByMessageId(const QString &msgid)
+{
+    QList<QPair<QString, qint64>> out;
+    if (!m_db.isOpen() || msgid.isEmpty())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT folder, uid FROM messages WHERE msgid = ?"));
+    q.addBindValue(msgid);
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out.append({q.value(0).toString(), q.value(1).toLongLong()});
+    return out;
 }
 
 bool MailStore::headIndicatesAttachment(const QByteArray &head)

@@ -20,6 +20,9 @@ find_package(Qt6Keychain REQUIRED)
 # Attachment payloads are stored compressed on disk (see attachmentstore.cpp).
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+# DKIM signature verification (see dkimverifier.cpp). Only libcrypto is needed —
+# no TLS — and it is already in the process via Qt Network.
+pkg_check_modules(LIBCRYPTO REQUIRED IMPORTED_TARGET libcrypto)
 
 qt_standard_project_setup(REQUIRES 6.5)
 
@@ -27,6 +30,10 @@ qt_add_executable(mailo
     src/main.cpp
     src/mailclient.cpp
     src/mailclient.h
+    src/dkimverifier.cpp
+    src/dkimverifier.h
+    src/messagecontext.cpp
+    src/messagecontext.h
     src/foldermodel.cpp
     src/foldermodel.h
     src/messagelistmodel.cpp
@@ -43,10 +50,16 @@ qt_add_executable(mailo
     src/viewersecurity.h
 )
 
+# Must be set before qt_add_qml_module(), which bakes the autogen path into the
+# metatypes dependency. Keeps mailo_autogen/ out of the build root.
+set_target_properties(mailo PROPERTIES
+    AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/autogen/mailo_autogen")
+
 set_source_files_properties(src/qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 set_source_files_properties(src/qml/AccountSheet.qml PROPERTIES QT_RESOURCE_ALIAS AccountSheet.qml)
 set_source_files_properties(src/qml/MessageViewer.qml PROPERTIES QT_RESOURCE_ALIAS MessageViewer.qml)
 set_source_files_properties(src/qml/ComposeSheet.qml PROPERTIES QT_RESOURCE_ALIAS ComposeSheet.qml)
+set_source_files_properties(src/qml/MessageWindow.qml PROPERTIES QT_RESOURCE_ALIAS MessageWindow.qml)
 
 qt_add_qml_module(mailo
     URI Mailo
@@ -56,6 +69,7 @@ qt_add_qml_module(mailo
         src/qml/AccountSheet.qml
         src/qml/MessageViewer.qml
         src/qml/ComposeSheet.qml
+        src/qml/MessageWindow.qml
 )
 
 # Compile ABOUT.md into the binary (shown in Settings → About). Editing
@@ -73,6 +87,7 @@ target_link_libraries(mailo PRIVATE
     KPim6::SMTP
     Qt6Keychain::Qt6Keychain
     PkgConfig::ZSTD
+    PkgConfig::LIBCRYPTO
 )
 
 target_compile_definitions(mailo PRIVATE MAILO_VERSION="${PROJECT_VERSION}")
@@ -130,13 +145,12 @@ set(CPACK_GENERATOR DEB)
 set(CPACK_PACKAGE_NAME mailo)
 set(CPACK_PACKAGE_VENDOR "Daniel Duris")
 set(CPACK_PACKAGE_CONTACT "Daniel Duris <dusoft@staznosti.sk>")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Lightweight IMAP mail client for KDE")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "The fast KDE email client")
 set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/nekromoff/mailo")
 set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Mailo is an IMAP mail client focused on speed and safe message viewing.
 It caches headers, bodies and the folder tree in SQLite for instant,
 offline-capable browsing and full-text search, and renders HTML mail in a
-sandboxed QtWebEngine view that blocks all remote content until you opt in
-per message.
+sandboxed QtWebEngine view that blocks all remote content until you opt in. Built for KDE.
 
 Licensed under the LGPL-3.0-or-later; see /usr/share/doc/mailo/copyright.")
 set(CPACK_STRIP_FILES ON)
@@ -161,3 +175,31 @@ target_link_libraries(attachmenttest PRIVATE Qt6::Core PkgConfig::ZSTD)
 
 qt_add_executable(viewertest tests/viewertest.cpp src/viewersecurity.cpp src/viewersecurity.h)
 target_link_libraries(viewertest PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::WebEngineQuick)
+
+# Checks DKIM canonicalization against the vectors published in RFC 6376 3.4.5.
+# Self-contained: no network, no fixtures. Exit 0 = all vectors match.
+qt_add_executable(dkimtest tests/dkimtest.cpp src/dkimverifier.cpp src/dkimverifier.h)
+target_link_libraries(dkimtest PRIVATE Qt6::Core Qt6::Network PkgConfig::LIBCRYPTO)
+
+# Diagnostic, not a pass/fail test: runs the real verifier over .eml files and
+# prints a verdict per message. Needs working DNS. Used to establish that our
+# stored bodies are not byte-identical to what arrived — see doc/roadmap.md.
+#   ./dkimchecktool msg1.eml msg2.eml
+qt_add_executable(dkimchecktool tests/dkimchecktool.cpp
+    src/dkimverifier.cpp src/dkimverifier.h)
+target_link_libraries(dkimchecktool PRIVATE
+    Qt6::Core Qt6::Network KPim6::Mime PkgConfig::LIBCRYPTO)
+
+# Diagnostic: does a message survive the KMime parse/re-encode path byte for
+# byte? With no argument it uses a built-in nested multipart; with a file
+# argument it checks that message.
+qt_add_executable(rawfidelitytest tests/rawfidelitytest.cpp)
+target_link_libraries(rawfidelitytest PRIVATE Qt6::Core KPim6::Mime)
+
+# Keep the test and diagnostic targets out of the build root: both the
+# binaries and the AUTOMOC/AUTOUIC scratch dirs land under build/tests/.
+foreach(_test attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest)
+    set_target_properties(${_test} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/tests/${_test}_autogen")
+endforeach()

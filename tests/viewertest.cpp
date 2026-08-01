@@ -21,7 +21,9 @@ int main(int argc, char *argv[])
     QGuiApplication app(argc, argv);
 
     ViewerSchemeHandler *handler = ViewerSchemeHandler::install();
+    const quint64 context = handler->allocateContext();
     const QString url = handler->setMessageHtml(
+        context,
         QByteArrayLiteral("<meta charset=\"utf-8\"><html><head><title>MAILO_OK</title></head>"
                           "<body><p>hello été</p></body></html>"));
 

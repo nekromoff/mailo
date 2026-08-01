@@ -1,0 +1,126 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+#include "messagecontext.h"
+
+#include "mailclient.h"
+#include "viewersecurity.h"
+
+MessageContext::MessageContext(MailClient *client)
+    : QObject(client)
+    , m_client(client)
+{
+}
+
+MessageContext::~MessageContext()
+{
+    if (m_handler && m_viewerContext)
+        m_handler->releaseContext(m_viewerContext);
+}
+
+quint64 MessageContext::viewerContext()
+{
+    if (!m_viewerContext && m_handler)
+        m_viewerContext = m_handler->allocateContext();
+    return m_viewerContext;
+}
+
+void MessageContext::setRemoteContentAllowed(bool allow)
+{
+    // User toggle: remember the choice for this sender.
+    if (m_client)
+        m_client->rememberRemoteContent(m_senderAddress, allow);
+    applyRemoteAllowed(allow);
+}
+
+void MessageContext::applyRemoteAllowed(bool allow)
+{
+    // The interceptor flag is profile-global; pushing it on every apply means
+    // it always matches the view that is about to (re)load.
+    if (m_handler)
+        m_handler->setRemoteContentAllowed(allow);
+    if (m_remoteAllowed == allow)
+        return;
+    m_remoteAllowed = allow;
+    Q_EMIT remoteContentAllowedChanged();
+}
+
+QString MessageContext::htmlViewUrl()
+{
+    return m_client ? m_client->htmlViewUrlFor(this) : QString();
+}
+
+QString MessageContext::textViewUrl()
+{
+    return m_client ? m_client->textViewUrlFor(this) : QString();
+}
+
+QString MessageContext::sourceViewUrl()
+{
+    return m_client ? m_client->sourceViewUrlFor(this) : QString();
+}
+
+QVariantMap MessageContext::replyData(bool replyAll)
+{
+    return m_client ? m_client->replyDataFor(this, replyAll) : QVariantMap();
+}
+
+QVariantMap MessageContext::forwardData()
+{
+    return m_client ? m_client->forwardDataFor(this) : QVariantMap();
+}
+
+bool MessageContext::attachmentRisky(int index) const
+{
+    return m_client && m_client->attachmentRiskyFor(this, index);
+}
+
+void MessageContext::openAttachment(int index)
+{
+    if (m_client)
+        m_client->openAttachmentFor(this, index);
+}
+
+void MessageContext::saveAttachmentToDownloads(int index)
+{
+    if (m_client)
+        m_client->saveAttachmentToDownloadsFor(this, index);
+}
+
+void MessageContext::saveAttachment(int index, const QUrl &fileUrl)
+{
+    if (m_client)
+        m_client->saveAttachmentFor(this, index, fileUrl);
+}
+
+void MessageContext::clear()
+{
+    m_hasMessage = false;
+    m_message.reset();
+    m_attachmentParts.clear();
+    m_attachments.clear();
+    m_htmlBody.clear();
+    m_textBody.clear();
+    m_raw.clear();
+    m_uid = -1;
+    m_senderAddress.clear();
+    m_subject.clear();
+    m_from.clear();
+    m_to.clear();
+    m_cc.clear();
+    m_date.clear();
+    m_authInfo.clear();
+    m_bodyUrl.clear();
+    if (m_handler && m_viewerContext)
+        m_handler->clearInlineParts(m_viewerContext);
+    Q_EMIT messageChanged();
+}
+
+void MessageContext::release()
+{
+    if (m_handler && m_viewerContext) {
+        m_handler->releaseContext(m_viewerContext);
+        m_viewerContext = 0;
+    }
+    deleteLater();
+}

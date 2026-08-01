@@ -12,10 +12,25 @@ ColumnLayout {
     id: viewer
     spacing: 0
 
-    property bool hasMessage: false
+    /// The MessageContext this viewer renders. The reading pane binds
+    /// Mail.readingContext; a detached message window owns its own context.
+    /// All message state (bodies, attachments, junk flag, view URLs) comes
+    /// from here, so several viewers can be on screen at once.
+    property var context: null
+
+    /// The uiSettings object from Main.qml (for the configurable shortcuts).
+    /// Null is tolerated everywhere: the built-in defaults are used then.
+    property var ui: null
+
+    readonly property bool hasMessage: context ? context.hasMessage : false
     property string viewMode: "html"
 
-    property string fullAuthInfo: ""
+    /// True while the find bar is open. The message window checks this so its
+    /// Esc-closes-the-window shortcut does not swallow Esc-closes-the-find-bar.
+    readonly property bool findActive: findBar.visible
+    // Match counters, filled from findTextFinished (Chromium counts for us).
+    property int findMatches: 0
+    property int findCurrent: 0
 
     /// Reply / Reply all was clicked for the shown message.
     signal replyRequested(bool replyAll)
@@ -25,32 +40,138 @@ ColumnLayout {
     // Reset to the "Select a message" placeholder (e.g. the shown message was
     // deleted and the list is now empty).
     function clear() {
-        hasMessage = false
-        web.url = "about:blank"
+        if (context)
+            context.clear()
     }
 
-    function showMessage(subject, from, to, cc, date, bodyUrl, authInfo) {
-        subjectLabel.text = subject.length > 0 ? subject : "(no subject)"
-        fromLabel.text = from
-        toLabel.text = to
-        ccLabel.text = cc
-        dateLabel.text = date
-        fullAuthInfo = authInfo
-        dkimLabel.text = condenseAuth(authInfo)
-        hasMessage = true
+    function showCurrent() {
+        if (!context || !context.hasMessage) {
+            web.url = "about:blank"
+            return
+        }
         // Junk folders open as plain text; the HTML button is the explicit
         // opt-in to render the (still sandboxed) HTML.
-        viewMode = Mail.junkTextOnly ? "text" : "html"
-        web.url = bodyUrl
+        viewMode = context.junkTextOnly ? "text" : "html"
+        web.url = context.bodyUrl
     }
 
+    /// Switch the rendered representation. Shared by the HTML/Text/Source
+    /// buttons and the view-source shortcut so both stay in step.
+    function showMode(mode) {
+        if (!context || !context.hasMessage)
+            return
+        viewMode = mode
+        web.url = mode === "text" ? context.textViewUrl()
+                : mode === "source" ? context.sourceViewUrl()
+                                    : context.htmlViewUrl()
+    }
+
+    /// Ctrl+U: source on, and off again back to the rendered message.
+    function toggleSource() {
+        if (!hasMessage)
+            return
+        showMode(viewMode === "source"
+                 ? (context.junkTextOnly ? "text" : "html")
+                 : "source")
+    }
+
+    function openFind() {
+        if (!hasMessage)
+            return
+        findBar.visible = true
+        findField.forceActiveFocus()
+        findField.selectAll() // repeat presses replace the old term
+        if (findField.text.length > 0)
+            findRun(false)
+    }
+
+    function closeFind() {
+        findBar.visible = false
+        web.findText("") // drop the highlighting
+        findMatches = 0
+        findCurrent = 0
+        web.forceActiveFocus()
+    }
+
+    // Chromium's find-in-page advances to the next match on every repeated
+    // call with the same term, so next/previous is the same call as the
+    // initial search — only the direction flag differs.
+    function findRun(backward) {
+        if (findField.text.length === 0) {
+            web.findText("")
+            findMatches = 0
+            findCurrent = 0
+            return
+        }
+        let flags = 0
+        if (findCase.checked)
+            flags |= WebEngineView.FindCaseSensitively
+        if (backward)
+            flags |= WebEngineView.FindBackward
+        web.findText(findField.text, flags)
+    }
+
+    Shortcut {
+        sequences: [viewer.ui ? viewer.ui.shortcutFind : "Ctrl+F"]
+        enabled: viewer.hasMessage
+        onActivated: viewer.openFind()
+    }
+    Shortcut {
+        sequences: [viewer.ui ? viewer.ui.shortcutSource : "Ctrl+U"]
+        enabled: viewer.hasMessage
+        onActivated: viewer.toggleSource()
+    }
+    // Esc closes the bar wherever focus sits (the field handles it itself, but
+    // focus is usually back in the page after a jump to a match). The message
+    // window disables its own Esc-closes-the-window while the bar is open, so
+    // the two never compete for the key.
+    Shortcut {
+        sequence: "Esc"
+        enabled: viewer.findActive
+        onActivated: viewer.closeFind()
+    }
+    Shortcut {
+        sequences: ["F3", "Ctrl+G"]
+        enabled: viewer.findActive
+        onActivated: viewer.findRun(false)
+    }
+    Shortcut {
+        sequences: ["Shift+F3", "Ctrl+Shift+G"]
+        enabled: viewer.findActive
+        onActivated: viewer.findRun(true)
+    }
+
+    // The context outlives any one message: re-render whenever it presents a
+    // different one (reading pane), and once at startup for a window whose
+    // context was filled before the viewer existed.
+    Connections {
+        target: viewer.context
+        function onMessageChanged() {
+            viewer.showCurrent()
+        }
+    }
+    Component.onCompleted: showCurrent()
+
     // "purelymail.com; spf=pass …; dkim=fail …" → "spf=pass · dkim=fail ❗"
+    // Only the leading method=result of each ';'-delimited field is a verdict.
+    // Everything after it echoes sender-supplied data — smtp.mailfrom=,
+    // header.from=, reason= — so scanning the whole header would let a sender
+    // put "dkim=pass" in this badge by putting it in their own envelope
+    // address. Quoted strings and (comments) are dropped first for the same
+    // reason: both can carry a ';' and hide a verdict behind it.
     function condenseAuth(authInfo) {
-        if (authInfo.length === 0)
+        if (!authInfo || authInfo.length === 0)
             return ""
-        const verdicts = authInfo.toLowerCase().match(/\b(dkim|spf|dmarc)=[a-z]+/g)
-        if (!verdicts || verdicts.length === 0)
-            return ""
+        const cleaned = authInfo
+            .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+            .replace(/\([^()]*\)/g, " ")
+        const fields = cleaned.split(";")
+        let verdicts = []
+        for (let i = 1; i < fields.length; ++i) { // field 0 is the authserv-id
+            const m = /^\s*(dkim|spf|dmarc)\s*=\s*([a-z]+)/i.exec(fields[i])
+            if (m)
+                verdicts.push(m[1].toLowerCase() + "=" + m[2].toLowerCase())
+        }
         return verdicts
             .map(v => /(fail|permerror)$/.test(v) ? v + " ❗" : v)
             .join(" · ")
@@ -72,6 +193,7 @@ ColumnLayout {
                 id: fromLabel
                 Layout.fillWidth: true
                 elide: Text.ElideRight
+                text: viewer.context ? viewer.context.from : ""
             }
             // Explicit arrow glyphs — theme icons for reply/forward are not
             // reliably recognizable as arrows.
@@ -97,11 +219,11 @@ ColumnLayout {
                 icon.name: "image-x-generic"
                 text: "Load remote content"
                 checkable: true
-                checked: Mail.remoteContentAllowed
+                checked: viewer.context ? viewer.context.remoteContentAllowed : false
                 visible: viewer.viewMode === "html"
                 onToggled: {
-                    Mail.remoteContentAllowed = checked
-                    web.url = Mail.htmlViewUrl() // re-render with the new policy
+                    viewer.context.remoteContentAllowed = checked
+                    web.url = viewer.context.htmlViewUrl() // re-render with the new policy
                 }
                 QQC2.ToolTip.text: "Allow this message to load remote images, styles and fonts (JavaScript stays off)"
                 QQC2.ToolTip.visible: hovered
@@ -109,6 +231,7 @@ ColumnLayout {
             QQC2.Label {
                 id: dateLabel
                 opacity: 0.8
+                text: viewer.context ? viewer.context.date : ""
             }
         }
 
@@ -117,6 +240,7 @@ ColumnLayout {
             id: toLabel
             Layout.fillWidth: true
             elide: Text.ElideRight
+            text: viewer.context ? viewer.context.to : ""
         }
 
         QQC2.Label { text: "Cc:"; opacity: 0.8; visible: ccLabel.text.length > 0 }
@@ -125,6 +249,7 @@ ColumnLayout {
             Layout.fillWidth: true
             elide: Text.ElideRight
             visible: text.length > 0
+            text: viewer.context ? viewer.context.cc : ""
         }
 
         QQC2.Label { text: "Subject:"; opacity: 0.8 }
@@ -137,38 +262,107 @@ ColumnLayout {
                 Layout.fillWidth: true
                 font.bold: true
                 elide: Text.ElideRight
+                text: viewer.context
+                      ? (viewer.context.subject.length > 0 ? viewer.context.subject
+                                                           : (viewer.hasMessage ? "(no subject)" : ""))
+                      : ""
             }
             QQC2.ToolButton {
                 text: "HTML"
                 checkable: true
                 checked: viewer.viewMode === "html"
-                onClicked: { viewer.viewMode = "html"; web.url = Mail.htmlViewUrl() }
+                onClicked: viewer.showMode("html")
             }
             QQC2.ToolButton {
                 text: "Text"
                 checkable: true
                 checked: viewer.viewMode === "text"
-                onClicked: { viewer.viewMode = "text"; web.url = Mail.textViewUrl() }
+                onClicked: viewer.showMode("text")
             }
             QQC2.ToolButton {
                 text: "Source"
                 checkable: true
                 checked: viewer.viewMode === "source"
-                onClicked: { viewer.viewMode = "source"; web.url = Mail.sourceViewUrl() }
+                onClicked: viewer.showMode("source")
+                QQC2.ToolTip.text: "Show the raw message source ("
+                                   + (viewer.ui ? viewer.ui.shortcutSource : "Ctrl+U") + ")"
+                QQC2.ToolTip.visible: hovered
             }
         }
 
-        Item { visible: dkimLabel.text.length > 0 } // caption column stays empty
-        QQC2.Label {
-            id: dkimLabel
-            visible: text.length > 0
+        Item { visible: authRow.visible } // caption column stays empty
+        RowLayout {
+            id: authRow
             Layout.fillWidth: true
-            elide: Text.ElideRight
-            opacity: 0.8
-            font.pointSize: Kirigami.Theme.smallFont.pointSize
-            QQC2.ToolTip.text: viewer.fullAuthInfo
-            QQC2.ToolTip.visible: dkimHover.hovered && viewer.fullAuthInfo.length > 0
-            HoverHandler { id: dkimHover }
+            spacing: Kirigami.Units.largeSpacing
+            visible: dkimLabel.text.length > 0 || serverAuthLabel.text.length > 0
+
+            // What *we* verified, cryptographically. Deliberately separate from
+            // the server's say-so next to it: one is a signature checked against
+            // a key we fetched, the other is a header we chose to believe.
+            QQC2.Label {
+                id: dkimLabel
+                visible: text.length > 0
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                font.bold: viewer.context && viewer.context.dkimStatus === "fail"
+                color: {
+                    if (!viewer.context || viewer.context.dkimChecking)
+                        return Kirigami.Theme.textColor
+                    if (viewer.context.dkimTrusted)
+                        return Kirigami.Theme.positiveTextColor
+                    if (viewer.context.dkimStatus === "fail")
+                        return Kirigami.Theme.negativeTextColor
+                    if (viewer.context.dkimStatus === "pass")
+                        return Kirigami.Theme.neutralTextColor // valid but unaligned
+                    return Kirigami.Theme.textColor // "unverified" reads as neutral
+                }
+                opacity: viewer.context && viewer.context.dkimChecking ? 0.6 : 1
+                text: {
+                    if (!viewer.context)
+                        return ""
+                    if (viewer.context.dkimChecking)
+                        return "checking signature…"
+                    switch (viewer.context.dkimStatus) {
+                    case "pass":
+                        // "verified" only when the signing domain matches the
+                        // sender — a valid signature from some other domain is
+                        // exactly what a forgery looks like.
+                        return viewer.context.dkimTrusted
+                            ? "✓ DKIM verified" : "⚠ DKIM signed by another domain"
+                    case "fail":
+                        // Covers permanent errors too: an obsolete algorithm or
+                        // a revoked key is a signature that cannot be trusted.
+                        return "✗ DKIM signature invalid"
+                    case "temperror":
+                        return "DKIM not checked"
+                    case "unverified":
+                        // Body hash mismatch. We cannot tell tampering from our
+                        // own copy not being byte-exact, so we do not accuse.
+                        return "DKIM not verified"
+                    default:
+                        return "" // no signature at all — say nothing
+                    }
+                }
+                QQC2.ToolTip.text: viewer.context ? viewer.context.dkimDetail : ""
+                QQC2.ToolTip.visible: dkimHover.hovered && viewer.context
+                                      && viewer.context.dkimDetail.length > 0
+                HoverHandler { id: dkimHover }
+            }
+
+            QQC2.Label {
+                id: serverAuthLabel
+                visible: text.length > 0
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                text: viewer.context ? viewer.condenseAuth(viewer.context.authInfo) : ""
+                QQC2.ToolTip.text: viewer.context
+                    ? "Reported by the receiving server:\n" + viewer.context.authInfo : ""
+                QQC2.ToolTip.visible: serverAuthHover.hovered && viewer.context
+                                      && viewer.context.authInfo.length > 0
+                HoverHandler { id: serverAuthHover }
+            }
         }
     }
 
@@ -177,7 +371,7 @@ ColumnLayout {
         Layout.leftMargin: Kirigami.Units.largeSpacing
         Layout.rightMargin: Kirigami.Units.largeSpacing
         Layout.bottomMargin: Kirigami.Units.smallSpacing
-        visible: viewer.hasMessage && Mail.junkTextOnly && viewer.viewMode === "text"
+        visible: viewer.hasMessage && viewer.context.junkTextOnly && viewer.viewMode === "text"
         type: Kirigami.MessageType.Warning
         text: "Spam folder — showing plain text for safety. Click HTML above to render this message anyway."
     }
@@ -185,6 +379,69 @@ ColumnLayout {
     Kirigami.Separator {
         Layout.fillWidth: true
         visible: viewer.hasMessage
+    }
+
+    // Find in message. Chromium's own find-in-page does the searching and the
+    // counting; it works with JavaScript off, since it runs inside the engine
+    // rather than in the (untrusted) page.
+    RowLayout {
+        id: findBar
+        Layout.fillWidth: true
+        Layout.margins: Kirigami.Units.smallSpacing
+        spacing: Kirigami.Units.smallSpacing
+        visible: false
+
+        QQC2.TextField {
+            id: findField
+            Layout.fillWidth: true
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 20
+            placeholderText: "Find in message"
+            // Search as you type, from the top of the document each time.
+            onTextChanged: viewer.findRun(false)
+            Keys.onReturnPressed: event => viewer.findRun(event.modifiers & Qt.ShiftModifier)
+            Keys.onEnterPressed: event => viewer.findRun(event.modifiers & Qt.ShiftModifier)
+            Keys.onEscapePressed: viewer.closeFind()
+        }
+
+        QQC2.Label {
+            opacity: 0.8
+            font.pointSize: Kirigami.Theme.smallFont.pointSize
+            color: (findField.text.length > 0 && viewer.findMatches === 0)
+                   ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+            text: findField.text.length === 0 ? ""
+                : viewer.findMatches === 0 ? "No matches"
+                : viewer.findCurrent + " of " + viewer.findMatches
+                  + (viewer.findMatches === 1 ? " match" : " matches")
+        }
+
+        QQC2.ToolButton {
+            icon.name: "go-up"
+            enabled: viewer.findMatches > 0
+            onClicked: viewer.findRun(true)
+            QQC2.ToolTip.text: "Previous match (Shift+F3)"
+            QQC2.ToolTip.visible: hovered
+        }
+        QQC2.ToolButton {
+            icon.name: "go-down"
+            enabled: viewer.findMatches > 0
+            onClicked: viewer.findRun(false)
+            QQC2.ToolTip.text: "Next match (F3)"
+            QQC2.ToolTip.visible: hovered
+        }
+        QQC2.ToolButton {
+            id: findCase
+            text: "Aa"
+            checkable: true
+            onToggled: viewer.findRun(false)
+            QQC2.ToolTip.text: "Match case"
+            QQC2.ToolTip.visible: hovered
+        }
+        QQC2.ToolButton {
+            icon.name: "dialog-close"
+            onClicked: viewer.closeFind()
+            QQC2.ToolTip.text: "Close the find bar (Esc)"
+            QQC2.ToolTip.visible: hovered
+        }
     }
 
     Item {
@@ -209,6 +466,19 @@ ColumnLayout {
         onLoadingChanged: function (loadInfo) {
             if (loadInfo.status === WebEngineView.LoadFailedStatus)
                 console.warn("mailo viewer: load failed:", loadInfo.errorString, loadInfo.url)
+            // A new document (another message, or the same one switched to
+            // Text/Source) has no highlighting and no counts — search it again.
+            if (loadInfo.status === WebEngineView.LoadSucceededStatus) {
+                viewer.findMatches = 0
+                viewer.findCurrent = 0
+                if (viewer.findActive)
+                    viewer.findRun(false)
+            }
+        }
+
+        onFindTextFinished: function (result) {
+            viewer.findMatches = result.numberOfMatches
+            viewer.findCurrent = result.activeMatch
         }
 
         onNavigationRequested: function (request) {
@@ -229,7 +499,7 @@ ColumnLayout {
     // a layout row) so toggling it never resizes the WebEngineView, which
     // repaints with visible glitches on resize.
     Rectangle {
-        visible: Mail.attachments.length > 0
+        visible: viewer.context && viewer.context.attachments.length > 0
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
@@ -252,24 +522,24 @@ ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
                 Repeater {
-                    model: Mail.attachments
+                    model: viewer.context ? viewer.context.attachments : []
                     delegate: QQC2.Button {
                         required property var modelData
                         required property int index
                         icon.name: "mail-attachment"
                         text: modelData.name + " (" + modelData.sizeText + ")"
                         onClicked: { // left click = open (risky types need confirmation)
-                            if (Mail.attachmentRisky(index)) {
+                            if (viewer.context.attachmentRisky(index)) {
                                 confirmOpenDialog.attachmentIndex = index
                                 confirmOpenDialog.attachmentName = modelData.name
                                 confirmOpenDialog.open()
                             } else {
-                                Mail.openAttachment(index)
+                                viewer.context.openAttachment(index)
                             }
                         }
                         TapHandler {
                             acceptedButtons: Qt.RightButton // right click = save to ~/Downloads
-                            onTapped: Mail.saveAttachmentToDownloads(index)
+                            onTapped: viewer.context.saveAttachmentToDownloads(index)
                         }
                         QQC2.ToolTip.text: "Click to open — right-click to save to Downloads"
                         QQC2.ToolTip.visible: hovered
@@ -308,7 +578,7 @@ ColumnLayout {
                 QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.RejectRole
             }
         }
-        onAccepted: Mail.openAttachment(attachmentIndex)
+        onAccepted: viewer.context.openAttachment(attachmentIndex)
 
         contentItem: QQC2.Label {
             text: "\"" + confirmOpenDialog.attachmentName + "\" is a script, program "

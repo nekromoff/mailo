@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
+import QtCore
 import QtQuick
 import QtQuick.Window
 import QtQuick.Controls as QQC2
@@ -14,10 +15,38 @@ Window {
     title: "Compose"
     flags: Qt.Window
     transientParent: null // own top-level window with its own taskbar entry
-    width: 700
-    height: 600
+
+    // Last compose geometry, restored on every opening and across restarts.
+    // x/y are best effort (Wayland places windows itself); -1 = never saved.
+    Settings {
+        id: windowState
+        category: "composeWindow"
+        property int width: 700
+        property int height: 600
+        property int x: -1
+        property int y: -1
+        property bool maximized: false
+    }
+    width: windowState.width
+    height: windowState.height
     minimumWidth: 400
     minimumHeight: 300
+    Component.onCompleted: {
+        if (windowState.x >= 0) {
+            x = windowState.x
+            y = windowState.y
+        }
+    }
+    function saveGeometry() {
+        windowState.maximized = sheet.visibility === Window.Maximized
+        // Keep the last windowed geometry — see Main.qml.
+        if (sheet.visibility === Window.Windowed) {
+            windowState.width = sheet.width
+            windowState.height = sheet.height
+            windowState.x = sheet.x
+            windowState.y = sheet.y
+        }
+    }
     // Resolved from the content layout's Window color set (chrome gray),
     // so the window fill matches the panel. bgColor override still wins.
     color: panelColor
@@ -58,18 +87,51 @@ Window {
             || bodyEdit.text.trim() !== "" || attachments.length > 0
     }
 
-    // Escape closes the window, which routes through onClosing below — so it
-    // asks for confirmation exactly like the title bar's X rather than being a
-    // second, silent way to lose a message.
+    /// The fields exactly as the composer was opened (captured in present()),
+    /// so closing can tell "untouched" from "work in progress". A reply's
+    /// quoted body or a resumed draft counts as untouched until the user
+    /// actually edits something.
+    property var openedState: null
+    function captureOpenedState() {
+        openedState = {
+            to: toField.text,
+            cc: ccField.text,
+            bcc: bccField.text,
+            subject: subjectField.text,
+            // Read back through the editor: TextArea re-serializes rich text,
+            // so comparing against this (not the HTML we assigned) is stable.
+            body: bodyEdit.text,
+            attachCount: attachments.length
+        }
+    }
+    function isModified() {
+        if (!openedState)
+            return hasContent()
+        return toField.text !== openedState.to
+            || ccField.text !== openedState.cc
+            || bccField.text !== openedState.bcc
+            || subjectField.text !== openedState.subject
+            || bodyEdit.text !== openedState.body
+            || attachments.length !== openedState.attachCount
+    }
+
+    // Escape closes the window, which routes through onClosing below — so an
+    // edited message gets the same confirmation as the title bar's X, and an
+    // untouched one just closes.
     Shortcut {
         sequence: "Esc"
         onActivated: sheet.close()
     }
 
-    // The window's close button used to discard silently. It is now the only
-    // way to throw a message away, so it has to ask first.
+    // Closing only asks when there is something to lose: a composer the user
+    // has not typed into (empty new message, unedited reply/forward/draft)
+    // closes silently — nothing the user wrote is being thrown away, and a
+    // resumed draft stays in the Drafts folder untouched.
     onClosing: close => {
-        if (closingConfirmed || sending || !hasContent())
+        // Remember the geometry even when the discard dialog cancels the
+        // close below — a no-op then, the window is still on screen.
+        saveGeometry()
+        if (closingConfirmed || sending || !isModified())
             return
         close.accepted = false
         discardDialog.open()
@@ -78,7 +140,13 @@ Window {
     function present() {
         sending = false                  // never reopen stuck in "Sending…"
         closingConfirmed = false
-        show()
+        // Fields are fully populated by the open*() caller at this point —
+        // this snapshot is what "unchanged, close silently" compares against.
+        captureOpenedState()
+        if (windowState.maximized)
+            showMaximized()
+        else
+            show()
         raise()
         requestActivate()
         if (focusBodyOnOpen) {
@@ -307,21 +375,23 @@ Window {
         modal: true
         title: "Discard this message?"
 
+        // Discarding a resumed draft removes it outright — not to Trash.
+        // Keeping it would mean "Discard" left the message sitting in
+        // Drafts, which is the opposite of what it says. A no-op for a
+        // message that was never a draft.
+        function confirmDiscard() {
+            Mail.discardDraft(sheet.sourceDraftUid)
+            sheet.closingConfirmed = true
+            discardDialog.close()
+            sheet.close()
+        }
+
         footer: QQC2.DialogButtonBox {
             QQC2.Button {
                 text: "Discard"
                 icon.name: "edit-delete"
                 QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.DestructiveRole
-                onClicked: {
-                    // Discarding a resumed draft removes it outright — not to
-                    // Trash. Keeping it would mean "Discard" left the message
-                    // sitting in Drafts, which is the opposite of what it says.
-                    // A no-op for a message that was never a draft.
-                    Mail.discardDraft(sheet.sourceDraftUid)
-                    sheet.closingConfirmed = true
-                    discardDialog.close()
-                    sheet.close()
-                }
+                onClicked: discardDialog.confirmDiscard()
             }
             QQC2.Button {
                 text: "Save as draft"

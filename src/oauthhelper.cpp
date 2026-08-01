@@ -12,8 +12,12 @@
 #include <QRandomGenerator>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+
+#include <chrono>
+#include <memory>
 
 OAuthHelper::OAuthHelper(QObject *parent)
     : QObject(parent)
@@ -58,7 +62,7 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
         Q_EMIT failed(tr("No OAuth client ID configured for this account."));
         return;
     }
-    delete m_server;
+    endRedirectListener(); // abandon any sign-in still in flight
     m_server = new QTcpServer(this);
     if (!m_server->listen(QHostAddress::LocalHost, 0)) {
         Q_EMIT failed(tr("Could not open a local port for the OAuth redirect."));
@@ -70,6 +74,11 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
         QStringLiteral("http://localhost:%1/").arg(m_server->serverPort());
 
     m_codeVerifier = randomString(64);
+    // CSRF nonce. Without it the loopback listener redeems any code posted to
+    // it, so any local process — or any web page the user happens to visit,
+    // which can navigate to http://localhost:<port>/?code=… — could bind this
+    // client to an account of the attacker's choosing (RFC 8252 §8.9).
+    m_state = randomString(32);
     const QByteArray challenge = base64Url(
         QCryptographicHash::hash(m_codeVerifier.toLatin1(), QCryptographicHash::Sha256));
 
@@ -82,6 +91,7 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
     q.addQueryItem(QStringLiteral("scope"), ep.scope);
     q.addQueryItem(QStringLiteral("code_challenge"), QString::fromLatin1(challenge));
     q.addQueryItem(QStringLiteral("code_challenge_method"), QStringLiteral("S256"));
+    q.addQueryItem(QStringLiteral("state"), m_state);
     q.addQueryItem(QStringLiteral("access_type"), QStringLiteral("offline")); // Google
     q.addQueryItem(QStringLiteral("prompt"), QStringLiteral("consent"));      // force refresh token
     url.setQuery(q);
@@ -89,34 +99,74 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
     connect(m_server, &QTcpServer::newConnection, this,
             [this, provider, clientId, clientSecret, redirect] {
         QTcpSocket *sock = m_server->nextPendingConnection();
+        if (!sock)
+            return;
+        // Outlive the listener: endRedirectListener() deletes the server while
+        // this socket may still be draining its reply.
+        sock->setParent(this);
+        connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
+        auto buffer = std::make_shared<QByteArray>();
         connect(sock, &QTcpSocket::readyRead, this,
-                [this, sock, provider, clientId, clientSecret, redirect] {
-            const QByteArray request = sock->readAll();
-            const int pathStart = request.indexOf(' ') + 1;
-            const int pathEnd = request.indexOf(' ', pathStart);
-            const QUrl reqUrl = QUrl(QStringLiteral("http://127.0.0.1")
-                                     + QString::fromLatin1(
-                                         request.mid(pathStart, pathEnd - pathStart)));
+                [this, sock, buffer, provider, clientId, clientSecret, redirect] {
+            buffer->append(sock->readAll());
+            // Only the request line matters; wait for it to arrive whole rather
+            // than assuming it fits in the first read.
+            const int lineEnd = buffer->indexOf("\r\n");
+            if (lineEnd < 0) {
+                if (buffer->size() > 8192)
+                    sock->disconnectFromHost(); // not a browser redirect
+                return;
+            }
+            const QByteArray requestLine = buffer->left(lineEnd);
+            const int pathStart = requestLine.indexOf(' ') + 1;
+            const int pathEnd = requestLine.indexOf(' ', pathStart);
+            if (pathStart <= 0 || pathEnd < 0) {
+                sock->disconnectFromHost();
+                return;
+            }
+            const QUrl reqUrl(QStringLiteral("http://127.0.0.1")
+                              + QString::fromLatin1(
+                                  requestLine.mid(pathStart, pathEnd - pathStart)));
             const QUrlQuery query(reqUrl);
             const QString code = query.queryItemValue(QStringLiteral("code"));
             const QString error = query.queryItemValue(QStringLiteral("error"));
+            const QString state = query.queryItemValue(QStringLiteral("state"));
 
-            const QByteArray page = code.isEmpty()
-                ? QByteArrayLiteral("<h2>Sign-in failed.</h2>You can close this tab.")
-                : QByteArrayLiteral("<h2>Signed in.</h2>You can return to Mailo "
-                                    "and close this tab.");
-            sock->write("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close"
-                        "\r\nContent-Length: " + QByteArray::number(page.size())
-                        + "\r\n\r\n" + page);
-            sock->flush();
-            sock->disconnectFromHost();
-            m_server->close();
+            auto respond = [sock](const char *status, const QByteArray &body) {
+                sock->write(QByteArray("HTTP/1.1 ") + status
+                            + "\r\nContent-Type: text/html; charset=utf-8"
+                              "\r\nCache-Control: no-store\r\nConnection: close"
+                              "\r\nContent-Length: " + QByteArray::number(body.size())
+                            + "\r\n\r\n" + body);
+                sock->flush();
+                sock->disconnectFromHost();
+            };
 
-            if (code.isEmpty()) {
-                Q_EMIT failed(tr("Browser sign-in failed: %1")
-                                  .arg(error.isEmpty() ? tr("no code returned") : error));
+            // Anything that is not our redirect — favicon probes, port scans, a
+            // page poking at localhost — is answered and ignored. It must not
+            // end a sign-in the user is still completing.
+            if (code.isEmpty() && error.isEmpty()) {
+                respond("404 Not Found", QByteArrayLiteral("<h2>Not found.</h2>"));
                 return;
             }
+            // The nonce is what proves this redirect belongs to the sign-in we
+            // started. A replayed or injected one has nothing to match against.
+            if (m_state.isEmpty() || state != m_state) {
+                respond("400 Bad Request",
+                        QByteArrayLiteral("<h2>Sign-in rejected.</h2>This redirect did not "
+                                          "come from the sign-in Mailo started."));
+                return;
+            }
+            endRedirectListener(); // one-shot
+
+            if (code.isEmpty()) {
+                respond("200 OK", QByteArrayLiteral("<h2>Sign-in failed.</h2>"
+                                                    "You can close this tab."));
+                Q_EMIT failed(tr("Browser sign-in failed: %1").arg(error));
+                return;
+            }
+            respond("200 OK", QByteArrayLiteral("<h2>Signed in.</h2>You can return to "
+                                                "Mailo and close this tab."));
             requestToken(provider, clientId, clientSecret,
                          {{QStringLiteral("grant_type"), QStringLiteral("authorization_code")},
                           {QStringLiteral("code"), code},
@@ -125,7 +175,26 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
         });
     });
 
+    // Don't keep a loopback port open indefinitely when the user abandons the
+    // browser tab — that is the window in which an injected code would land.
+    QTimer::singleShot(std::chrono::minutes(5), this, [this] {
+        if (m_state.isEmpty())
+            return; // already finished
+        endRedirectListener();
+        Q_EMIT failed(tr("Browser sign-in timed out."));
+    });
+
     QDesktopServices::openUrl(url);
+}
+
+void OAuthHelper::endRedirectListener()
+{
+    m_state.clear();
+    if (m_server) {
+        m_server->close();
+        m_server->deleteLater();
+        m_server = nullptr;
+    }
 }
 
 void OAuthHelper::refresh(Provider provider, const QString &clientId,
