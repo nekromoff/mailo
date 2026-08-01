@@ -1,6 +1,6 @@
 # Mailo
 
-The fast KDE email client.
+The fast KDE-only email client.
 
 (c) 2026 Daniel Duris, dusoft@staznosti.sk
 
