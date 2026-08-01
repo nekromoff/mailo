@@ -43,6 +43,10 @@ Security-minded KDE-only IMAP mail client, blazing fast.
 <img width="900" height="573" alt="3" src="https://github.com/user-attachments/assets/386c741a-f78e-420e-9820-8cb2d27acaa7" />
 <img width="901" height="576" alt="4" src="https://github.com/user-attachments/assets/980494f3-a786-4da6-aba1-0aadd4540cb5" />
 
+## Installation
+
+Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailo/releases (open assets) to download.
+
 ## Technology
 
 | Layer | Choice |
