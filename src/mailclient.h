@@ -9,6 +9,7 @@
 #include <QDateTime>
 #include <QObject>
 #include <QPointer>
+#include <QSet>
 #include <QString>
 #include <QTimer>
 #include <QUrl>
@@ -62,6 +63,18 @@ class MailClient : public QObject
     /// True while a cache vacuum is running — the UI disables the button and
     /// shows a spinner, since the database is locked for writes meanwhile.
     Q_PROPERTY(bool reclaiming READ reclaiming NOTIFY reclaimingChanged)
+    /// True while the search index is being rebuilt to fold diacritics. The
+    /// window refuses to close during it: the swap at the end is what makes
+    /// the work count, and abandoning it means starting the pass again.
+    Q_PROPERTY(bool indexRebuilding READ indexRebuilding NOTIFY indexRebuildChanged)
+    /// True from the moment a search starts until the last result is in. The
+    /// list shows it directly — an empty list during a slow search is
+    /// indistinguishable from "nothing found" unless the view says otherwise.
+    Q_PROPERTY(bool searching READ searching NOTIFY searchingChanged)
+    /// Hits delivered so far by the search in flight.
+    Q_PROPERTY(int searchFound READ searchFound NOTIFY searchingChanged)
+    /// How far that has got, 0-100, for the message shown on a close attempt.
+    Q_PROPERTY(int indexRebuildPercent READ indexRebuildPercent NOTIFY indexRebuildChanged)
     /// ABOUT.md compiled into the binary (Settings → About). CONSTANT — baked
     /// in at build time, never changes at runtime.
     Q_PROPERTY(QString aboutText READ aboutText CONSTANT)
@@ -295,7 +308,7 @@ public:
     Q_INVOKABLE void filterByColor(int color);
 
     /// Server-side IMAP SEARCH in the selected folder.
-    /// field: 0 = whole message, 1 = subject, 2 = from, 3 = body.
+    /// field: 0 = from + subject only, 1 = everything (body, cc, all headers).
     /// A query wrapped in slashes (/pattern/) instead regex-filters the loaded list.
     Q_INVOKABLE void searchMessages(const QString &query, int field);
     /// Leaves search mode and reloads the folder.
@@ -342,9 +355,21 @@ public:
     /// one has run, so the UI can stop offering a multi-minute no-op.
     Q_INVOKABLE bool reclaimWorthwhile();
     bool reclaiming() const { return m_reclaiming; }
+    bool indexRebuilding() const { return m_indexRebuilding; }
+    bool searching() const { return m_searching; }
+    int searchFound() const { return m_searchFound; }
+    int indexRebuildPercent() const { return m_indexPercent; }
+    /// Asks to quit as soon as the rebuild finishes; the window is closed for
+    /// the user rather than leaving them to try again.
+    Q_INVOKABLE void quitWhenIndexRebuildDone() { m_quitAfterIndex = true; }
 
 Q_SIGNALS:
     void reclaimingChanged();
+    void indexRebuildChanged();
+    void searchingChanged();
+    /// The rebuild finished and a close was pending — QML closes the window,
+    /// so it still saves its geometry on the way out.
+    void closeRequested();
     void accountChanged();
     void connectedChanged();
     void busyChanged();
@@ -468,6 +493,8 @@ private:
     /// chunk at a time on a worker thread. Resumes after a restart.
     void startAttachmentMigration();
     void stopAttachmentMigration();
+    /// Cancels the index rebuild between slices and joins its thread.
+    void stopIndexRebuild();
 
     /// Starts the background removal of the excluded archive's cached rows.
     void startAllMailPurge();
@@ -505,9 +532,23 @@ private:
     void updatePageAnchor(const QList<MessageListModel::Header> &page);
     /// Fetches the given uids as search results; when \a localMergeKeyword is
     /// set, local partial-match hits are merged into the result list.
-    void fetchHeadersByUids(const QList<qint64> &uids,
-                            const QString &localMergeKeyword = {});
-    void localKeywordFilter(const QString &keyword, const QString &reason);
+    void fetchHeadersByUids(const QList<qint64> &uids, const QString &localMergeKeyword = {},
+                            bool headersOnly = true);
+    /// Local index search, off the GUI thread and streamed: rows appear as the
+    /// worker finds them instead of after the last one. \a append keeps what is
+    /// already listed (server hits being topped up with local partial matches);
+    /// otherwise the first batch replaces the list.
+    /// \a headersOnly limits matching to sender and subject.
+    void localKeywordFilter(const QString &keyword, const QString &reason, bool append = false,
+                            bool headersOnly = true);
+    /// Copies the search index into one that folds diacritics, in slices on a
+    /// worker, resuming where a previous run stopped.
+    void startIndexRebuild();
+    /// Removes rows the finished search did not confirm.
+    void pruneSearchResults();
+    /// Stops caring about the search in flight, if any. The worker notices on
+    /// its next batch and gives up.
+    void abandonLocalSearch() { m_searchSeq.fetchAndAddOrdered(1); }
     void appendToSentFolder(const QByteArray &rawMessage);
     /// Builds the MIME message shared by sendMail() and saveDraft().
     /// \a strict rejects malformed or missing recipients (sending); otherwise
@@ -672,6 +713,16 @@ private:
     QAtomicInt m_purgeCancel;
     int m_purgedRows = 0;
     bool m_reclaiming = false; ///< a VACUUM is running on a worker thread
+    QThread *m_indexThread = nullptr; ///< diacritics rebuild of the FTS index
+    QAtomicInt m_indexCancel;
+    /// Read by the body-writer thread, so it knows to queue what it indexes
+    /// for repair after the swap.
+    QAtomicInt m_indexRebuildActive;
+    bool m_indexRebuilding = false;
+    bool m_searching = false;   ///< a search is in flight (server or local)
+    int m_searchFound = 0;      ///< hits delivered by it so far
+    int m_indexPercent = 0;
+    bool m_quitAfterIndex = false; ///< close was attempted mid-rebuild
     QTimer m_keepAlive;
     QTimer m_pollTimer;      ///< IDLE-less fallback refresh of the open folder
     int m_refreshMinutes = 5;
@@ -690,6 +741,16 @@ private:
     bool m_headerFetch = false; ///< a header FETCH is in flight (any session)
     bool m_bodyBackfill = false; ///< the idle body-caching phase is running
     bool m_searchActive = false; ///< showing search results, not the folder
+    /// Bumped for every local search started or abandoned. The worker carries
+    /// the value it was started with and stops as soon as it no longer
+    /// matches, so a user who keeps typing is never waiting on the query for
+    /// the word they have already changed.
+    QAtomicInteger<quint64> m_searchSeq;
+    /// Uids the current search has delivered (GUI thread only). When the
+    /// search completes, rows outside this set are pruned — the list morphs
+    /// from the old query's results into the new one's instead of being
+    /// cleared up front, which flashed blank on every keystroke.
+    QSet<qint64> m_searchSeen;
     qint64 m_pageDate = 0;   ///< disk-cache paging anchor: oldest shown date
     qint64 m_pageUid = 0;    ///< …and its uid (keyset pagination tiebreaker)
 

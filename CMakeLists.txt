@@ -32,6 +32,8 @@ qt_add_executable(mailo
     src/mailclient.h
     src/dkimverifier.cpp
     src/dkimverifier.h
+    src/publicsuffixlist.cpp
+    src/publicsuffixlist.h
     src/messagecontext.cpp
     src/messagecontext.h
     src/foldermodel.cpp
@@ -60,6 +62,9 @@ set_source_files_properties(src/qml/AccountSheet.qml PROPERTIES QT_RESOURCE_ALIA
 set_source_files_properties(src/qml/MessageViewer.qml PROPERTIES QT_RESOURCE_ALIAS MessageViewer.qml)
 set_source_files_properties(src/qml/ComposeSheet.qml PROPERTIES QT_RESOURCE_ALIAS ComposeSheet.qml)
 set_source_files_properties(src/qml/MessageWindow.qml PROPERTIES QT_RESOURCE_ALIAS MessageWindow.qml)
+set_source_files_properties(src/qml/HoverToolTip.qml PROPERTIES QT_RESOURCE_ALIAS HoverToolTip.qml)
+set_source_files_properties(src/qml/SelectableValue.qml PROPERTIES QT_RESOURCE_ALIAS SelectableValue.qml)
+set_source_files_properties(src/qml/ExpandableValue.qml PROPERTIES QT_RESOURCE_ALIAS ExpandableValue.qml)
 
 qt_add_qml_module(mailo
     URI Mailo
@@ -70,6 +75,9 @@ qt_add_qml_module(mailo
         src/qml/MessageViewer.qml
         src/qml/ComposeSheet.qml
         src/qml/MessageWindow.qml
+        src/qml/HoverToolTip.qml
+        src/qml/SelectableValue.qml
+        src/qml/ExpandableValue.qml
 )
 
 # Compile ABOUT.md into the binary (shown in Settings → About). Editing
@@ -178,7 +186,8 @@ target_link_libraries(viewertest PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick 
 
 # Checks DKIM canonicalization against the vectors published in RFC 6376 3.4.5.
 # Self-contained: no network, no fixtures. Exit 0 = all vectors match.
-qt_add_executable(dkimtest tests/dkimtest.cpp src/dkimverifier.cpp src/dkimverifier.h)
+qt_add_executable(dkimtest tests/dkimtest.cpp src/dkimverifier.cpp src/dkimverifier.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h)
 target_link_libraries(dkimtest PRIVATE Qt6::Core Qt6::Network PkgConfig::LIBCRYPTO)
 
 # Diagnostic, not a pass/fail test: runs the real verifier over .eml files and
@@ -186,7 +195,8 @@ target_link_libraries(dkimtest PRIVATE Qt6::Core Qt6::Network PkgConfig::LIBCRYP
 # stored bodies are not byte-identical to what arrived — see doc/roadmap.md.
 #   ./dkimchecktool msg1.eml msg2.eml
 qt_add_executable(dkimchecktool tests/dkimchecktool.cpp
-    src/dkimverifier.cpp src/dkimverifier.h)
+    src/dkimverifier.cpp src/dkimverifier.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h)
 target_link_libraries(dkimchecktool PRIVATE
     Qt6::Core Qt6::Network KPim6::Mime PkgConfig::LIBCRYPTO)
 

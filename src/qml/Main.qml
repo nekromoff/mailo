@@ -1241,10 +1241,35 @@ Kirigami.ApplicationWindow {
                         // neither. Ctrl+F searches inside the open message;
                         // Ctrl+Shift+F searches the mailbox.
                         focusSequences: ["Ctrl+Shift+F"]
-                        onAccepted: Mail.searchMessages(text, searchFieldBox.currentIndex)
+                        function startSearch() {
+                            // Search results read from the top. Left alone, the
+                            // remapping that keeps the cursor on its message
+                            // makes the view chase it around while results
+                            // reconcile — park the cursor and stay at the top.
+                            messageList.currentIndex = -1
+                            messageList.positionViewAtBeginning()
+                            Mail.searchMessages(searchField.text, searchFieldBox.currentIndex)
+                        }
+                        // Not on every keystroke: half a beat after typing
+                        // pauses. Enter still searches immediately (accepted
+                        // fires regardless of autoAccept).
+                        autoAccept: false
+                        onAccepted: {
+                            searchDebounce.stop()
+                            startSearch()
+                        }
                         onTextChanged: {
-                            if (text.length === 0)
+                            if (text.length === 0) {
+                                searchDebounce.stop()
                                 Mail.clearSearch()
+                            } else {
+                                searchDebounce.restart()
+                            }
+                        }
+                        Timer {
+                            id: searchDebounce
+                            interval: 200
+                            onTriggered: searchField.startSearch()
                         }
                         Keys.onEscapePressed: {
                             text = ""
@@ -1253,8 +1278,18 @@ Kirigami.ApplicationWindow {
                     }
                     QQC2.ComboBox {
                         id: searchFieldBox
-                        model: ["Everything", "Subject", "From", "Body"]
-                        implicitWidth: Kirigami.Units.gridUnit * 7
+                        // From+Subject first and default: searching bodies too
+                        // ("Everything" — body, cc, all headers) is the slower,
+                        // noisier search, so it is the one you opt into.
+                        model: ["From + Subject", "Everything"]
+                        implicitWidth: Kirigami.Units.gridUnit * 8
+                        // Changing the scope IS a new query when there is text
+                        // to search — no reason to make the user press Enter
+                        // to get what they just asked for.
+                        onActivated: {
+                            if (searchField.text.length > 0)
+                                searchField.startSearch()
+                        }
                     }
 
                     // Quick filter by color mark — one square per defined
@@ -1646,6 +1681,14 @@ Kirigami.ApplicationWindow {
                                 if (messageList.currentIndex >= first)
                                     messageList.currentIndex = remap(messageList.currentIndex)
                                 messageList.selectionRev++
+                                // Results reconcile in place while a search
+                                // runs, and an insert above the viewport
+                                // re-anchors the view on the rows it was
+                                // showing — which reads as the list scrolling
+                                // by itself. Until the user picks a row, the
+                                // top of the results is the place to be.
+                                if (Mail.searching && messageList.currentIndex < 0)
+                                    Qt.callLater(() => messageList.positionViewAtBeginning())
                             }
                             function onRowsRemoved(parent, first, last) {
                                 const shift = last - first + 1
@@ -1662,6 +1705,11 @@ Kirigami.ApplicationWindow {
                                     (a >= first && a <= last) ? -1
                                     : (a > last ? a - shift : a)
                                 messageList.selectionRev++
+                                // Same top-pinning as onRowsInserted: pruning
+                                // stale rows at search completion must not
+                                // leave the view parked mid-list.
+                                if (Mail.searching && messageList.currentIndex < 0)
+                                    Qt.callLater(() => messageList.positionViewAtBeginning())
 
                                 // Keep the preview in sync with what now sits
                                 // under the cursor. If the current row itself
@@ -1964,9 +2012,40 @@ Kirigami.ApplicationWindow {
                         Kirigami.PlaceholderMessage {
                             anchors.centerIn: parent
                             width: parent.width - Kirigami.Units.gridUnit * 4
-                            visible: messageList.count === 0
+                            // Not while a search runs: an empty list then means
+                            // "no results yet", which the spinner below says.
+                            visible: messageList.count === 0 && !Mail.searching
                             text: Mail.connected ? "No messages" : "Not connected"
                             icon.name: "mail-folder-inbox"
+                        }
+
+                        // Search progress lives here in the list, not in the
+                        // status breadcrumb. LoadingPlaceholder, not the
+                        // style's BusyIndicator — Breeze draws that as a cog.
+                        Kirigami.LoadingPlaceholder {
+                            anchors.centerIn: parent
+                            width: parent.width - Kirigami.Units.gridUnit * 4
+                            visible: Mail.searching && messageList.count === 0
+                            text: "Searching…"
+                        }
+
+                        // Results are already showing and more are coming: say
+                        // so over them instead of replacing them.
+                        QQC2.Label {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.bottom: parent.bottom
+                            anchors.bottomMargin: Kirigami.Units.largeSpacing
+                            visible: Mail.searching && messageList.count > 0
+                            padding: Kirigami.Units.smallSpacing
+                            text: "Searching — " + Mail.searchFound + " found"
+                            background: Kirigami.ShadowedRectangle {
+                                radius: Kirigami.Units.cornerRadius
+                                color: Kirigami.Theme.backgroundColor
+                                border.width: 1
+                                border.color: Kirigami.ColorUtils.linearInterpolation(
+                                    Kirigami.Theme.backgroundColor,
+                                    Kirigami.Theme.textColor, 0.2)
+                            }
                         }
                     }
                 }

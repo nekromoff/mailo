@@ -4,6 +4,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QHash>
 #include <QObject>
 #include <QString>
 
@@ -16,13 +17,57 @@
  * once \a domain is checked against the From: header domain, so any UI that
  * says "verified" must require aligned == true.
  */
+/**
+ * Outcome of validating a message's ARC chain (RFC 8617).
+ *
+ * ARC exists for the case DKIM cannot survive: a mailing list rewrites the
+ * subject or appends a footer, the author's signature stops matching, and the
+ * only evidence that the message authenticated *before* the change is what the
+ * list recorded on its way through. Each hop adds a set of three headers — the
+ * authentication results it saw, a signature over the message as it forwarded
+ * it, and a seal over every ARC header so far — so the chain is tamper-evident
+ * even though the message body is not.
+ *
+ * An intact chain is emphatically not proof the message is genuine. It proves
+ * the sealers signed what they claim to have seen; believing the claim means
+ * trusting \a sealer, which is a judgement only the reader can make. Any UI
+ * built on this must name the sealer rather than reduce it to a checkmark.
+ */
+struct ArcResult {
+    enum Status {
+        None,      ///< no ARC headers at all — the ordinary case
+        Pass,      ///< every seal verified, and so did the newest signature
+        /// Every seal verified, but the newest ARC-Message-Signature did not
+        /// match our copy of the body. Kept apart from Fail for the same reason
+        /// as DkimResult::BodyMismatch: today that usually says more about our
+        /// stored octets than about the message. The seals cover only the ARC
+        /// headers, so they stay meaningful when the body hash does not.
+        SealsOnly,
+        Fail,      ///< a seal did not verify, or a hop recorded cv=fail
+        TempError, ///< DNS lookup failed; retrying later may succeed
+        PermError, ///< malformed chain, unusable key, unsupported algorithm
+    };
+
+    Status status = None;
+    QString sealer; ///< d= of the outermost seal — who is vouching for the chain
+    int sets = 0;   ///< how many hops sealed the message
+    QString detail; ///< short human-readable reason, for the tooltip
+};
+
 struct DkimResult {
     enum Status {
         None,      ///< no DKIM-Signature header at all
         Pass,      ///< at least one signature verified
         Fail,      ///< the signature did not match the published key
         TempError, ///< DNS lookup failed; retrying later may succeed
-        PermError, ///< malformed signature, unusable key, unsupported algorithm
+        PermError, ///< malformed signature, unusable key, no key published
+        /// Signed with an algorithm we will not verify — in practice rsa-sha1,
+        /// which RFC 8301 forbids because SHA-1 collisions are affordable.
+        /// Deliberately not Fail: we could compute it, but a "pass" from a
+        /// broken hash is not evidence of anything, and calling it invalid
+        /// would claim we checked something we refused to check. The honest
+        /// answer is that this signature cannot be evaluated.
+        Unsupported,
         /// The body hash did not match. Deliberately NOT Fail: this happens
         /// whenever our own copy of the message is not byte-identical to what
         /// arrived, and measured against real cached mail that is currently
@@ -40,6 +85,10 @@ struct DkimResult {
     QString selector; ///< s= of that signature
     bool aligned = false;
     QString detail; ///< short human-readable reason, for the tooltip
+    /// Only filled in when it could change what the reader is told: a signature
+    /// that already verifies and aligns needs no second opinion, and checking
+    /// anyway would spend DNS queries to say the same thing.
+    ArcResult arc;
 
     bool trustworthy() const { return status == Pass && aligned; }
 };
@@ -104,6 +153,18 @@ private:
     /// the signature is unusable before we ever need the key.
     bool prepare(const QByteArray &head, const QByteArray &body, const Signature &sig,
                  QByteArray *signedData, DkimResult *out) const;
+
+    /// RFC 8617 §5.2. Walks every ARC set from the oldest hop outwards.
+    /// \a keyCache is shared with the DKIM pass: a chain signs its message
+    /// signature and its seal with the same selector more often than not, and a
+    /// long chain would otherwise mean a DNS round trip per hop.
+    ArcResult verifyArcChain(const QByteArray &head, const QByteArray &body,
+                             QHash<QString, QByteArray> *keyCache) const;
+
+    /// DNS TXT for a `<selector>._domainkey.<domain>` record, through
+    /// \a cache. An empty result with *\a tempError false means "no such key".
+    QByteArray publicKeyRecord(const QString &dnsName, bool *tempError,
+                               QHash<QString, QByteArray> *cache) const;
 
     QByteArray m_testKeyRecord;
 };

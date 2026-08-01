@@ -115,14 +115,35 @@ Window {
         return ""
     }
 
+    /// True once a server has been spelled out — either stored with the account
+    /// or typed here. Until then the fields follow what is guessed from the
+    /// address, and stop the moment the user disagrees.
+    property bool hostPinned: false
+    property bool smtpHostPinned: false
+
+    /// The SMTP host the client falls back to when none is stored (see
+    /// MailClient::loadAccount). Kept in step with that rule so the field shows
+    /// what sending would actually use rather than leaving it to be guessed
+    /// behind the user's back.
+    function derivedSmtpHost(imapHost) {
+        const h = imapHost.trim()
+        return h.length > 0 ? h.replace(/^imap/, "smtp") : ""
+    }
+
     function loadDetails() {
         const d = Mail.accountDetails(editIndex)
+        hostPinned = (d.host ?? "") !== ""
         hostField.text = d.host ?? ""
         portField.value = d.port ?? 993
         securityBox.currentIndex = d.security ?? 0
         userField.text = d.user ?? ""
         passwordField.text = ""
-        smtpHostField.text = d.smtpHost ?? ""
+        // Accounts saved before this field existed have no SMTP host but send
+        // anyway, off the derived one — so show that instead of an empty field
+        // the Save button then refuses to accept.
+        smtpHostPinned = (d.smtpHost ?? "") !== ""
+        smtpHostField.text = smtpHostPinned ? d.smtpHost
+                                            : derivedSmtpHost(hostField.text)
         smtpPortField.value = d.smtpPort ?? 587
         smtpSecurityBox.currentIndex = d.smtpSecurity ?? 1
         authBox.currentIndex = d.authType ?? 0
@@ -404,6 +425,19 @@ Window {
                 id: userField
                 Kirigami.FormData.label: authBox.currentIndex === 0 ? "Username:" : "E-mail:"
                 placeholderText: "user@example.com"
+                // The usual shape of a provider's server names, guessed from
+                // the address so the form arrives filled in. Wrong for plenty
+                // of hosts, which is why both fields stay editable — a guess to
+                // correct beats two blanks to research.
+                onTextEdited: {
+                    const domain = text.split("@").pop().trim()
+                    if (domain.length === 0 || domain.indexOf(".") < 0)
+                        return
+                    if (!sheet.hostPinned)
+                        hostField.text = "imap." + domain
+                    if (!sheet.smtpHostPinned)
+                        smtpHostField.text = sheet.derivedSmtpHost(hostField.text)
+                }
             }
             QQC2.Label {
                 visible: authBox.currentIndex > 0
@@ -421,6 +455,15 @@ Window {
                 visible: authBox.currentIndex === 0
                 Kirigami.FormData.label: "Server:"
                 placeholderText: "imap.example.com"
+                // Follow along while setting up a new account, so the SMTP row
+                // is filled in by the time it is reached. onTextEdited, not
+                // onTextChanged: loading an account must not overwrite what it
+                // stored.
+                onTextEdited: {
+                    sheet.hostPinned = true
+                    if (!sheet.smtpHostPinned)
+                        smtpHostField.text = sheet.derivedSmtpHost(text)
+                }
             }
             QQC2.SpinBox {
                 id: portField
@@ -463,6 +506,9 @@ Window {
                 visible: authBox.currentIndex === 0
                 Kirigami.FormData.label: "SMTP server:"
                 placeholderText: "smtp.example.com"
+                // Typing here settles the question: stop mirroring the IMAP
+                // server, even if it is later corrected.
+                onTextEdited: sheet.smtpHostPinned = true
             }
             QQC2.SpinBox {
                 id: smtpPortField
@@ -814,7 +860,9 @@ Window {
                     required property int modelData
                     readonly property string keyProp: "scaleKey" + modelData
                     readonly property string colorProp: "scaleColor" + modelData
-                    Kirigami.FormData.label: "Scale " + modelData + ":"
+                    // "Scale" is what the settings keys call these (scaleColor1…5);
+                    // there is no scale to speak of, so the UI says what they are.
+                    Kirigami.FormData.label: "Label " + modelData + ":"
                     spacing: Kirigami.Units.smallSpacing
 
                     QQC2.Button {
@@ -900,7 +948,7 @@ Window {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Pressing a scale shortcut marks the selected messages "
+                text: "Pressing a label shortcut marks the selected messages "
                       + "with that color (press again to clear the mark). "
                       + "Defined colors appear next to the search bar as a "
                       + "quick filter."

@@ -18,6 +18,20 @@ static const char *statusName(DkimResult::Status s)
     case DkimResult::TempError: return "TEMPERROR";
     case DkimResult::PermError: return "PERMERROR";
     case DkimResult::BodyMismatch: return "UNVERIFIED";
+    case DkimResult::Unsupported: return "UNSUPPORTED";
+    }
+    return "?";
+}
+
+static const char *arcName(ArcResult::Status s)
+{
+    switch (s) {
+    case ArcResult::None: return "NONE";
+    case ArcResult::Pass: return "PASS";
+    case ArcResult::SealsOnly: return "SEALS-ONLY";
+    case ArcResult::Fail: return "FAIL";
+    case ArcResult::TempError: return "TEMPERROR";
+    case ArcResult::PermError: return "PERMERROR";
     }
     return "?";
 }
@@ -52,6 +66,13 @@ int main(int argc, char **argv)
                qPrintable(QFileInfo(f).fileName()), qPrintable(fromDomain),
                qPrintable(result.domain), statusName(result.status),
                qPrintable(result.detail));
+        // Only printed when there was a chain to walk: ARC runs solely for
+        // messages DKIM could not settle, so silence here is not a verdict.
+        if (result.arc.status != ArcResult::None) {
+            printf("%-16s   arc=%-10s hops=%-2d sealer=%-20s %s\n", "", arcName(result.arc.status),
+                   result.arc.sets, qPrintable(result.arc.sealer),
+                   qPrintable(result.arc.detail));
+        }
     }
     return 0;
 }

@@ -4,6 +4,7 @@
 #include "mailclient.h"
 #include "attachmentstore.h"
 #include "oauthhelper.h"
+#include "publicsuffixlist.h"
 
 #include <QClipboard>
 #include <QDesktopServices>
@@ -478,6 +479,11 @@ MailClient::MailClient(QObject *parent)
     connect(m_reading, &MessageContext::remoteContentAllowedChanged,
             this, &MailClient::remoteContentAllowedChanged);
 
+    // Before the verifier thread exists, so the list's networking belongs to
+    // the GUI thread: alignment reads it from the verifier thread, and whoever
+    // touches the singleton first decides where it lives.
+    PublicSuffixList::instance().start();
+
     // DKIM verification lives on its own thread for its whole life: the DNS
     // round trip alone would stall the GUI for as long as a resolver takes.
     qRegisterMetaType<DkimResult>();
@@ -598,6 +604,12 @@ MailClient::MailClient(QObject *parent)
     // out in the background. Deferred so it never competes with startup.
     if (m_store.attachmentMigrationPending())
         QTimer::singleShot(8000, this, [this] { startAttachmentMigration(); });
+
+    // Same idea for the search index built before diacritic folding. Deferred
+    // further than the attachment migration so the two do not fight over the
+    // write lock in the first seconds.
+    if (m_store.ftsNeedsRebuild())
+        QTimer::singleShot(15000, this, [this] { startIndexRebuild(); });
 }
 
 void MailClient::loadCachedFolderModel()
@@ -2274,6 +2286,11 @@ void MailClient::runBodyWriter()
             }
         }
         MailStore::writeBodiesOn(db, batch);
+        // A body indexed while the folded index is being built lands in the old
+        // table, and the copy may already be past that row — so queue it for
+        // the background re-indexer, which runs after the swap and heals it.
+        if (m_indexRebuildActive.loadRelaxed())
+            MailStore::queueForReindex(db, batch);
     }
     // Flush whatever is left so a quit does not lose fetched bodies.
     QList<MailStore::BodyWrite> rest;
@@ -2304,6 +2321,7 @@ MailClient::~MailClient()
 {
     // Shutdown joins five worker threads. If quitting ever hangs, these say
     // which join it is sitting in rather than leaving a silent process behind.
+    abandonLocalSearch(); // a search worker must not outlive the model it fills
     qCDebug(logTrace, "shutdown: stopping DKIM verifier");
     if (m_dkimThread) {
         m_dkimThread->quit();
@@ -2319,6 +2337,10 @@ MailClient::~MailClient()
     stopFolderOps();
     qCDebug(logTrace, "shutdown: stopping attachment migration");
     stopAttachmentMigration();
+    // Cancelled between slices, never mid-slice: the cursor is committed with
+    // each one, so the next run picks up where this leaves off.
+    qCDebug(logTrace, "shutdown: stopping index rebuild");
+    stopIndexRebuild();
     qCDebug(logTrace, "shutdown: joining reindex");
     if (m_reindexThread)
         m_reindexThread->wait();
@@ -2516,6 +2538,14 @@ void MailClient::stopAttachmentMigration()
         return;
     m_migrateCancel.storeRelaxed(1);
     m_migrateThread->wait();
+}
+
+void MailClient::stopIndexRebuild()
+{
+    if (!m_indexThread)
+        return;
+    m_indexCancel.storeRelaxed(1);
+    m_indexThread->wait();
 }
 
 /// Name fallback for servers that do not advertise RFC 6154 \All. Gmail always
@@ -3780,7 +3810,6 @@ void MailClient::searchMessages(const QString &query, int field)
             return;
         }
         m_messageModel.applyFilter(re);
-        setStatus(tr("%1 in loaded").arg(countNoun(m_messageModel.rowCount(), "match", "matches")));
         return;
     }
 
@@ -3790,37 +3819,41 @@ void MailClient::searchMessages(const QString &query, int field)
     }
 
     setBusy(true);
-    setStatus(tr("Searching"));
+    // Progress lives in the list itself (Mail.searching drives an overlay
+    // there), not in the status breadcrumb. The previous results are NOT
+    // cleared here: the search field re-fires on every keystroke, and a clear
+    // per letter flashes the list blank. New hits merge into what is showing,
+    // and rows the new query does not confirm are pruned when it completes.
+    m_searchSeen.clear();
+    m_searching = true;
+    m_searchFound = 0;
+    Q_EMIT searchingChanged();
 
-    KIMAP::Term::SearchKey key = KIMAP::Term::Text;
-    switch (field) {
-    case 1:
-        key = KIMAP::Term::Subject;
-        break;
-    case 2:
-        key = KIMAP::Term::From;
-        break;
-    case 3:
-        key = KIMAP::Term::Body;
-        break;
-    }
+    // 0 = from + subject, the default: body search drags in every newsletter
+    // that ever mentioned the word. "Everything" (1) is the opt-in.
+    const bool headersOnly = field == 0;
+    const KIMAP::Term term = headersOnly
+        ? KIMAP::Term(KIMAP::Term::Or,
+                      {KIMAP::Term(KIMAP::Term::From, trimmed),
+                       KIMAP::Term(KIMAP::Term::Subject, trimmed)})
+        : KIMAP::Term(KIMAP::Term::Text, trimmed);
 
     auto *search = new KIMAP::SearchJob(m_session);
     search->setUidBased(true);
-    search->setTerm(KIMAP::Term(key, trimmed));
-    connect(search, &KJob::result, this, [this, trimmed](KJob *job) {
+    search->setTerm(term);
+    connect(search, &KJob::result, this, [this, trimmed, headersOnly](KJob *job) {
         if (job->error()) {
             // Some servers reject SEARCH variants; fall back to local matching.
             qWarning() << "IMAP SEARCH failed:" << job->errorString();
             setBusy(false);
-            localKeywordFilter(trimmed,
-                               tr("Server search failed (%1)").arg(job->errorString()));
+            localKeywordFilter(trimmed, tr("Server search failed (%1)").arg(job->errorString()),
+                               /*append=*/false, headersOnly);
             return;
         }
         QList<qint64> uids = static_cast<KIMAP::SearchJob *>(job)->results();
         if (uids.isEmpty()) {
             setBusy(false);
-            localKeywordFilter(trimmed, tr("No server matches"));
+            localKeywordFilter(trimmed, tr("No server matches"), /*append=*/false, headersOnly);
             return;
         }
         // Newest 200 hits are plenty for a result list.
@@ -3828,40 +3861,128 @@ void MailClient::searchMessages(const QString &query, int field)
             uids = uids.mid(uids.size() - 200);
         // Merge in local partial-word hits — many servers (Gmail…) match
         // whole words only, so "hung" would otherwise miss "hungarian".
-        fetchHeadersByUids(uids, trimmed);
+        fetchHeadersByUids(uids, trimmed, headersOnly);
     });
     search->start();
 }
 
-void MailClient::localKeywordFilter(const QString &keyword, const QString &reason)
+void MailClient::localKeywordFilter(const QString &keyword, const QString &reason, bool append,
+                                    bool headersOnly)
 {
-    // Full-text index first (covers subjects, senders and cached bodies).
-    const auto hits = m_store.search(m_selectedFolder, keyword);
-    if (!hits.isEmpty()) {
-        m_oldestFetchedSeq = 1; // result list is complete; no load-more
-        m_messageModel.setHeaders(hits);
-        setStatus(tr("%1 — %2 in local index").arg(reason, countNoun(hits.size(), "match", "matches")));
-        return;
+    // The substring pass walks the folder's whole date index, which on a large
+    // mailbox is far past a frame's worth of work — so it runs on a worker and
+    // hands rows over in batches. The list fills in while it goes rather than
+    // staying frozen and then appearing all at once.
+    const quint64 seq = m_searchSeq.fetchAndAddOrdered(1) + 1;
+    const QString scopedFolder = m_store.scopedKey(m_selectedFolder);
+    const bool fts = m_store.ftsAvailable();
+    const QString connection = QStringLiteral("mailstore-search-%1").arg(seq);
+
+    // Shared with the worker: what it has delivered so far, so the finish
+    // handler can tell "no matches" from "matches already on screen" without
+    // asking the model (which may hold server hits too).
+    auto delivered = std::make_shared<QAtomicInt>(0);
+    if (!m_searching) {
+        m_searching = true;
+        m_searchFound = append ? m_messageModel.rowCount() : 0;
+        Q_EMIT searchingChanged();
     }
-    const QRegularExpression re(QRegularExpression::escape(keyword),
-                                QRegularExpression::CaseInsensitiveOption);
-    m_messageModel.applyFilter(re);
-    setStatus(tr("%1 — %2 in loaded")
-                  .arg(reason, countNoun(m_messageModel.rowCount(), "local match", "local matches")));
+
+    auto *thread = QThread::create([this, seq, scopedFolder, keyword, fts, connection, delivered,
+                                    headersOnly] {
+        QSqlDatabase db = MailStore::openWorkerConnection(connection);
+        if (db.isOpen()) {
+            MailStore::searchOn(
+                db, scopedFolder, keyword, fts,
+                [this, seq, delivered](const QList<MessageListModel::Header> &batch) -> bool {
+                    if (m_searchSeq.loadAcquire() != seq)
+                        return false; // nobody is waiting for this any more
+                    delivered->fetchAndAddOrdered(batch.size());
+                    // Queued, never blocking: both passes are capped at 200
+                    // rows, so this is a handful of posts and there is nothing
+                    // to throttle — while a worker blocking on the GUI thread
+                    // would be a deadlock waiting for a shutdown to happen.
+                    // Append-only: the list was cleared once when the search
+                    // started, and every batch after that inserts sorted rows
+                    // in place. Never a reset mid-search — a reset blanks the
+                    // view for a frame and reads as flashing.
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, seq, batch] {
+                            if (m_searchSeq.loadAcquire() != seq)
+                                return;
+                            m_oldestFetchedSeq = 1; // results are not a page of the folder
+                            m_messageModel.appendHeaders(batch);
+                            for (const auto &h : batch)
+                                m_searchSeen.insert(h.uid);
+                            m_searchFound = int(m_searchSeen.size());
+                            Q_EMIT searchingChanged();
+                        },
+                        Qt::QueuedConnection);
+                    return m_searchSeq.loadAcquire() == seq;
+                },
+                headersOnly);
+            db.close();
+        }
+        QSqlDatabase::removeDatabase(connection);
+    });
+    connect(thread, &QThread::finished, this,
+            [this, thread, seq, keyword, reason, delivered, append] {
+                thread->deleteLater();
+                if (m_searchSeq.loadAcquire() != seq)
+                    return; // superseded; whoever replaced us owns the status line
+                setBusy(false);
+                m_searching = false;
+                pruneSearchResults();
+                m_searchFound = m_messageModel.rowCount();
+                Q_EMIT searchingChanged();
+                if (delivered->loadAcquire() > 0)
+                    return;
+                if (append)
+                    return; // server hits stand on their own
+                // Nothing in the index: fall back to filtering what is loaded.
+                const QRegularExpression re(QRegularExpression::escape(keyword),
+                                            QRegularExpression::CaseInsensitiveOption);
+                m_messageModel.applyFilter(re);
+            });
+    // Below the UI's own work: typing the next letter must not wait for this.
+    thread->start(QThread::LowPriority);
+}
+
+/// Drops rows the just-finished search did not deliver. Runs only at
+/// completion: mid-search the old rows are still being confirmed one batch at
+/// a time, and pruning early would re-introduce the per-keystroke blanking
+/// this exists to avoid.
+void MailClient::pruneSearchResults()
+{
+    if (!m_searchActive)
+        return;
+    QList<qint64> stale;
+    const QList<qint64> uids = m_messageModel.allUids();
+    for (qint64 uid : uids) {
+        if (!m_searchSeen.contains(uid))
+            stale.append(uid);
+    }
+    if (!stale.isEmpty())
+        m_messageModel.removeByUids(stale);
 }
 
 void MailClient::clearSearch()
 {
     m_searchActive = false;
+    abandonLocalSearch(); // its rows would land in the folder we are restoring
+    if (m_searching) {
+        m_searching = false;
+        Q_EMIT searchingChanged();
+    }
     m_messageModel.applyFilter(QRegularExpression());
     if (!m_selectedFolder.isEmpty() && m_connected)
         openFolder(m_selectedFolder);
 }
 
-void MailClient::fetchHeadersByUids(const QList<qint64> &uids,
-                                    const QString &localMergeKeyword)
+void MailClient::fetchHeadersByUids(const QList<qint64> &uids, const QString &localMergeKeyword,
+                                    bool headersOnly)
 {
-    setStatus(tr("Fetching results"));
 
     KIMAP::ImapSet set;
     for (qint64 uid : uids)
@@ -3884,19 +4005,33 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids,
                 }
             });
 
-    connect(fetch, &KJob::result, this, [this, headers, localMergeKeyword](KJob *job) {
+    connect(fetch, &KJob::result, this,
+            [this, headers, localMergeKeyword, headersOnly](KJob *job) {
         setBusy(false);
         if (job->error()) {
             setStatus(tr("Fetching results failed"));
+            m_searching = false;
+            Q_EMIT searchingChanged();
             Q_EMIT errorOccurred(job->errorString());
             return;
         }
         m_oldestFetchedSeq = 1; // disable load-more while showing results
-        m_messageModel.setHeaders(*headers);
-        if (!localMergeKeyword.isEmpty())
-            m_messageModel.appendHeaders(
-                m_store.search(m_selectedFolder, localMergeKeyword));
-        setStatus(countNoun(m_messageModel.rowCount(), "search result", "search results"));
+        // Append, not set: a reset would blank the rows already showing.
+        m_messageModel.appendHeaders(*headers);
+        for (const auto &h : *headers)
+            m_searchSeen.insert(h.uid);
+        m_searchFound = int(m_searchSeen.size());
+        // Local partial-word hits are topped up afterwards, on a worker: the
+        // server's answer is already on screen and must not wait for ours.
+        // Only that top-up ends the searching state; without one it ends here.
+        if (!localMergeKeyword.isEmpty()) {
+            localKeywordFilter(localMergeKeyword, tr("Search results"), /*append=*/true,
+                               headersOnly);
+        } else {
+            m_searching = false;
+            pruneSearchResults();
+        }
+        Q_EMIT searchingChanged();
     });
     fetch->start();
 }
@@ -4811,6 +4946,9 @@ void MailClient::startDkimVerification(MessageContext *ctx)
 {
     ctx->m_dkimStatus.clear();
     ctx->m_dkimDetail.clear();
+    ctx->m_arcStatus.clear();
+    ctx->m_arcSealer.clear();
+    ctx->m_arcDetail.clear();
     ctx->m_dkimTrusted = false;
     ctx->m_dkimChecking = false;
     ctx->m_dkimAttempt = 0;
@@ -4914,11 +5052,45 @@ void MailClient::applyDkimResult(quint64 requestId, const DkimResult &result)
         // being byte-exact, and today it is usually the latter.
         ctx->m_dkimStatus = QStringLiteral("unverified");
         break;
+    case DkimResult::Unsupported:
+        // An obsolete algorithm is not a broken signature — it is one we
+        // declined to give an opinion on. Saying "invalid" would be a claim we
+        // did not earn.
+        ctx->m_dkimStatus = QStringLiteral("unsupported");
+        break;
     }
     qCDebug(logTrace) << "dkim: uid" << ctx->m_uid << "verdict" << ctx->m_dkimStatus
                       << "d=" << result.domain << "aligned" << result.aligned
                       << "-" << result.detail;
     ctx->m_dkimDetail = result.detail;
+
+    // ARC is only run when DKIM could not settle the question, so an empty
+    // status here means "not asked", not "no chain".
+    switch (result.arc.status) {
+    case ArcResult::None:
+        ctx->m_arcStatus = QStringLiteral("none");
+        break;
+    case ArcResult::Pass:
+        ctx->m_arcStatus = QStringLiteral("pass");
+        break;
+    case ArcResult::SealsOnly:
+        ctx->m_arcStatus = QStringLiteral("sealsonly");
+        break;
+    case ArcResult::Fail:
+        ctx->m_arcStatus = QStringLiteral("fail");
+        break;
+    case ArcResult::TempError:
+    case ArcResult::PermError:
+        // Nothing was established either way; the reason is in the tooltip.
+        ctx->m_arcStatus = QStringLiteral("error");
+        break;
+    }
+    ctx->m_arcSealer = result.arc.sealer;
+    ctx->m_arcDetail = result.arc.detail;
+    if (result.arc.status != ArcResult::None) {
+        qCDebug(logTrace) << "arc: uid" << ctx->m_uid << "status" << ctx->m_arcStatus << "sealer"
+                          << result.arc.sealer << "hops" << result.arc.sets;
+    }
     ctx->m_dkimTrusted = result.trustworthy();
     // Still "checking" while a retry is pending — we have not given up yet.
     ctx->m_dkimChecking = retrying;
@@ -5087,4 +5259,75 @@ void MailClient::openMessageInWindow(int row)
     m_detachPending = true;
     m_detachUid = uid;
     fetchMessage(row);
+}
+
+/// Copies the FTS index into one whose tokenizer folds diacritics, so "ave"
+/// finds "ávé". A tokenizer cannot be changed in place, and the copy is as big
+/// as the mail behind it, so it runs in slices on a worker with the cursor
+/// persisted after every slice: quitting resumes rather than restarts. The
+/// window refuses to close while it runs, because the swap at the end is what
+/// makes the work count.
+void MailClient::startIndexRebuild()
+{
+    if (m_indexThread || m_reclaiming || !m_store.ftsNeedsRebuild())
+        return;
+    m_indexCancel.storeRelaxed(0);
+    m_indexRebuildActive.storeRelaxed(1);
+    m_indexRebuilding = true;
+    m_indexPercent = 0;
+    Q_EMIT indexRebuildChanged();
+
+    m_indexThread = QThread::create([this] {
+        QSqlDatabase db = MailStore::openWorkerConnection(QStringLiteral("mailstore-ftsdia"));
+        if (!db.isOpen())
+            return;
+        bool ok = MailStore::beginFtsRebuild(db);
+        const qint64 total = qMax<qint64>(1, MailStore::indexedMessageCount(db));
+        qint64 cursor = MailStore::ftsRebuildCursor(db);
+        qint64 copied = 0;
+        while (ok && !m_indexCancel.loadRelaxed()) {
+            const int n = MailStore::copyFtsChunk(db, &cursor, 500);
+            if (n < 0) {
+                ok = false;
+                break;
+            }
+            if (n == 0) {
+                ok = MailStore::finishFtsRebuild(db);
+                break;
+            }
+            copied += n;
+            const int percent = int(qMin<qint64>(99, copied * 100 / total));
+            QMetaObject::invokeMethod(this, [this, percent] {
+                if (percent == m_indexPercent)
+                    return;
+                m_indexPercent = percent;
+                setStatus(tr("Rebuilding the search index — %1%").arg(percent));
+                Q_EMIT indexRebuildChanged();
+            }, Qt::QueuedConnection);
+            // Yield the write lock between slices, exactly as the attachment
+            // migration does: the user's own writes must never queue behind us.
+            QThread::msleep(25);
+        }
+        const bool finished = ok && !m_indexCancel.loadRelaxed();
+        db.close();
+        QSqlDatabase::removeDatabase(QStringLiteral("mailstore-ftsdia"));
+        m_indexRebuildActive.storeRelaxed(0);
+        QMetaObject::invokeMethod(this, [this, finished] {
+            m_indexRebuilding = false;
+            m_indexPercent = finished ? 100 : 0;
+            Q_EMIT indexRebuildChanged();
+            if (finished) {
+                // The store's own connection still points at the table that was
+                // just swapped out; it reopens with the new one on next start.
+                setStatus(tr("Search index rebuilt — accents are ignored from the next start"));
+            }
+            if (m_quitAfterIndex)
+                Q_EMIT closeRequested();
+        }, Qt::QueuedConnection);
+    });
+    connect(m_indexThread, &QThread::finished, this, [this] {
+        m_indexThread->deleteLater();
+        m_indexThread = nullptr;
+    });
+    m_indexThread->start(QThread::LowestPriority);
 }

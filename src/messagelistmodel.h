@@ -86,6 +86,9 @@ public:
     void setColorLabel(qint64 uid, int color);
     /// Drops the given uids from the model (visible and hidden lists).
     void removeByUids(const QList<qint64> &uids);
+    /// Every uid held, visible or filtered out — the reconcile pass after a
+    /// search uses this to find rows the new query no longer justifies.
+    QList<qint64> allUids() const;
 
     /// Show only rows whose subject or sender matches; empty pattern clears.
     void applyFilter(const QRegularExpression &pattern);

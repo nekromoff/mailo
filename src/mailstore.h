@@ -196,7 +196,43 @@ public:
 
     /// Local keyword search inside one folder; matches partial words too
     /// (FTS5 prefix query plus a substring scan over subject/sender).
+    /// Blocking, and on a large folder the substring pass is not fast — callers
+    /// on the GUI thread should use searchOn() on a worker instead.
     QList<MessageListModel::Header> search(const QString &folder, const QString &keyword);
+
+    /// Receives search hits in batches as they are found; returning false
+    /// abandons the search (a newer query, a folder switch, shutdown).
+    using SearchSink = std::function<bool(const QList<MessageListModel::Header> &)>;
+
+    /// search(), on a worker thread's connection, delivering as it goes.
+    /// \a scopedFolder is what scopedKey() returns for the folder.
+    /// \a headersOnly limits the full-text pass to sender and subject.
+    static void searchOn(QSqlDatabase &db, const QString &scopedFolder, const QString &keyword,
+                         bool ftsAvailable, const SearchSink &deliver, bool headersOnly = false);
+
+    /// Whether the FTS index exists — searchOn() takes this as a parameter
+    /// because it cannot ask the instance from a worker thread.
+    bool ftsAvailable() const { return m_ftsAvailable; }
+
+    /// True when the search index was built before diacritic folding, so
+    /// "ave" does not find "ávé". An fts5 tokenizer cannot be changed in
+    /// place; the index has to be copied into a new table. Noted at open(),
+    /// carried out by MailClient on a worker.
+    bool ftsNeedsRebuild() const { return m_ftsRebuildNeeded; }
+    /// Creates the folded index if it is not there yet.
+    static bool beginFtsRebuild(QSqlDatabase &db);
+    /// Where a previous run stopped (0 = nothing copied yet).
+    static qint64 ftsRebuildCursor(QSqlDatabase &db);
+    /// Copies up to \a limit rows past \a cursor, advancing it. Returns the
+    /// number copied, 0 when the old index is exhausted, -1 on failure.
+    static int copyFtsChunk(QSqlDatabase &db, qint64 *cursor, int limit);
+    /// Swaps the folded index in for the old one. Returns false if the swap
+    /// failed, in which case the old index is untouched and still usable.
+    static bool finishFtsRebuild(QSqlDatabase &db);
+    /// Queues the given bodies for background re-indexing (fts_pending).
+    static void queueForReindex(QSqlDatabase &db, const QList<BodyWrite> &batch);
+    /// Rough denominator for rebuild progress.
+    static qint64 indexedMessageCount(QSqlDatabase &db);
 
     /// A cached body whose text still has to be (re)indexed for search.
     struct PendingBody {
@@ -254,4 +290,5 @@ private:
     QSqlDatabase m_db;
     QString m_accountKey;
     bool m_ftsAvailable = false;
+    bool m_ftsRebuildNeeded = false; ///< index predates diacritic folding
 };

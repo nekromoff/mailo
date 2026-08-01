@@ -199,11 +199,27 @@ bool MailStore::open()
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_date"
                           " ON messages(folder, date DESC, uid DESC)"));
 
+    // remove_diacritics 2 folds accents in both the index and the query, so
+    // "ave" finds "ávé" — the default (1) leaves several Latin ranges alone.
     m_ftsAvailable = q.exec(QStringLiteral(
         "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5("
-        " subject, sender, body, folder UNINDEXED, uid UNINDEXED)"));
+        " subject, sender, body, folder UNINDEXED, uid UNINDEXED,"
+        " tokenize = \"unicode61 remove_diacritics 2\")"));
     if (!m_ftsAvailable)
         qWarning() << "mailstore: FTS5 unavailable:" << q.lastError().text();
+
+    // An index built before that option folds nothing, and there is no way to
+    // change a tokenizer in place — it has to be rebuilt. Only noted here;
+    // doing it costs a pass over the whole index and belongs on a worker.
+    if (m_ftsAvailable) {
+        QSqlQuery schema(m_db);
+        if (schema.exec(QStringLiteral(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts'"))
+            && schema.next()) {
+            m_ftsRebuildNeeded =
+                !schema.value(0).toString().contains(QLatin1String("remove_diacritics 2"));
+        }
+    }
 
     // One-time rebuild keying every fts row by its messages.rowid. folder/uid
     // are UNINDEXED in fts5, so per-message maintenance filtered on them was
@@ -1619,13 +1635,33 @@ QList<MessageListModel::Header> MailStore::search(const QString &folder,
                                                   const QString &keyword)
 {
     QList<MessageListModel::Header> out;
-    if (!m_db.isOpen() || keyword.trimmed().isEmpty())
+    if (!m_db.isOpen())
         return out;
     SlowGuard guard("search");
-    const QString key = scoped(folder);
-    QSet<qint64> seen;
+    searchOn(m_db, scoped(folder), keyword, m_ftsAvailable,
+             [&out](const QList<MessageListModel::Header> &batch) {
+                 out += batch;
+                 return true;
+             });
+    return out;
+}
 
-    const auto readRows = [&out, &seen](QSqlQuery &q) {
+void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QString &keyword,
+                         bool ftsAvailable, const SearchSink &deliver, bool headersOnly)
+{
+    if (!db.isOpen() || keyword.trimmed().isEmpty())
+        return;
+    QSet<qint64> seen;
+    bool cancelled = false;
+
+    // Handed over in batches rather than at the end: the two passes below walk
+    // an index that may hold a hundred thousand rows for the folder, and the
+    // reader wants the first names on screen while that is still going. The
+    // sink returns false to abandon a search whose answer nobody is waiting for
+    // any more — a newer query, or a folder switch.
+    constexpr int kBatch = 10;
+    const auto readRows = [&](QSqlQuery &q) {
+        QList<MessageListModel::Header> batch;
         while (q.next()) {
             MessageListModel::Header h;
             h.uid = q.value(0).toLongLong();
@@ -1640,32 +1676,51 @@ QList<MessageListModel::Header> MailStore::search(const QString &folder,
             h.authInfo = q.value(6).toString();
             h.attachKind = q.value(7).toInt();
             h.colorLabel = q.value(8).toInt();
-            out.append(h);
+            batch.append(h);
+            if (batch.size() < kBatch)
+                continue;
+            if (!deliver(batch)) {
+                cancelled = true;
+                return;
+            }
+            batch.clear();
         }
+        if (!batch.isEmpty() && !deliver(batch))
+            cancelled = true;
     };
 
-    if (m_ftsAvailable) {
-        QSqlQuery q(m_db);
+    if (ftsAvailable) {
+        QSqlQuery q(db);
+        // MATCH must be a one-shot subquery, not a JOIN: with the join, the
+        // planner put messages on the outside and re-ran the whole FTS query
+        // for every row of the folder — tens of seconds where this form is
+        // milliseconds (EXPLAIN: LIST SUBQUERY vs SCAN f per row).
         q.prepare(QStringLiteral(
             "SELECT m.uid, m.subject, m.sender, m.date, m.seen, m.suspicious, m.auth, m.attach,"
-            " m.color FROM messages m JOIN fts f ON m.rowid = f.rowid"
-            " WHERE fts MATCH ? AND m.folder = ? ORDER BY m.date DESC LIMIT 200"));
+            " m.color FROM messages m"
+            " WHERE m.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)"
+            " AND m.folder = ? ORDER BY m.date DESC LIMIT 200"));
         // Quote as a literal phrase so FTS5 operators in user input can't
         // break it; the trailing * makes it a prefix query, so partial words
         // match too ("hung" finds "hungarian").
         QString phrase = keyword;
         phrase.replace(QLatin1Char('"'), QStringLiteral("\"\""));
-        q.addBindValue(QStringLiteral("\"%1\"*").arg(phrase));
-        q.addBindValue(key);
+        // {subject sender} is fts5's column filter — body stays out of the
+        // match when only headers are wanted.
+        q.addBindValue(headersOnly ? QStringLiteral("{subject sender} : \"%1\"*").arg(phrase)
+                                   : QStringLiteral("\"%1\"*").arg(phrase));
+        q.addBindValue(scopedFolder);
         if (q.exec())
             readRows(q);
         else
             qWarning() << "mailstore: fts search failed:" << q.lastError().text();
     }
+    if (cancelled)
+        return;
 
     // Substring pass over subject/sender — catches word-internal fragments
     // the token-based FTS index cannot ("gari" inside "hungarian").
-    QSqlQuery like(m_db);
+    QSqlQuery like(db);
     like.prepare(QStringLiteral(
         "SELECT uid, subject, sender, date, seen, suspicious, auth, attach, color FROM messages"
         " WHERE folder = ? AND (subject LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\')"
@@ -1675,10 +1730,128 @@ QList<MessageListModel::Header> MailStore::search(const QString &folder,
     escaped.replace(QLatin1Char('%'), QStringLiteral("\\%"));
     escaped.replace(QLatin1Char('_'), QStringLiteral("\\_"));
     const QString pattern = QLatin1Char('%') + escaped + QLatin1Char('%');
-    like.addBindValue(key);
+    like.addBindValue(scopedFolder);
     like.addBindValue(pattern);
     like.addBindValue(pattern);
     if (like.exec())
         readRows(like);
-    return out;
+}
+
+// --- Diacritics-folding index rebuild --------------------------------------
+//
+// The tokenizer of an fts5 table is fixed at creation, so teaching the index to
+// ignore accents means building a second one and swapping it in. It is done in
+// slices on a worker, with the cursor persisted, because the index is as large
+// as the mail that produced it: a single statement would hold the write lock
+// for minutes and quitting halfway would throw the work away.
+
+bool MailStore::beginFtsRebuild(QSqlDatabase &db)
+{
+    QSqlQuery q(db);
+    if (!q.exec(QStringLiteral(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_dia USING fts5("
+            " subject, sender, body, folder UNINDEXED, uid UNINDEXED,"
+            " tokenize = \"unicode61 remove_diacritics 2\")"))) {
+        qWarning() << "mailstore: cannot create the folded index:" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+qint64 MailStore::ftsRebuildCursor(QSqlDatabase &db)
+{
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("SELECT value FROM meta_values WHERE key = 'fts_dia_cursor'"));
+    return (q.exec() && q.next()) ? q.value(0).toLongLong() : 0;
+}
+
+int MailStore::copyFtsChunk(QSqlDatabase &db, qint64 *cursor, int limit)
+{
+    // Copied out of the old index rather than re-derived from the messages and
+    // bodies: the body column holds text that cost a MIME parse to produce, and
+    // re-extracting it for every cached message would turn minutes into days.
+    QSqlQuery read(db);
+    read.prepare(QStringLiteral(
+        "SELECT rowid, subject, sender, body, folder, uid FROM fts"
+        " WHERE rowid > ? ORDER BY rowid LIMIT ?"));
+    read.addBindValue(*cursor);
+    read.addBindValue(limit);
+    if (!read.exec()) {
+        qWarning() << "mailstore: index rebuild read failed:" << read.lastError().text();
+        return -1;
+    }
+
+    db.transaction();
+    QSqlQuery write(db);
+    write.prepare(QStringLiteral(
+        "INSERT INTO fts_dia (rowid, subject, sender, body, folder, uid)"
+        " VALUES (?, ?, ?, ?, ?, ?)"));
+    int copied = 0;
+    qint64 last = *cursor;
+    while (read.next()) {
+        last = read.value(0).toLongLong();
+        write.addBindValue(last);
+        write.addBindValue(read.value(1));
+        write.addBindValue(read.value(2));
+        write.addBindValue(read.value(3));
+        write.addBindValue(read.value(4));
+        write.addBindValue(read.value(5));
+        if (!write.exec()) {
+            qWarning() << "mailstore: index rebuild write failed:" << write.lastError().text();
+            db.rollback();
+            return -1;
+        }
+        ++copied;
+    }
+    QSqlQuery mark(db);
+    mark.prepare(QStringLiteral(
+        "INSERT OR REPLACE INTO meta_values (key, value) VALUES ('fts_dia_cursor', ?)"));
+    mark.addBindValue(QString::number(last));
+    mark.exec();
+    db.commit();
+    *cursor = last;
+    return copied;
+}
+
+bool MailStore::finishFtsRebuild(QSqlDatabase &db)
+{
+    // One transaction for the swap itself: at no point may a reader find the
+    // search index missing.
+    db.transaction();
+    QSqlQuery q(db);
+    const bool ok = q.exec(QStringLiteral("DROP TABLE fts"))
+        && q.exec(QStringLiteral("ALTER TABLE fts_dia RENAME TO fts"))
+        && q.exec(QStringLiteral("DELETE FROM meta_values WHERE key = 'fts_dia_cursor'"));
+    if (!ok) {
+        qWarning() << "mailstore: index swap failed, keeping the old index:"
+                   << q.lastError().text();
+        db.rollback();
+        return false;
+    }
+    db.commit();
+    return true;
+}
+
+qint64 MailStore::indexedMessageCount(QSqlDatabase &db)
+{
+    QSqlQuery q(db);
+    // messages, not fts: counting an fts5 table means walking its own storage,
+    // and this is only the denominator of a percentage.
+    return (q.exec(QStringLiteral("SELECT count(*) FROM messages")) && q.next())
+        ? q.value(0).toLongLong()
+        : 0;
+}
+
+void MailStore::queueForReindex(QSqlDatabase &db, const QList<BodyWrite> &batch)
+{
+    if (!db.isOpen() || batch.isEmpty())
+        return;
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO fts_pending (folder, uid) VALUES (?, ?)"));
+    for (const BodyWrite &w : batch) {
+        q.addBindValue(w.scopedFolder);
+        q.addBindValue(w.uid);
+        q.exec();
+    }
 }

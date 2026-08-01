@@ -381,3 +381,12 @@ void MessageListModel::markSeen(int row)
     const QModelIndex idx = index(row);
     Q_EMIT dataChanged(idx, idx, {SeenRole});
 }
+
+QList<qint64> MessageListModel::allUids() const
+{
+    QList<qint64> uids;
+    uids.reserve(m_all.size());
+    for (const Header &h : m_all)
+        uids.append(h.uid);
+    return uids;
+}

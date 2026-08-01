@@ -65,6 +65,15 @@ class MessageContext : public QObject
     Q_PROPERTY(bool dkimTrusted READ dkimTrusted NOTIFY dkimChanged)
     /// True between opening the message and the verifier answering.
     Q_PROPERTY(bool dkimChecking READ dkimChecking NOTIFY dkimChanged)
+    /// ARC chain validation (RFC 8617), checked only when DKIM could not give
+    /// the reader an answer to rely on. "" when not checked, otherwise one of
+    /// none/pass/sealsonly/fail/error.
+    Q_PROPERTY(QString arcStatus READ arcStatus NOTIFY dkimChanged)
+    /// Domain of the outermost seal — the party whose word the chain rests on.
+    /// A chain says nothing on its own; it says what this domain vouches for.
+    Q_PROPERTY(QString arcSealer READ arcSealer NOTIFY dkimChanged)
+    /// Short human-readable reason, for the tooltip.
+    Q_PROPERTY(QString arcDetail READ arcDetail NOTIFY dkimChanged)
 
 public:
     explicit MessageContext(MailClient *client);
@@ -86,6 +95,9 @@ public:
     QString dkimDetail() const { return m_dkimDetail; }
     bool dkimTrusted() const { return m_dkimTrusted; }
     bool dkimChecking() const { return m_dkimChecking; }
+    QString arcStatus() const { return m_arcStatus; }
+    QString arcSealer() const { return m_arcSealer; }
+    QString arcDetail() const { return m_arcDetail; }
 
     // View URLs for the HTML / Text / Source toggle (this message's, always —
     // independent of what the reading pane shows).
@@ -143,6 +155,9 @@ private:
 
     QString m_dkimStatus;
     QString m_dkimDetail;
+    QString m_arcStatus;
+    QString m_arcSealer;
+    QString m_arcDetail;
     bool m_dkimTrusted = false;
     bool m_dkimChecking = false;
     int m_dkimAttempt = 0; ///< DNS retries used for this message so far

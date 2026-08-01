@@ -189,10 +189,8 @@ ColumnLayout {
         QQC2.Label { text: "From:"; opacity: 0.8 }
         RowLayout {
             Layout.fillWidth: true
-            QQC2.Label {
+            SelectableValue {
                 id: fromLabel
-                Layout.fillWidth: true
-                elide: Text.ElideRight
                 text: viewer.context ? viewer.context.from : ""
             }
             // Explicit arrow glyphs — theme icons for reply/forward are not
@@ -228,26 +226,36 @@ ColumnLayout {
                 QQC2.ToolTip.text: "Allow this message to load remote images, styles and fonts (JavaScript stays off)"
                 QQC2.ToolTip.visible: hovered
             }
-            QQC2.Label {
+            SelectableValue {
                 id: dateLabel
+                // Fixed trailing item: it is short enough to always fit, so it
+                // keeps its own width instead of competing for the row's.
+                Layout.fillWidth: false
+                Layout.preferredWidth: -1
                 opacity: 0.8
                 text: viewer.context ? viewer.context.date : ""
             }
         }
 
-        QQC2.Label { text: "To:"; opacity: 0.8 }
-        QQC2.Label {
+        // Captions stay on the first line of a recipient list that unfolds.
+        QQC2.Label { text: "To:"; opacity: 0.8; Layout.alignment: Qt.AlignTop }
+        ExpandableValue {
             id: toLabel
-            Layout.fillWidth: true
-            elide: Text.ElideRight
+            // Lines the caret up under the date: the From row and this one are
+            // the same grid column, so the date's x is the same offset here.
+            caretX: dateLabel.x
             text: viewer.context ? viewer.context.to : ""
         }
 
-        QQC2.Label { text: "Cc:"; opacity: 0.8; visible: ccLabel.text.length > 0 }
         QQC2.Label {
+            text: "Cc:"
+            opacity: 0.8
+            Layout.alignment: Qt.AlignTop
+            visible: ccLabel.text.length > 0
+        }
+        ExpandableValue {
             id: ccLabel
-            Layout.fillWidth: true
-            elide: Text.ElideRight
+            caretX: dateLabel.x
             visible: text.length > 0
             text: viewer.context ? viewer.context.cc : ""
         }
@@ -257,11 +265,9 @@ ColumnLayout {
             Layout.fillWidth: true
             spacing: Kirigami.Units.smallSpacing
 
-            QQC2.Label {
+            SelectableValue {
                 id: subjectLabel
-                Layout.fillWidth: true
                 font.bold: true
-                elide: Text.ElideRight
                 text: viewer.context
                       ? (viewer.context.subject.length > 0 ? viewer.context.subject
                                                            : (viewer.hasMessage ? "(no subject)" : ""))
@@ -295,7 +301,8 @@ ColumnLayout {
             id: authRow
             Layout.fillWidth: true
             spacing: Kirigami.Units.largeSpacing
-            visible: dkimLabel.text.length > 0 || serverAuthLabel.text.length > 0
+            visible: dkimLabel.text.length > 0 || arcLabel.text.length > 0
+                     || serverAuthLabel.text.length > 0
 
             // What *we* verified, cryptographically. Deliberately separate from
             // the server's say-so next to it: one is a signature checked against
@@ -335,6 +342,10 @@ ColumnLayout {
                         return "✗ DKIM signature invalid"
                     case "temperror":
                         return "DKIM not checked"
+                    case "unsupported":
+                        // Neither verified nor broken: obsolete crypto we will
+                        // not lend credibility to by checking it.
+                        return "⚠ DKIM uses obsolete crypto"
                     case "unverified":
                         // Body hash mismatch. We cannot tell tampering from our
                         // own copy not being byte-exact, so we do not accuse.
@@ -343,10 +354,59 @@ ColumnLayout {
                         return "" // no signature at all — say nothing
                     }
                 }
-                QQC2.ToolTip.text: viewer.context ? viewer.context.dkimDetail : ""
-                QQC2.ToolTip.visible: dkimHover.hovered && viewer.context
-                                      && viewer.context.dkimDetail.length > 0
                 HoverHandler { id: dkimHover }
+                HoverToolTip {
+                    hover: dkimHover
+                    markFailures: true
+                    text: viewer.context ? viewer.context.dkimDetail : ""
+                }
+            }
+
+            // Kept apart from both neighbours on purpose. DKIM says whether the
+            // author's own signature holds; this says whether the hops that
+            // carried the message left an unbroken trail — which is worth
+            // exactly as much as the reader's trust in the domain named in it,
+            // so the sealer is always shown rather than reduced to a tick.
+            QQC2.Label {
+                id: arcLabel
+                visible: text.length > 0
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                font.bold: viewer.context && viewer.context.arcStatus === "fail"
+                color: {
+                    if (!viewer.context)
+                        return Kirigami.Theme.textColor
+                    if (viewer.context.arcStatus === "fail")
+                        return Kirigami.Theme.negativeTextColor
+                    // Never positive-coloured: an intact chain is a claim by a
+                    // third party, not verification of the sender.
+                    return Kirigami.Theme.textColor
+                }
+                text: {
+                    if (!viewer.context || viewer.context.dkimChecking)
+                        return ""
+                    const sealer = viewer.context.arcSealer
+                    switch (viewer.context.arcStatus) {
+                    case "pass":
+                        return "ARC intact via " + sealer
+                    case "sealsonly":
+                        // Seals held, body could not be checked — say the
+                        // weaker thing, not the stronger one.
+                        return "ARC chain intact via " + sealer
+                    case "fail":
+                        return "✗ ARC chain broken"
+                    case "error":
+                        return "ARC not checked"
+                    default:
+                        return "" // no chain, or never asked
+                    }
+                }
+                HoverHandler { id: arcHover }
+                HoverToolTip {
+                    hover: arcHover
+                    markFailures: true
+                    text: viewer.context && viewer.context.arcDetail.length > 0
+                        ? "Forwarding hops (ARC):\n" + viewer.context.arcDetail : ""
+                }
             }
 
             QQC2.Label {
@@ -357,11 +417,13 @@ ColumnLayout {
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 text: viewer.context ? viewer.condenseAuth(viewer.context.authInfo) : ""
-                QQC2.ToolTip.text: viewer.context
-                    ? "Reported by the receiving server:\n" + viewer.context.authInfo : ""
-                QQC2.ToolTip.visible: serverAuthHover.hovered && viewer.context
-                                      && viewer.context.authInfo.length > 0
                 HoverHandler { id: serverAuthHover }
+                HoverToolTip {
+                    hover: serverAuthHover
+                    markFailures: true
+                    text: viewer.context && viewer.context.authInfo.length > 0
+                        ? "Reported by the receiving server:\n" + viewer.context.authInfo : ""
+                }
             }
         }
     }

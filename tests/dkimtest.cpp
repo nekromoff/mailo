@@ -9,6 +9,7 @@
 // Exit 0 = all vectors match.
 
 #include "../src/dkimverifier.h"
+#include "../src/publicsuffixlist.h"
 
 #include <QByteArray>
 #include <cstdio>
@@ -71,6 +72,41 @@ int main()
     check("example body", DkimCanon::bodySimple(body), " C \r\nD \t E\r\n");
     check("empty body", DkimCanon::bodySimple(""), "\r\n");
     check("no trailing CRLF gains one", DkimCanon::bodySimple("x"), "x\r\n");
+
+    // The other half of "quietly wrong": alignment. An organizational domain
+    // computed one label off either rejects legitimate mail or accepts a
+    // forgery, and the rules that make it non-obvious are exactly the ones
+    // below. Vectors come from the algorithm's own test list at
+    // publicsuffix.org/list/, not from our parser.
+    printf("public suffix lookups\n");
+    PublicSuffixList::instance().setRulesFromData(
+        "// a cut-down list with one of each rule shape\n"
+        "com\n"
+        "uk\n"
+        "co.uk\n"
+        "jp\n"
+        "kobe.jp\n"
+        "*.kobe.jp\n"
+        "!city.kobe.jp\n"
+        "*.ck\n"
+        "!www.ck\n");
+    auto org = [](const char *name) {
+        return PublicSuffixList::instance().organizationalDomain(QString::fromLatin1(name));
+    };
+    check("plain TLD", org("example.com").toLatin1(), "example.com");
+    check("subdomain", org("mail.example.com").toLatin1(), "example.com");
+    // The case the old parent/child heuristic got wrong in the safe direction.
+    check("siblings share an org domain", org("a.example.co.uk").toLatin1(), "example.co.uk");
+    check("a public suffix has no owner", org("co.uk").toLatin1(), "");
+    check("unlisted TLD falls back to '*'", org("example.invalidtld").toLatin1(),
+          "example.invalidtld");
+    check("wildcard rule", org("www.city.kobe.jp").toLatin1(), "city.kobe.jp");
+    check("exception overrules its wildcard", org("www.ck").toLatin1(), "www.ck");
+    // A wildcard makes the label under it part of the suffix, so the owned name
+    // starts one label further left than it looks.
+    check("wildcard swallows a label", org("bar.ck").toLatin1(), "");
+    check("owned name under a wildcard", org("foo.bar.ck").toLatin1(), "foo.bar.ck");
+    check("deeper name under a wildcard", org("a.foo.bar.ck").toLatin1(), "foo.bar.ck");
 
     if (failures == 0) {
         printf("PASS: all canonicalization vectors match\n");
