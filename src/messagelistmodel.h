@@ -5,6 +5,7 @@
 
 #include <QAbstractListModel>
 #include <QDateTime>
+#include <QHash>
 #include <QList>
 #include <QRegularExpression>
 #include <QSet>
@@ -44,6 +45,17 @@ public:
         /// RFC 5322 Message-ID with the angle brackets stripped. Stable across
         /// folders and UIDVALIDITY resets, unlike uid.
         QString msgid;
+
+        // Sort keys, derived from the fields above by primeKeys() when the
+        // header enters the model. Producers do not fill them. They exist so a
+        // comparison costs an integer compare or a plain QString compare,
+        // instead of a QDateTime compare (timezone-aware, local-spec) or a
+        // case-insensitive compare that re-folds both strings every time — on
+        // a list of 100k rows that is the difference between a sort the user
+        // does not notice and one that freezes the GUI thread.
+        qint64 dateSecs = 0;  ///< date.toSecsSinceEpoch(), 0 when invalid
+        QString fromKey;      ///< case-folded from
+        QString subjectKey;   ///< case-folded subject
     };
 
     using QAbstractListModel::QAbstractListModel;
@@ -84,14 +96,31 @@ public:
     Q_INVOKABLE void setColorFilter(int color);
 
 private:
+    /// Fills the derived sort keys of a header entering the model.
+    static void primeKeys(Header &h);
+    /// Recomputes m_rows (sort + filter) inside a model reset.
     void rebuildVisible();
-    void sortList(QList<Header> &list) const;
+    /// Re-sorts m_rows in place and reports it as a layout change, so the view
+    /// keeps its scroll position and its selection.
+    void resortVisible();
+    /// Rebuilds the uid → m_all index map after m_all is replaced or spliced.
+    void reindex();
+    /// Visible row showing the m_all entry \a allIndex, or -1 when filtered out.
+    int visibleRowOf(int allIndex) const { return m_rows.indexOf(allIndex); }
     bool lessThan(const Header &a, const Header &b) const;
     bool matchesFilter(const Header &h) const;
 
     QString m_dateFormat = QStringLiteral("yyyy-MM-dd");
-    QList<Header> m_headers; ///< visible (possibly filtered) rows
-    QList<Header> m_all;     ///< everything fetched for the folder
+    /// Everything fetched for the folder, in arrival order. Rows are only ever
+    /// appended here, so the indices held in m_rows and m_byUid stay valid;
+    /// removeByUids() is the one exception and rebuilds both.
+    QList<Header> m_all;
+    /// Visible rows: indices into m_all, in sort order, filter applied. The
+    /// visible list is a permutation and not a second copy of the headers —
+    /// copying them meant every insert detached the shared list (a deep copy
+    /// of the whole folder) and left two copies of state to keep in step.
+    QList<int> m_rows;
+    QHash<qint64, int> m_byUid; ///< uid → index into m_all
     QRegularExpression m_filter;
     int m_colorFilter = 0;
     SortColumn m_sortColumn = SortColumn::Date;

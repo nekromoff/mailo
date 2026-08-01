@@ -1584,6 +1584,47 @@ Kirigami.ApplicationWindow {
                                 if (row < 0)
                                     fetchDebounce.restart()
                             }
+                            // Re-sorting keeps the same rows and only renumbers
+                            // them, so it reports a layout change instead of a
+                            // reset — that is what lets the view keep its
+                            // delegates. selectedSet, selectionAnchor and
+                            // currentIndex are row numbers all the same, so
+                            // they still have to be re-derived, exactly as
+                            // onModelReset does above.
+                            function onLayoutChanged() {
+                                messageList.clearSelection()
+                                if (messageList.count <= 0) {
+                                    messageList.currentIndex = -1
+                                    return
+                                }
+                                const row = messageList.openedUid >= 0
+                                    ? Mail.messageModel.rowForUid(messageList.openedUid) : -1
+                                messageList.currentIndex = row >= 0 ? row : 0
+                                if (row < 0) {
+                                    messageList.openedUid =
+                                        Mail.messageModel.uidAt(messageList.currentIndex)
+                                    fetchDebounce.restart()
+                                }
+                                // Follow the cursor to its new row. Keeping the
+                                // old scroll offset would leave the view
+                                // showing unrelated messages — and if it was
+                                // sitting at the bottom it stays at the bottom,
+                                // where atYEnd below keeps asking for another
+                                // page, which lands somewhere else in the new
+                                // order and leaves it at the bottom again: the
+                                // list scrolls on by itself. Deferred, because
+                                // the view has not finished relaying out the
+                                // rows while this signal is still being
+                                // delivered.
+                                Qt.callLater(() => {
+                                    if (messageList.currentIndex >= 0)
+                                        messageList.positionViewAtIndex(
+                                            messageList.currentIndex, ListView.Center)
+                                })
+                                console.info("mailo: msg re-sorted: count", messageList.count,
+                                            "uid", messageList.openedUid,
+                                            "-> row", messageList.currentIndex)
+                            }
                             // Incremental inserts (appendHeaders: search local
                             // merge, load-more) shift every row at/after the
                             // insertion point. selectedSet, selectionAnchor and
