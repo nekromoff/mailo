@@ -36,6 +36,9 @@ class MessageContext : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool hasMessage READ hasMessage NOTIFY messageChanged)
+    /// Identifies the message this context holds — account, folder and uid.
+    /// The tab strip uses it to recognise a message it already has open.
+    Q_PROPERTY(QString sourceKey READ sourceKey NOTIFY messageChanged)
     Q_PROPERTY(QString subject READ subject NOTIFY messageChanged)
     Q_PROPERTY(QString from READ from NOTIFY messageChanged)
     Q_PROPERTY(QString to READ to NOTIFY messageChanged)
@@ -80,6 +83,7 @@ public:
     ~MessageContext() override;
 
     bool hasMessage() const { return m_hasMessage; }
+    QString sourceKey() const { return m_sourceKey; }
     QString subject() const { return m_subject; }
     QString from() const { return m_from; }
     QString to() const { return m_to; }
@@ -146,6 +150,7 @@ private:
     QString m_textBody;  ///< plain-text part
     QByteArray m_raw;    ///< complete RFC-822 source
     qint64 m_uid = -1;
+    QString m_sourceKey; ///< account + folder + uid; see sourceKey()
     QString m_senderAddress; ///< addr-spec of the sender (remote-content key)
     bool m_junk = false;
     bool m_remoteAllowed = false;

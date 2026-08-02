@@ -6,6 +6,7 @@
 #include "publicsuffixlist.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDnsLookup>
 #include <QEventLoop>
 #include <QList>
@@ -223,10 +224,12 @@ QList<Field> splitFields(const QByteArray &head)
 // --- DNS -------------------------------------------------------------------
 
 /// Blocking TXT lookup. Safe here and only here: this runs on the verifier's
-/// own thread, never the GUI thread.
-QByteArray lookupDkimKey(const QString &name, bool *tempError)
+/// own thread, never the GUI thread. \a ttlSecs receives the record's DNS TTL
+/// (0 when the answer is not cacheable).
+QByteArray lookupDkimKey(const QString &name, bool *tempError, qint64 *ttlSecs)
 {
     *tempError = false;
+    *ttlSecs = 0;
     QDnsLookup lookup(QDnsLookup::TXT, name);
     QEventLoop loop;
     QObject::connect(&lookup, &QDnsLookup::finished, &loop, &QEventLoop::quit);
@@ -250,6 +253,7 @@ QByteArray lookupDkimKey(const QString &name, bool *tempError)
     const auto records = lookup.textRecords();
     if (records.isEmpty())
         return {};
+    *ttlSecs = records.first().timeToLive();
     // A TXT record is a sequence of strings that must be concatenated.
     QByteArray joined;
     for (const QByteArray &chunk : records.first().values())
@@ -448,7 +452,7 @@ bool DkimVerifier::prepare(const QByteArray &head, const QByteArray &body, const
 }
 
 QByteArray DkimVerifier::publicKeyRecord(const QString &dnsName, bool *tempError,
-                                         QHash<QString, QByteArray> *cache) const
+                                         QHash<QString, QByteArray> *cache)
 {
     *tempError = false;
     if (!m_testKeyRecord.isEmpty())
@@ -458,16 +462,46 @@ QByteArray DkimVerifier::publicKeyRecord(const QString &dnsName, bool *tempError
         if (it != cache->constEnd())
             return *it; // including a remembered "no such key"
     }
-    const QByteArray record = lookupDkimKey(dnsName, tempError);
+
+    // The cross-message layer: keyed by DNS name, honouring the record's own
+    // TTL. Without it, reopening a message re-asks the resolver for a key that
+    // was fetched seconds ago — and mail from one sender tends to arrive in
+    // runs signed by one selector. No locking: everything here runs on the
+    // verifier's thread. Expired entries are dropped on contact rather than
+    // swept; the map only ever holds selectors of mail actually opened.
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const auto cached = m_dnsCache.constFind(dnsName);
+    if (cached != m_dnsCache.constEnd()) {
+        if (cached->expiry > now) {
+            if (cache)
+                cache->insert(dnsName, cached->record);
+            return cached->record;
+        }
+        m_dnsCache.erase(cached);
+    }
+
+    qint64 ttl = 0;
+    const QByteArray record = lookupDkimKey(dnsName, tempError, &ttl);
     // A temporary failure must not be cached: the whole point is that it may
     // succeed next time.
-    if (cache && !*tempError)
-        cache->insert(dnsName, record);
+    if (!*tempError) {
+        if (cache)
+            cache->insert(dnsName, record);
+        // "No such key" is an answer too (NXDOMAIN), and the one senders with
+        // no DKIM produce on every message — cache it briefly rather than
+        // hammering the resolver with known misses. Positive answers keep the
+        // record's TTL, clamped: a 5 s TTL is load-balancer noise, and hours
+        // past a day defeats key rotation.
+        const qint64 keep = record.isEmpty()
+            ? 600
+            : qBound(qint64(300), ttl, qint64(24) * 3600);
+        m_dnsCache.insert(dnsName, {record, now + keep});
+    }
     return record;
 }
 
 ArcResult DkimVerifier::verifyArcChain(const QByteArray &head, const QByteArray &body,
-                                       QHash<QString, QByteArray> *keyCache) const
+                                       QHash<QString, QByteArray> *keyCache)
 {
     // One hop's three headers. Every hop must supply all three; a set missing
     // one is not a set the chain can be walked through.

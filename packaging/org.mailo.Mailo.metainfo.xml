@@ -33,6 +33,24 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="1.1" date="2026-08-02" type="stable">
+      <description>
+        <ul>
+          <li>Compose, Settings and opened messages are tabs in the main
+              window; the composer can still be a separate window if
+              preferred.</li>
+          <li>An account's sending address is kept separately from its login
+              name, and can carry a full name and organization.</li>
+          <li>Imported mail is its own account type, with no server to
+              configure.</li>
+          <li>Accounts can be reordered by dragging them.</li>
+          <li>Message list keyboard navigation: Page Up/Down, Home/End and
+              Enter to open a message.</li>
+          <li>Much faster paging through large folders.</li>
+          <li>Reclaiming disk space no longer freezes the window.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.0" date="2026-07-31" type="stable">
       <description>
         <ul>

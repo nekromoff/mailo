@@ -1,55 +1,47 @@
 // SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-import QtCore
 import QtQuick
-import QtQuick.Window
 import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import Mailo.Core
 
-Window {
+/// The composer. A tab page, not a window: the tab strip in Main.qml hosts it.
+/// See the page contract there — title, present(), closeRequested.
+Item {
     id: sheet
-    title: "Compose"
-    flags: Qt.Window
-    transientParent: null // own top-level window with its own taskbar entry
 
-    // Last compose geometry, restored on every opening and across restarts.
-    // x/y are best effort (Wayland places windows itself); -1 = never saved.
-    Settings {
-        id: windowState
-        category: "composeWindow"
-        property int width: 700
-        property int height: 600
-        property int x: -1
-        property int y: -1
-        property bool maximized: false
+    /// Tab page contract (see Main.qml). The title doubles as the tab label,
+    /// which is why the open*() functions set titleBase to Reply/Forward/Draft.
+    property string titleBase: "Compose"
+    /// Once there is a recipient the tab says who the message is going to —
+    /// several open composers all reading "Compose" are indistinguishable.
+    /// Only the first recipient, and its display name in preference to the
+    /// address, since a tab has no room for more.
+    property string title: {
+        const first = toField.text.split(",")[0].trim()
+        if (first === "")
+            return titleBase
+        const named = first.match(/^\s*"?([^"<]*[^"<\s])"?\s*</)
+        return titleBase + " to: " + (named ? named[1] : first)
     }
-    width: windowState.width
-    height: windowState.height
-    minimumWidth: 400
-    minimumHeight: 300
-    Component.onCompleted: {
-        if (windowState.x >= 0) {
-            x = windowState.x
-            y = windowState.y
-        }
+    signal presentRequested()
+    signal closeRequested()
+
+    /// False when the composer is a window of its own rather than a tab (the
+    /// Look and feel setting). Window-wide shortcuts are gated on the tab
+    /// being the visible one, which is never true outside a StackLayout.
+    property bool inTab: true
+    readonly property bool pageActive: !inTab || StackLayout.isCurrentItem
+
+    // Resolved from the content layout's Window color set (chrome gray), so
+    // the page fill matches the panel. bgColor override still wins.
+    Rectangle {
+        anchors.fill: parent
+        color: sheet.panelColor
     }
-    function saveGeometry() {
-        windowState.maximized = sheet.visibility === Window.Maximized
-        // Keep the last windowed geometry — see Main.qml.
-        if (sheet.visibility === Window.Windowed) {
-            windowState.width = sheet.width
-            windowState.height = sheet.height
-            windowState.x = sheet.x
-            windowState.y = sheet.y
-        }
-    }
-    // Resolved from the content layout's Window color set (chrome gray),
-    // so the window fill matches the panel. bgColor override still wins.
-    color: panelColor
 
     /// The uiSettings object from Main.qml (Look settings).
     property var ui: null
@@ -78,7 +70,7 @@ Window {
     }
 
     /// Set while closing deliberately (sent, draft saved, discard confirmed),
-    /// so onClosing lets it through instead of asking again.
+    /// so close() lets it through instead of asking again.
     property bool closingConfirmed: false
 
     function hasContent() {
@@ -115,25 +107,30 @@ Window {
             || attachments.length !== openedState.attachCount
     }
 
-    // Escape closes the window, which routes through onClosing below — so an
-    // edited message gets the same confirmation as the title bar's X, and an
+    // Escape closes the tab, which routes through close() below — so an edited
+    // message gets the same confirmation as the tab's close button, and an
     // untouched one just closes.
     Shortcut {
         sequence: "Esc"
+        // Only the visible tab may act on a window-wide shortcut.
+        enabled: sheet.pageActive
         onActivated: sheet.close()
     }
 
-    // Closing only asks when there is something to lose: a composer the user
-    // has not typed into (empty new message, unedited reply/forward/draft)
-    // closes silently — nothing the user wrote is being thrown away, and a
-    // resumed draft stays in the Drafts folder untouched.
-    onClosing: close => {
-        // Remember the geometry even when the discard dialog cancels the
-        // close below — a no-op then, the window is still on screen.
-        saveGeometry()
-        if (closingConfirmed || sending || !isModified())
+    /// Closing only asks when there is something to lose: a composer the user
+    /// has not typed into (empty new message, unedited reply/forward/draft)
+    /// closes silently — nothing the user wrote is being thrown away, and a
+    /// resumed draft stays in the Drafts folder untouched. When it does ask,
+    /// closeRequested is withheld: the tab stays until the dialog resolves.
+    function close() {
+        if (closingConfirmed || sending || !isModified()) {
+            closeRequested()
             return
-        close.accepted = false
+        }
+        // Raise the tab rather than call present(): a question must not be
+        // asked off-screen, but this is not a fresh open, so none of the
+        // open-time state below may be reset.
+        presentRequested()
         discardDialog.open()
     }
 
@@ -143,12 +140,7 @@ Window {
         // Fields are fully populated by the open*() caller at this point —
         // this snapshot is what "unchanged, close silently" compares against.
         captureOpenedState()
-        if (windowState.maximized)
-            showMaximized()
-        else
-            show()
-        raise()
-        requestActivate()
+        presentRequested()
         if (focusBodyOnOpen) {
             bodyEdit.forceActiveFocus()
             bodyEdit.cursorPosition = 0
@@ -159,7 +151,7 @@ Window {
 
     function openNew() {
         sourceDraftUid = -1
-        title = "Compose"
+        titleBase = "Compose"
         toField.text = ""
         ccField.text = ""
         bccField.text = ""
@@ -180,7 +172,7 @@ Window {
     function openDraft(d) {
         if (!d || d.subject === undefined)
             return
-        title = "Draft"
+        titleBase = "Draft"
         toField.text = d.to
         ccField.text = d.cc
         bccField.text = d.bcc
@@ -198,7 +190,7 @@ Window {
         if (!r || r.to === undefined)
             return
         sourceDraftUid = -1
-        title = "Reply"
+        titleBase = "Reply"
         toField.text = r.to
         ccField.text = r.cc
         bccField.text = ""
@@ -216,7 +208,7 @@ Window {
         if (!r || r.to === undefined)
             return
         sourceDraftUid = -1
-        title = "Forward"
+        titleBase = "Forward"
         toField.text = r.to
         ccField.text = r.cc
         bccField.text = ""
@@ -339,29 +331,26 @@ Window {
 
     Connections {
         target: Mail
+        // No "is this composer open?" guard on any of these any more: the page
+        // is created when the composer opens and destroyed when it closes, so
+        // simply existing to receive the signal is the guard.
         function onMailSent() {
-            if (sheet.visible) {
-                // The draft this was resumed from is superseded — without
-                // this, sending an edited draft leaves the old one behind.
-                Mail.discardDraft(sheet.sourceDraftUid)
-                sheet.closingConfirmed = true
-                sheet.close()
-            }
+            // The draft this was resumed from is superseded — without this,
+            // sending an edited draft leaves the old one behind.
+            Mail.discardDraft(sheet.sourceDraftUid)
+            sheet.closingConfirmed = true
+            sheet.close()
         }
         function onDraftSaved() {
-            if (sheet.visible) {
-                // The superseded copy is removed by saveDraft() itself, in
-                // sequence with the append — doing it from here raced the
-                // refresh and briefly showed both.
-                sheet.closingConfirmed = true
-                sheet.close()
-            }
+            // The superseded copy is removed by saveDraft() itself, in
+            // sequence with the append — doing it from here raced the
+            // refresh and briefly showed both.
+            sheet.closingConfirmed = true
+            sheet.close()
         }
-        // Sending failed: revert the Send button, keep this window open, and
-        // show the full server error in a dismissible dialog centered on it.
+        // Sending failed: revert the Send button, keep this tab open, and show
+        // the full server error in a dismissible dialog.
         function onSendFailed(error) {
-            if (!sheet.visible)
-                return
             sheet.sending = false
             sendErrorDialog.errorText = error
             sendErrorDialog.open()
@@ -465,6 +454,8 @@ Window {
     // Attach shortcut (configurable in Settings → Shortcuts; default Ctrl+Shift+A).
     Shortcut {
         sequence: sheet.ui ? sheet.ui.shortcutAttach : "Ctrl+Shift+A"
+        // Window-wide shortcuts belong to whichever tab is on screen.
+        enabled: sheet.pageActive
         onActivated: attachDialog.open()
     }
 
@@ -474,7 +465,8 @@ Window {
     Shortcut {
         sequences: sheet.ui ? [sheet.ui.shortcutSend, "Ctrl+Enter"]
                             : ["Ctrl+Return", "Ctrl+Enter"]
-        enabled: toField.text.trim().length > 0 && !sheet.sending
+        enabled: sheet.pageActive
+                 && toField.text.trim().length > 0 && !sheet.sending
         onActivated: sheet.doSend()
     }
 

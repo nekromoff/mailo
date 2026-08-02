@@ -1,3 +1,21 @@
+mailo (1.1) unstable; urgency=medium
+
+  * Compose, Settings and opened messages are tabs in the main window rather
+    than separate windows; the composer can still be a window of its own
+    (Settings, Look and feel).
+  * Accounts keep the e-mail address they send from separately from the login
+    name, so the two may differ, and can carry a full name and organization.
+  * Imported mail is its own account type, without server settings.
+  * Accounts can be reordered by dragging them in the folder pane.
+  * Message list: Page Up/Down, Home/End, Enter to open, Ctrl+W to close a
+    tab, and the keyboard follows the folder you open.
+  * Much faster paging through large folders, and background updates no
+    longer slow down as more of a folder is loaded.
+  * Reclaiming disk space no longer freezes the window while it starts.
+  * File pickers are the desktop's own, with its colours and Places sidebar.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Sun, 02 Aug 2026 12:00:00 +0200
+
 mailo (1.0) unstable; urgency=medium
 
   * Attachments are stored as content-addressed files outside the database,

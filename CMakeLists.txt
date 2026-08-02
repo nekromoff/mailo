@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailo VERSION 1.0 LANGUAGES CXX)
+project(mailo VERSION 1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,7 +12,7 @@ set(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
     GROUP_READ GROUP_EXECUTE
     WORLD_READ WORLD_EXECUTE)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Sql WebEngineQuick)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Sql Widgets WebEngineQuick)
 find_package(KPim6IMAP REQUIRED)
 find_package(KPim6Mime REQUIRED)
 find_package(KPim6SMTP REQUIRED)
@@ -61,6 +61,7 @@ set_source_files_properties(src/qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.q
 set_source_files_properties(src/qml/AccountSheet.qml PROPERTIES QT_RESOURCE_ALIAS AccountSheet.qml)
 set_source_files_properties(src/qml/MessageViewer.qml PROPERTIES QT_RESOURCE_ALIAS MessageViewer.qml)
 set_source_files_properties(src/qml/ComposeSheet.qml PROPERTIES QT_RESOURCE_ALIAS ComposeSheet.qml)
+set_source_files_properties(src/qml/ComposeWindow.qml PROPERTIES QT_RESOURCE_ALIAS ComposeWindow.qml)
 set_source_files_properties(src/qml/MessageWindow.qml PROPERTIES QT_RESOURCE_ALIAS MessageWindow.qml)
 set_source_files_properties(src/qml/HoverToolTip.qml PROPERTIES QT_RESOURCE_ALIAS HoverToolTip.qml)
 set_source_files_properties(src/qml/SelectableValue.qml PROPERTIES QT_RESOURCE_ALIAS SelectableValue.qml)
@@ -74,6 +75,7 @@ qt_add_qml_module(mailo
         src/qml/AccountSheet.qml
         src/qml/MessageViewer.qml
         src/qml/ComposeSheet.qml
+        src/qml/ComposeWindow.qml
         src/qml/MessageWindow.qml
         src/qml/HoverToolTip.qml
         src/qml/SelectableValue.qml
@@ -89,7 +91,10 @@ qt_add_resources(mailo "about"
 )
 
 target_link_libraries(mailo PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Sql Qt6::WebEngineQuick
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Sql
+    # Widgets: for KDE's native, widget-based file pickers only (see main.cpp).
+    Qt6::Widgets
+    Qt6::WebEngineQuick
     KPim6::IMAP
     KPim6::Mime
     KPim6::SMTP

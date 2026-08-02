@@ -109,7 +109,9 @@ private:
     /// Rebuilds the uid → m_all index map after m_all is replaced or spliced.
     void reindex();
     /// Visible row showing the m_all entry \a allIndex, or -1 when filtered out.
-    int visibleRowOf(int allIndex) const { return m_rows.indexOf(allIndex); }
+    /// Row of an m_all entry in the visible list, or -1 when filtered out.
+    /// Binary search over the sorted rows — see the definition.
+    int visibleRowOf(int allIndex) const;
     bool lessThan(const Header &a, const Header &b) const;
     bool matchesFilter(const Header &h) const;
 

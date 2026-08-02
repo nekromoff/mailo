@@ -1,62 +1,35 @@
 // SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-import QtCore
 import QtQuick
-import QtQuick.Window
 import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import Mailo.Core
 
-Window {
+/// The settings pages. A tab page, not a window: the tab strip in Main.qml
+/// hosts it. See the page contract there — title, present(), closeRequested.
+Item {
     id: sheet
-    title: "Settings"
-    // A real top-level window: the system title bar provides close, minimize
-    // and maximize, the window manager handles resizing (the old hand-rolled
-    // corner grip is gone), and it gets its own taskbar entry.
-    flags: Qt.Window
-    transientParent: null
+
+    /// Tab page contract (see Main.qml).
+    property string title: "Settings"
+    signal presentRequested()
+    signal closeRequested()
+    function present() { presentRequested() }
     // No Cancel: everything outside the Accounts page applies live, so the
     // button only ever discarded account edits while silently keeping the
-    // rest. Escape (and the title bar's close) dismisses without saving.
-    // The last geometry, remembered across restarts. x/y are best effort
-    // (Wayland places windows itself); -1 = never saved, let the WM place it.
-    Settings {
-        id: dialogSettings
-        category: "settingsDialog"
-        property real width: 820
-        property real height: Kirigami.Units.gridUnit * 30
-        property int x: -1
-        property int y: -1
-        property bool maximized: false
-    }
-    width: dialogSettings.width
-    height: dialogSettings.height
-    minimumWidth: 560
-    minimumHeight: 360
-    Component.onCompleted: {
-        if (dialogSettings.x >= 0) {
-            x = dialogSettings.x
-            y = dialogSettings.y
-        }
-    }
-    onClosing: {
-        dialogSettings.maximized = sheet.visibility === Window.Maximized
-        // Keep the last windowed geometry — see Main.qml.
-        if (sheet.visibility === Window.Windowed) {
-            dialogSettings.width = sheet.width
-            dialogSettings.height = sheet.height
-            dialogSettings.x = sheet.x
-            dialogSettings.y = sheet.y
-        }
-    }
+    // rest. Escape (and the tab's close button) dismisses without saving.
+    function close() { closeRequested() }
 
     // Chrome-gray panel (Window color set), same treatment as the compose
-    // window; the user's bgColor override wins.
-    color: ui && ui.bgColor !== "" ? ui.bgColor
-                                   : content.Kirigami.Theme.backgroundColor
+    // page; the user's bgColor override wins.
+    Rectangle {
+        anchors.fill: parent
+        color: sheet.ui && sheet.ui.bgColor !== ""
+               ? sheet.ui.bgColor : content.Kirigami.Theme.backgroundColor
+    }
 
     /// The window's persisted UI settings object (set by Main.qml).
     property var ui
@@ -66,43 +39,48 @@ Window {
 
     /// True while a shortcut-capture button is reading raw key presses — the
     /// Esc shortcut below stands down so Esc can cancel the capture instead
-    /// of closing the window.
+    /// of closing the tab.
     property bool captureActive: false
 
-    /// Shows the window (the Dialog-era entry point, kept so callers and the
-    /// old open() semantics — reload the account form on every opening —
+    /// Shows the settings tab (the Dialog-era entry point, kept so callers and
+    /// the old open() semantics — reload the account form on every opening —
     /// stay unchanged).
     function open() {
         editIndex = Mail.accountNames.length > 0 ? Mail.currentAccount : -1
         loadDetails()
-        if (dialogSettings.maximized)
-            showMaximized()
-        else
-            show()
-        raise()
-        requestActivate()
+        present()
     }
 
     Shortcut {
         sequence: "Esc"
-        enabled: !sheet.captureActive
+        // Only the visible tab may act on a window-wide shortcut.
+        enabled: sheet.StackLayout.isCurrentItem && !sheet.captureActive
         onActivated: sheet.close()
     }
 
     /// Account being edited; -1 = creating a new one.
     property int editIndex: -1
 
+    /// True when this is an imported archive: mail on disk, no server, nothing
+    /// to connect to. It is a choice in the account-type list rather than a
+    /// flag on the side, because everything else on this page — servers,
+    /// password, how mail is composed — only means something for an account
+    /// that talks to a server. Switching the type to Standard (IMAP) is the
+    /// deliberate upgrade path from archive to live account.
+    readonly property bool localAccount: authBox.currentIndex === 3
+
     /// OAuth providers supply their own servers, so only the address matters.
-    readonly property bool oauthAccount: authBox.currentIndex !== 0
+    readonly property bool oauthAccount:
+        authBox.currentIndex === 1 || authBox.currentIndex === 2
 
     /// What the account still needs before it can be saved, or "" when ready.
     /// Saving a half-filled account produced one that could never connect and
     /// had to be deleted and redone, so the button stays off until it would
     /// actually work.
     readonly property string detailsMissing: {
-        if (userField.text.trim() === "")
-            return oauthAccount ? "an e-mail address" : "a username"
-        if (!oauthAccount) {
+        if (emailField.text.trim() === "")
+            return "an e-mail address"
+        if (!oauthAccount && !localAccount) {
             if (hostField.text.trim() === "")
                 return "an IMAP server"
             if (smtpHostField.text.trim() === "")
@@ -120,6 +98,9 @@ Window {
     /// address, and stop the moment the user disagrees.
     property bool hostPinned: false
     property bool smtpHostPinned: false
+    /// Same idea for the login: it follows the address until the user says
+    /// otherwise, because for most servers the two are the same thing.
+    property bool userPinned: false
 
     /// The SMTP host the client falls back to when none is stored (see
     /// MailClient::loadAccount). Kept in step with that rule so the field shows
@@ -137,6 +118,17 @@ Window {
         portField.value = d.port ?? 993
         securityBox.currentIndex = d.security ?? 0
         userField.text = d.user ?? ""
+        // A saved login is a decision already made — never overwrite it with
+        // the address afterwards.
+        userPinned = userField.text !== ""
+        displayNameField.text = d.displayName ?? ""
+        organizationField.text = d.organization ?? ""
+        // Accounts saved before the address was its own field kept it in the
+        // login — and send off it, via MailClient::ownAddress. Show that,
+        // rather than a blank the Save button then refuses to accept.
+        emailField.text = (d.email ?? "") !== ""
+            ? d.email
+            : (userField.text.indexOf("@") >= 0 ? userField.text : "")
         passwordField.text = ""
         // Accounts saved before this field existed have no SMTP host but send
         // anyway, off the derived one — so show that instead of an empty field
@@ -146,13 +138,16 @@ Window {
                                             : derivedSmtpHost(hostField.text)
         smtpPortField.value = d.smtpPort ?? 587
         smtpSecurityBox.currentIndex = d.smtpSecurity ?? 1
-        authBox.currentIndex = d.authType ?? 0
+        // An archive is its own account type here, so it takes the slot after
+        // the OAuth providers rather than showing as "Standard (IMAP)" with
+        // every server field mysteriously blank.
+        authBox.currentIndex = (d.local ?? false) ? 3 : (d.authType ?? 0)
         signatureEdit.text = d.signature ?? ""
         htmlMailBox.checked = d.htmlMail ?? true
     }
 
-    /// Persists the account form (the Save button). Closes the window on
-    /// success — the same flow the Dialog's accept() used to run.
+    /// Persists the account form (the Save button). The tab stays open —
+    /// saving is not leaving.
     function saveAccount() {
         // Look-page settings apply live; Save only persists account edits.
         if (page !== 0)
@@ -162,7 +157,10 @@ Window {
         if (detailsMissing !== "")
             return
         // OAuth providers get fixed, known-good server settings.
-        const presets = authBox.currentIndex === 1
+        const presets = sheet.localAccount
+            ? {host: "", port: 993, security: 0,
+               smtpHost: "", smtpPort: 587, smtpSecurity: 1}
+            : authBox.currentIndex === 1
             ? {host: "imap.gmail.com", port: 993, security: 0,
                smtpHost: "smtp.gmail.com", smtpPort: 587, smtpSecurity: 1}
             : authBox.currentIndex === 2
@@ -175,17 +173,28 @@ Window {
             host: presets.host,
             port: presets.port,
             security: presets.security,
-            user: userField.text,
+            // The login defaults to the address: that is what most servers
+            // want, and it keeps the login non-empty, which the account key
+            // (and so the wallet entry and message cache) depends on.
+            user: (!oauthAccount && userField.text.trim() !== "")
+                ? userField.text : emailField.text,
+            email: emailField.text,
+            displayName: displayNameField.text,
+            organization: organizationField.text,
             password: passwordField.text,
             savePassword: savePasswordBox.checked,
             smtpHost: presets.smtpHost,
             smtpPort: presets.smtpPort,
             smtpSecurity: presets.smtpSecurity,
-            authType: authBox.currentIndex,
+            // Imported is not an authentication method — it is the absence of
+            // a server to authenticate to, so it stores as the plain type.
+            authType: sheet.localAccount ? 0 : authBox.currentIndex,
+            local: sheet.localAccount,
             signature: signatureEdit.text,
             htmlMail: htmlMailBox.checked
         })
-        close()
+        // Saving does not close: a tab stays until the user closes it, and
+        // settings are commonly saved several times in a sitting.
     }
 
     QQC2.Dialog {
@@ -226,6 +235,15 @@ Window {
         cursorPosition: signatureEdit.cursorPosition
         selectionStart: signatureEdit.selectionStart
         selectionEnd: signatureEdit.selectionEnd
+    }
+
+    FolderDialog {
+        id: thunderbirdImportDialog
+        title: "Choose a Thunderbird mail folder"
+        onAccepted: {
+            Mail.importThunderbird(selectedFolder)
+            sheet.close()
+        }
     }
 
     FileDialog {
@@ -388,6 +406,16 @@ Window {
             }
             QQC2.Button {
                 Layout.fillWidth: true
+                icon.name: "document-import"
+                text: "Import mail…"
+                onClicked: thunderbirdImportDialog.open()
+                QQC2.ToolTip.text: "Import a Thunderbird mail folder (mbox) as a "
+                                   + "browsable archive account. Point it at a profile's "
+                                   + "\"Mail\" or \"ImapMail\" subfolder."
+                QQC2.ToolTip.visible: hovered
+            }
+            QQC2.Button {
+                Layout.fillWidth: true
                 icon.name: "list-remove"
                 text: "Remove"
                 enabled: sheet.editIndex >= 0 && Mail.accountNames.length > 0
@@ -419,17 +447,54 @@ Window {
             QQC2.ComboBox {
                 id: authBox
                 Kirigami.FormData.label: "Account type:"
-                model: ["Standard (IMAP)", "Gmail", "Microsoft 365"]
+                model: ["Standard (IMAP)", "Gmail", "Microsoft 365",
+                        "Imported account"]
+            }
+            // Both optional, and both about how the account presents itself,
+            // so they share a row. The name gives recipients
+            // "Jane Roe <jane@example.com>" instead of a bare address; the
+            // organization becomes the Organization header, which is rarer
+            // still — hence the lighter treatment of the second field.
+            RowLayout {
+                visible: !sheet.localAccount
+                Kirigami.FormData.label: "Identity:"
+                spacing: Kirigami.Units.smallSpacing
+
+                QQC2.TextField {
+                    id: displayNameField
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: Kirigami.Units.gridUnit * 12
+                    placeholderText: "Full name"
+                }
+                QQC2.TextField {
+                    id: organizationField
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: Kirigami.Units.gridUnit * 10
+                    placeholderText: "Organization (optional)"
+                    // Dimmed rather than disabled: the field works, it is just
+                    // the one most accounts leave empty. Only the chrome
+                    // fades — text the user has typed stays full contrast.
+                    opacity: activeFocus || text !== "" ? 1.0 : 0.75
+                }
             }
             QQC2.TextField {
-                id: userField
-                Kirigami.FormData.label: authBox.currentIndex === 0 ? "Username:" : "E-mail:"
+                id: emailField
+                Kirigami.FormData.label: "E-mail address:"
                 placeholderText: "user@example.com"
                 // The usual shape of a provider's server names, guessed from
                 // the address so the form arrives filled in. Wrong for plenty
                 // of hosts, which is why both fields stay editable — a guess to
                 // correct beats two blanks to research.
                 onTextEdited: {
+                    if (!sheet.userPinned)
+                        userField.text = text
+                    // An archive has no server, and guessing one for it is not
+                    // a harmless guess: an imported account stays local only
+                    // while its server field is empty, so filling it in here
+                    // would quietly turn a finished archive into a live
+                    // account pointed at a host nobody chose.
+                    if (sheet.localAccount)
+                        return
                     const domain = text.split("@").pop().trim()
                     if (domain.length === 0 || domain.indexOf(".") < 0)
                         return
@@ -439,8 +504,21 @@ Window {
                         smtpHostField.text = sheet.derivedSmtpHost(hostField.text)
                 }
             }
+            // The login is its own field because it need not be the address,
+            // nor even share its domain — shared hosting hands out logins like
+            // "u1234" or "mail3", and sending as that guessed address bounces.
+            // OAuth providers sign in as the address, so they get no field.
+            QQC2.TextField {
+                id: userField
+                visible: !sheet.oauthAccount
+                Kirigami.FormData.label: "Username:"
+                placeholderText: "Same as the e-mail address"
+                // Typing here means the login is not the address after all, so
+                // it stops following it.
+                onTextEdited: sheet.userPinned = true
+            }
             QQC2.Label {
-                visible: authBox.currentIndex > 0
+                visible: sheet.oauthAccount
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Server settings are set up automatically. When you save, "
@@ -450,6 +528,17 @@ Window {
                 opacity: 0.7
             }
 
+            QQC2.Label {
+                visible: sheet.localAccount
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                text: "Imported mail, kept on disk. There is no server to "
+                      + "configure and nothing is sent or synced. To turn this "
+                      + "into a live account, change the type to Standard (IMAP) "
+                      + "and fill in its servers."
+            }
             QQC2.TextField {
                 id: hostField
                 visible: authBox.currentIndex === 0
@@ -529,16 +618,19 @@ Window {
             }
 
             Kirigami.Separator {
+                visible: !sheet.localAccount
                 Kirigami.FormData.label: "Composing"
                 Kirigami.FormData.isSection: true
             }
             QQC2.CheckBox {
                 id: htmlMailBox
+                visible: !sheet.localAccount
                 Kirigami.FormData.label: "Message format:"
                 text: "Send HTML mail"
                 checked: true
             }
             QQC2.Label {
+                visible: !sheet.localAccount
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "HTML mail carries a plain-text version alongside, so every "
@@ -549,10 +641,12 @@ Window {
             }
 
             Kirigami.Separator {
+                visible: !sheet.localAccount
                 Kirigami.FormData.label: "Signature"
                 Kirigami.FormData.isSection: true
             }
             ColumnLayout {
+                visible: !sheet.localAccount
                 Kirigami.FormData.label: ""
                 Layout.fillWidth: true
                 spacing: Kirigami.Units.smallSpacing
@@ -796,6 +890,24 @@ Window {
                 model: ["Compact", "Medium", "Wide"]
                 currentIndex: sheet.ui ? sheet.ui.rowDensity : 1
                 onActivated: sheet.ui.rowDensity = currentIndex
+            }
+
+            // Only the composer is offered both ways: writing a message next
+            // to the mailbox you are reading is a real need, while settings
+            // and opened messages have no such pairing.
+            QQC2.ComboBox {
+                id: composePlacementBox
+                Kirigami.FormData.label: "Compose in:"
+                model: ["Tab", "Separate window"]
+                currentIndex: sheet.ui && sheet.ui.composeInWindow ? 1 : 0
+                onActivated: sheet.ui.composeInWindow = (currentIndex === 1)
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                text: "Takes effect the next time you open the composer."
             }
 
             RowLayout {

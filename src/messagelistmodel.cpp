@@ -100,9 +100,11 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
     if (headers.isEmpty())
         return 0;
     int added = 0;
-    // Sorted per-row inserts instead of a model reset, so the ListView
-    // keeps its scroll position when older messages arrive.
+    // Sorted inserts instead of a model reset, so the ListView keeps its
+    // scroll position when older messages arrive.
     const auto cmp = [this](int a, int b) { return lessThan(m_all.at(a), m_all.at(b)); };
+    QList<int> fresh; // m_all indexes of the genuinely new, visible rows
+    fresh.reserve(headers.size());
     for (const Header &h : headers) {
         const auto known = m_byUid.constFind(h.uid);
         if (known != m_byUid.constEnd()) {
@@ -137,11 +139,33 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
         m_byUid.insert(h.uid, at);
         if ((hasFilter() || m_colorFilter != 0) && !matchesFilter(m_all.at(at)))
             continue;
-        const int row = int(std::upper_bound(m_rows.begin(), m_rows.end(), at, cmp)
+        fresh.append(at);
+    }
+
+    // The new rows go in as contiguous runs, not one at a time. A page of
+    // older mail is 500 rows that all belong together at the end of the list,
+    // and inserting them singly cost 500 beginInsertRows/endInsertRows rounds
+    // — each one a full round of view invalidation — plus 500 mid-list
+    // insertions into m_rows, which on a 40k-row folder is tens of millions of
+    // element moves. That is what made scrolling through an imported folder
+    // crawl. In the paging case this loop runs exactly once.
+    std::sort(fresh.begin(), fresh.end(), cmp);
+    for (int i = 0; i < fresh.size();) {
+        const int row = int(std::upper_bound(m_rows.begin(), m_rows.end(), fresh.at(i), cmp)
                             - m_rows.begin());
-        beginInsertRows({}, row, row);
-        m_rows.insert(row, at);
+        // Everything that still sorts before the row now at `row` belongs in
+        // the same run, in order: fresh is sorted, so they simply follow on.
+        int run = 1;
+        while (i + run < fresh.size()
+               && (row == m_rows.size()
+                   || cmp(fresh.at(i + run), m_rows.at(row))))
+            ++run;
+        beginInsertRows({}, row, row + run - 1);
+        m_rows.insert(row, run, 0);
+        for (int k = 0; k < run; ++k)
+            m_rows[row + k] = fresh.at(i + k);
         endInsertRows();
+        i += run;
     }
     return added;
 }
@@ -191,7 +215,36 @@ bool MessageListModel::lessThan(const Header &a, const Header &b) const
         c = a.dateSecs < b.dateSecs ? -1 : (b.dateSecs < a.dateSecs ? 1 : 0);
         break;
     }
-    return m_sortDescending ? c > 0 : c < 0;
+    if (c != 0)
+        return m_sortDescending ? c > 0 : c < 0;
+    // Ties break on uid, which makes this a total order: no two rows compare
+    // equal. That keeps rows with the same timestamp (or the same sender, when
+    // sorting by sender) from shuffling on every re-sort, and it is what lets
+    // visibleRowOf() find a row by binary search instead of scanning.
+    if (a.uid == b.uid)
+        return false;
+    return m_sortDescending ? a.uid > b.uid : a.uid < b.uid;
+}
+
+int MessageListModel::visibleRowOf(int allIndex) const
+{
+    // m_rows is always held in sort order, so a row can be found by its sort
+    // key rather than walked to. This was m_rows.indexOf(), a linear scan —
+    // and every background update that touches one row (a cached body
+    // revealing an attachment, a colour mark, a flag) went through it, so with
+    // 40k rows paged in each of those cost a 40k-element walk. That is what
+    // made a long paging session feel heavier the longer it went on.
+    if (allIndex < 0 || allIndex >= m_all.size())
+        return -1;
+    const auto cmp = [this](int a, int b) { return lessThan(m_all.at(a), m_all.at(b)); };
+    auto it = std::lower_bound(m_rows.begin(), m_rows.end(), allIndex, cmp);
+    // lessThan is a total order, so the match is at that position if anywhere;
+    // the loop is belt and braces for equal keys that should not exist.
+    for (; it != m_rows.end() && !cmp(allIndex, *it); ++it) {
+        if (*it == allIndex)
+            return int(it - m_rows.begin());
+    }
+    return -1;
 }
 
 bool MessageListModel::matchesFilter(const Header &h) const

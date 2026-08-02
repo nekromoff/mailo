@@ -8,32 +8,18 @@ The fast KDE-only email client.
 
 Security-minded KDE-only IMAP mail client, blazing fast.
 
-- **IMAP mail reading** — connect to any IMAP server (SSL/TLS, STARTTLS, or plain),
-  browse the folder tree, read messages. Auth is PLAIN/LOGIN (no OAuth yet, so use
-  an app password with providers that require XOAUTH2).
-- **Local cache with full-text search** — headers, read message bodies, and the folder
-  list are cached in SQLite. Folders open instantly (offline included), previously read
-  messages open with zero network, and search falls back through: server-side IMAP
-  SEARCH → local FTS5 full-text index → regex over the loaded list. Queries wrapped in
-  slashes (`/pattern/`) are treated as a case-insensitive regex.
-- **Sandboxed message viewing** — HTML mail renders in QtWebEngine with JavaScript,
-  plugins, and local-file access disabled, an off-the-record profile, and a request
-  interceptor that blocks all remote content (tracking pixels included) until the
-  per-message **Load remote content** opt-in. Inline `cid:` images are served locally.
-  Links open in the system browser, never inside the viewer.
-- **Sender authentication verdicts** — SPF/DKIM/DMARC results (parsed from the
-  receiving server's `Authentication-Results` header) flag suspicious messages with a
-  red **!** column in the message list; hover for the raw verdict.
-- **Compose & send** — SMTP sending (KSMTP) with a basic rich-text editor: bold,
-  italic, font size, ordered/unordered lists, attachments. Messages are sent as
-  `multipart/mixed` with a `text/plain` + `text/html` alternative pair.
-- **Attachments** — listed in a bottom panel; click to open with the system handler,
-  right-click to save into `~/Downloads` (auto-deduplicated filenames).
-- **Fast by design** — scroll-based pagination (100 headers at a time), hover and
-  read-ahead body prefetching into the cache, keyboard navigation (arrows, Enter,
-  pane switching), sortable Subject/From/Date columns.
-- **Secure credential storage** — the password lives in KWallet (or any Secret
-  Service keyring) via Qt6Keychain, never in a config file.
+- **IMAP mail reading** — any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365. Several accounts at once, reorderable by dragging.
+- **Tabs** — composer, Settings and opened messages are tabs, not scattered windows. Ctrl+W closes; the composer can be its own window if preferred.
+- **Local cache with full-text search** — headers, read bodies and folders in SQLite: folders open instantly, offline included. IMAP SEARCH → FTS5 (accent-folding) → regex; `/pattern/` is a case-insensitive regex.
+- **Imported mail** — a Thunderbird directory imports as an offline account. Add servers later to promote it to a live one, archive intact.
+- **Sandboxed message viewing** — HTML renders with JavaScript, plugins and local-file access off, off-the-record, and every remote request blocked until the per-message opt-in. Links open in the system browser.
+- **Sender authentication verdicts** — DKIM verified in-process, ARC chains validated, server SPF/DKIM/DMARC alongside. Suspicious mail gets a red **!**.
+- **Compose & send** — SMTP with rich text, attachments, signature and resumable drafts. The sending address, name and organization are separate from the login.
+- **Attachments** — click to open, right-click to save. Stored zstd-compressed and deduplicated outside the database.
+- **Keyboard-first** — arrows, Page Up/Down, Home/End, Enter to open, Ctrl+W to close a tab, and the keyboard follows the folder you open.
+- **UX to taste** — Look and feel sets row density, background colour and whether the composer is a tab or a window; Shortcuts rebinds every action, including the five colour labels; General sets the date format, refresh interval and cache limits.
+- **Fast by design** — a 20 ms limit on the GUI thread, one frame: anything slower runs on a worker. Pages in from the cache as you scroll, prefetches bodies, sorts in memory.
+- **Secure credential storage** — passwords and OAuth tokens in KWallet via Qt6Keychain, never a config file.
 
 ## Screenshots
 <img width="1920" height="1024" alt="0" src="https://github.com/user-attachments/assets/638d2514-dd1b-41fd-901a-850f130fe2cc" />
@@ -58,6 +44,8 @@ Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailo/r
 | SMTP | KPim6 KSMTP |
 | HTML viewer | QtWebEngine (Quick), custom `mailo:` URL scheme + request interceptor |
 | Storage | SQLite via Qt SQL (WAL), FTS5 for full-text indexing |
+| Attachment store | content-addressed files, zstd-compressed and deduplicated |
+| DKIM / ARC | verified in-process against OpenSSL (libcrypto), worker thread |
 | Secrets | Qt6Keychain → KWallet / libsecret |
 | Rich-text editing | QTextDocument/QTextCursor exposed to QML (`DocumentHandler`) |
 | Build | CMake + Ninja |
@@ -74,15 +62,14 @@ cmake --build build
 ./build/mailo
 ```
 
-`build/viewertest` is a headless end-to-end test of the sandboxed viewer pipeline
-(scheme registration, handler, render).
+`build/viewertest` is a headless end-to-end test of the sandboxed viewer pipeline (scheme registration, handler, render).
 
 ## Data locations
 
 - Message cache: `~/.local/share/mailo/mailo.db`
 - Settings: `~/.config/mailo/mailo.conf` (no secrets)
-- Password: KWallet, service `mailo`, key `imap-password`
+- Passwords and OAuth refresh tokens: KWallet, service `mailo`
 
-## Status / roadmap
+## Status
 
-Working, multiple accounts supported.
+Working and in daily use. Multiple accounts, OAuth for Gmail and Microsoft 365, imported offline archives, and caches into the tens of gigabytes.

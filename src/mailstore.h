@@ -53,6 +53,12 @@ public:
     /// Highest cached uid of a folder (0 when nothing is cached).
     qint64 maxCachedUid(const QString &folder);
     void storeHeaders(const QString &folder, const QList<MessageListModel::Header> &headers);
+    /// storeHeaders() on an explicit connection and an already-scoped folder
+    /// key, for workers (the Thunderbird importer) that do not own m_db.
+    /// \a ftsAvailable is passed in because a worker cannot ask the instance.
+    static void storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
+                               const QList<MessageListModel::Header> &headers,
+                               bool ftsAvailable);
     void removeMessages(const QString &folder, const QList<qint64> &uids);
     /// Refined attachment kind (MessageListModel::Header::attachKind) learned
     /// from the full body — e.g. "single .ics calendar invite".

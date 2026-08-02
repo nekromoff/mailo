@@ -57,6 +57,9 @@ class MailClient : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool hasAccount READ hasAccount NOTIFY accountChanged)
+    /// True while the active account is a local archive (imported mail, no
+    /// server configured): nothing ever connects, the cache is the account.
+    Q_PROPERTY(bool accountIsLocal READ accountIsLocal NOTIFY accountChanged)
     Q_PROPERTY(bool connected READ connected NOTIFY connectedChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
@@ -98,6 +101,9 @@ class MailClient : public QObject
     Q_PROPERTY(QString accountHost READ accountHost NOTIFY accountChanged)
     Q_PROPERTY(int accountPort READ accountPort NOTIFY accountChanged)
     Q_PROPERTY(QString accountUser READ accountUser NOTIFY accountChanged)
+    Q_PROPERTY(QString accountEmail READ accountEmail NOTIFY accountChanged)
+    Q_PROPERTY(QString accountDisplayName READ accountDisplayName NOTIFY accountChanged)
+    Q_PROPERTY(QString accountOrganization READ accountOrganization NOTIFY accountChanged)
     Q_PROPERTY(int accountSecurity READ accountSecurity NOTIFY accountChanged)
     Q_PROPERTY(QString smtpHost READ smtpHost NOTIFY accountChanged)
     Q_PROPERTY(int smtpPort READ smtpPort NOTIFY accountChanged)
@@ -144,6 +150,7 @@ public:
     void setViewerHandler(ViewerSchemeHandler *handler) { m_viewerHandler = handler; }
 
     bool hasAccount() const;
+    bool accountIsLocal() const { return m_local; }
     bool connected() const { return m_connected; }
     bool busy() const { return m_busy; }
     QString statusText() const { return m_statusText; }
@@ -155,6 +162,9 @@ public:
     QString accountHost() const { return m_host; }
     int accountPort() const { return m_port; }
     QString accountUser() const { return m_user; }
+    QString accountEmail() const { return m_email; }
+    QString accountDisplayName() const { return m_displayName; }
+    QString accountOrganization() const { return m_organization; }
     int accountSecurity() const { return m_security; }
 
     QString smtpHost() const { return m_smtpHost; }
@@ -192,6 +202,15 @@ public:
     /// then makes it the active one. An empty password keeps the stored one.
     Q_INVOKABLE void saveAccountDetails(int index, const QVariantMap &details);
     Q_INVOKABLE void removeAccount(int index);
+    /// Imports a Thunderbird mail directory (mbox files, ".sbd" hierarchy)
+    /// into a new local-archive account: browsable from the cache like any
+    /// other account, but never connected or synced — unless server details
+    /// are filled in later, which turns it into a normal account. Runs on a
+    /// worker thread; importFinished() reports the outcome.
+    Q_INVOKABLE void importThunderbird(const QUrl &dir);
+    /// Reorders the account list (drag-and-drop in the account pane). Purely
+    /// presentational — nothing is keyed on an account's position.
+    Q_INVOKABLE void moveAccount(int from, int to);
     /// Disconnects, loads account \a index and reconnects.
     Q_INVOKABLE void switchAccount(int index);
     /// Builds a MIME message and sends it via SMTP. attachments are local file URLs.
@@ -260,6 +279,10 @@ public:
     Q_INVOKABLE void prefetchMessage(int row);
     /// Fetches the next (older) window of headers; no-op if everything is loaded.
     Q_INVOKABLE void loadMoreMessages();
+    /// Pages in every remaining cached header of the open folder at once, so
+    /// the End key can reach the oldest message instead of the oldest one
+    /// scrolled to so far. Returns true if anything was added.
+    Q_INVOKABLE bool loadAllCachedMessages();
 
     /// True when the currently open folder is the trash folder.
     Q_INVOKABLE bool isTrashFolder() const;
@@ -400,6 +423,8 @@ Q_SIGNALS:
     void junkTextOnlyChanged();
     void accountsChanged();
     void cachedFoldersChanged();
+    /// Thunderbird import finished; \a message is user-presentable either way.
+    void importFinished(bool ok, const QString &message);
     void refreshMinutesChanged();
     void maxBodyMBChanged();
     void debugLoggingChanged();
@@ -409,7 +434,16 @@ Q_SIGNALS:
 private:
     friend class MessageContext; // thin QML front for the *For methods below
 
-    QString accountKey() const { return m_user + QLatin1Char('@') + m_host; }
+    /// Storage identity: the wallet entry and the on-disk message cache are
+    /// filed under this. Deliberately keyed on the login, not the e-mail
+    /// address — rebasing it would orphan every cached folder and stored
+    /// password on existing installs. Imported archives carry an explicit
+    /// cacheKey instead, so filling in server details later (which changes
+    /// user/host) does not orphan the imported mail.
+    QString accountKey() const
+    {
+        return m_cacheKey.isEmpty() ? m_user + QLatin1Char('@') + m_host : m_cacheKey;
+    }
     /// Fills the folder model from the disk cache (instant sidebar).
     void loadCachedFolderModel();
     /// Records a body-derived attachment kind (e.g. calendar invite) in the
@@ -483,6 +517,11 @@ private:
     /// Stops and joins the writer thread after flushing its queue. It restarts
     /// on the next queueBodyWrite().
     void stopBodyWriter();
+    /// True once every background writer has stopped (see reclaimDiskSpace).
+    bool writersIdle() const;
+    /// Polls for that, then starts the vacuum thread. Polling rather than
+    /// joining: the GUI thread must keep serving the event loop meanwhile.
+    void startVacuumWhenWritersIdle();
 
     /// Cached missingBodyCount() for one folder — see the .cpp for why.
     int missingBodiesIn(const QString &folder);
@@ -586,8 +625,8 @@ private:
     /// Records the To/Cc addresses of a message from the Sent folder in the
     /// recipient-autocompletion store.
     void harvestRecipients(const KMime::Message *msg);
-    /// The account's own sending address (used as From, and excluded from
-    /// reply-all recipient lists).
+    /// The account's own sending address, bare — no display name. This is the
+    /// SMTP envelope sender, and the address excluded from reply-all lists.
     QString ownAddress() const;
     /// The account signature as an HTML fragment ready to splice into a
     /// compose body; empty when no signature is set.
@@ -655,6 +694,17 @@ private:
     int m_port = 993;
     int m_security = SslTls;
     QString m_user;
+    /// The address mail is sent from. Separate from m_user because a login
+    /// name need not be an address (and need not share its domain). Empty on
+    /// accounts saved before this was a field; ownAddress() then falls back to
+    /// the old guess rather than forcing everyone through the account dialog.
+    QString m_email;
+    /// The name recipients see in From, e.g. "Jane Roe" <jane@example.com>.
+    /// Optional: empty sends a bare address, which is what every account did
+    /// before this field existed.
+    QString m_displayName;
+    /// Optional Organization: header. Empty sends no such header at all.
+    QString m_organization;
     QString m_password;
     QString m_smtpHost;
     int m_smtpPort = 587;
@@ -664,6 +714,8 @@ private:
     QString m_clientSecret;
     QString m_signature; ///< per-account signature (HTML, may be a full doc)
     bool m_htmlMail = true; ///< send multipart text+HTML; false = plain text only
+    bool m_local = false;   ///< local archive: never connect, never sync
+    QString m_cacheKey;     ///< fixed storage key of an imported archive ("" = user@host)
     QString m_refreshToken;
     QString m_accessToken;
     QDateTime m_accessTokenExpiry;
@@ -706,6 +758,8 @@ private:
     QThread *m_migrateThread = nullptr; ///< attachment externalisation of old mail
     QAtomicInt m_migrateCancel;
     QThread *m_reindexThread = nullptr; ///< off-thread body text extraction
+    QThread *m_importThread = nullptr;  ///< Thunderbird mbox import worker
+    QAtomicInt m_importStop;            ///< asks the importer to stop mid-file
     QThread *m_purgeThread = nullptr; ///< background removal of that archive
     QThread *m_folderOpThread = nullptr; ///< cache re-key / purge after a folder move
     QAtomicInt m_folderOpCancel;

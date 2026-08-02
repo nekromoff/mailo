@@ -40,6 +40,7 @@
 
 #include <kmime/content.h>
 #include <kmime/message.h>
+#include <kmime/types.h>
 #include <kmime/util.h>
 
 #include <qt6keychain/keychain.h>
@@ -516,7 +517,10 @@ MailClient::MailClient(QObject *parent)
     m_store.open();
     // Claim any pre-multi-account cache rows for the account they were
     // written by (the one active at upgrade time), then scope everything.
-    m_store.adoptLegacyCache(accountKey());
+    // Never for a local archive: its key was born after the migration and
+    // must not adopt another account's leftovers.
+    if (!m_local)
+        m_store.adoptLegacyCache(accountKey());
     m_store.setAccountKey(accountKey());
 
     // Instant startup from cache: folders and INBOX appear before (and
@@ -684,22 +688,35 @@ void MailClient::setDateFormat(const QString &format)
     Q_EMIT dateFormatChanged();
 }
 
-QVariantList MailClient::cachedFolderList(int index)
+/// Storage key of account \a index straight from settings — same rule as
+/// accountKey(), for the sidebar paths that inspect non-active accounts.
+/// Empty when the index is unknown or the account has no identity yet.
+static QString storedAccountKeyAt(QSettings &s, int index)
 {
-    QSettings s = appSettings();
-    QString user, host;
+    QString user, host, cacheKey;
     const int count = s.beginReadArray(QStringLiteral("accounts"));
     if (index >= 0 && index < count) {
         s.setArrayIndex(index);
         user = s.value(QStringLiteral("user")).toString();
         host = s.value(QStringLiteral("host")).toString();
+        cacheKey = s.value(QStringLiteral("cacheKey")).toString();
     }
     s.endArray();
+    if (!cacheKey.isEmpty())
+        return cacheKey;
     if (host.isEmpty() && user.isEmpty())
+        return {};
+    return user + QLatin1Char('@') + host;
+}
+
+QVariantList MailClient::cachedFolderList(int index)
+{
+    QSettings s = appSettings();
+    const QString key = storedAccountKeyAt(s, index);
+    if (key.isEmpty())
         return {};
 
     QVariantList out;
-    const QString key = user + QLatin1Char('@') + host;
     const QSet<QString> collapsed = FolderModel::savedCollapsed(key);
     const QStringList boxes = m_store.cachedFolders(key);
     // Levels of ALL rows up front: hasChildren must see the next row even
@@ -736,17 +753,10 @@ QVariantList MailClient::cachedFolderList(int index)
 void MailClient::toggleCachedCollapsed(int index, const QString &mailBox)
 {
     QSettings s = appSettings();
-    QString user, host;
-    const int count = s.beginReadArray(QStringLiteral("accounts"));
-    if (index >= 0 && index < count) {
-        s.setArrayIndex(index);
-        user = s.value(QStringLiteral("user")).toString();
-        host = s.value(QStringLiteral("host")).toString();
-    }
-    s.endArray();
-    if (host.isEmpty() && user.isEmpty())
+    const QString key = storedAccountKeyAt(s, index);
+    if (key.isEmpty())
         return;
-    FolderModel::toggleSavedCollapsed(user + QLatin1Char('@') + host, mailBox);
+    FolderModel::toggleSavedCollapsed(key, mailBox);
     ++m_cachedFolderRevision;
     Q_EMIT cachedFoldersChanged();
 }
@@ -810,12 +820,47 @@ static void migrateLegacyAccount(QSettings &s)
     // "account/secret" (pre-wallet plaintext) is handled by loadAccount below.
 }
 
+/// One-time migration: before the address had its own field, accounts kept it
+/// in the login, and that is what they sent as. Copy it across so the address
+/// is stored outright rather than re-derived on every send. Logins that are
+/// not addresses are left alone — there is nothing to copy, and ownAddress()
+/// keeps guessing for them until the account dialog is filled in.
+static void migrateAccountEmail(QSettings &s)
+{
+    const int count = s.beginReadArray(QStringLiteral("accounts"));
+    QList<int> needsEmail;
+    for (int i = 0; i < count; ++i) {
+        s.setArrayIndex(i);
+        if (!s.value(QStringLiteral("email")).toString().isEmpty())
+            continue;
+        if (s.value(QStringLiteral("user")).toString().contains(QLatin1Char('@')))
+            needsEmail.append(i);
+    }
+    s.endArray();
+    if (needsEmail.isEmpty())
+        return;
+
+    s.beginWriteArray(QStringLiteral("accounts"), count);
+    for (const int i : needsEmail) {
+        s.setArrayIndex(i);
+        s.setValue(QStringLiteral("email"), s.value(QStringLiteral("user")));
+    }
+    s.endArray();
+}
+
 void MailClient::loadAccount()
 {
     QSettings s = appSettings();
     migrateLegacyAccount(s);
+    migrateAccountEmail(s);
     m_currentAccount = s.value(QStringLiteral("currentAccount"), 0).toInt();
     loadAccountFields();
+
+    // A local archive owns no secret — don't touch the keyring for it.
+    if (m_local) {
+        m_secretReady = true;
+        return;
+    }
 
     // One-time migration: pre-wallet builds kept the password base64-encoded
     // in the config file. Move it into the system wallet and wipe it.
@@ -838,8 +883,13 @@ void MailClient::loadAccountFields()
         s.endArray();
         m_host.clear();
         m_user.clear();
+        m_email.clear();
+        m_displayName.clear();
+        m_organization.clear();
         m_smtpHost.clear();
         m_signature.clear();
+        m_local = false;
+        m_cacheKey.clear();
         return;
     }
     m_currentAccount = qBound(0, m_currentAccount, count - 1);
@@ -848,6 +898,9 @@ void MailClient::loadAccountFields()
     m_port = s.value(QStringLiteral("port"), 993).toInt();
     m_security = s.value(QStringLiteral("security"), int(SslTls)).toInt();
     m_user = s.value(QStringLiteral("user")).toString();
+    m_email = s.value(QStringLiteral("email")).toString();
+    m_displayName = s.value(QStringLiteral("displayName")).toString();
+    m_organization = s.value(QStringLiteral("organization")).toString();
     m_smtpHost = s.value(QStringLiteral("smtpHost")).toString();
     m_smtpPort = s.value(QStringLiteral("smtpPort"), 587).toInt();
     m_smtpSecurity = s.value(QStringLiteral("smtpSecurity"), 1).toInt();
@@ -856,6 +909,8 @@ void MailClient::loadAccountFields()
     m_clientSecret = s.value(QStringLiteral("clientSecret")).toString();
     m_signature = s.value(QStringLiteral("signature")).toString();
     m_htmlMail = s.value(QStringLiteral("htmlMail"), true).toBool();
+    m_local = s.value(QStringLiteral("local"), false).toBool();
+    m_cacheKey = s.value(QStringLiteral("cacheKey")).toString();
     s.endArray();
     m_accessToken.clear(); // tokens never survive an account switch
     m_refreshToken.clear();
@@ -961,8 +1016,14 @@ QStringList MailClient::accountNames() const
     const int count = s.beginReadArray(QStringLiteral("accounts"));
     for (int i = 0; i < count; ++i) {
         s.setArrayIndex(i);
+        // The list is user-facing, so it shows the address; the login and the
+        // host are only fallbacks for accounts that have no address stored.
+        const QString email = s.value(QStringLiteral("email")).toString();
         const QString user = s.value(QStringLiteral("user")).toString();
-        names.append(user.isEmpty() ? s.value(QStringLiteral("host")).toString() : user);
+        if (!email.isEmpty())
+            names.append(email);
+        else
+            names.append(user.isEmpty() ? s.value(QStringLiteral("host")).toString() : user);
     }
     s.endArray();
     return names;
@@ -980,6 +1041,11 @@ QVariantMap MailClient::accountDetails(int index) const
         out.insert(QStringLiteral("security"),
                    s.value(QStringLiteral("security"), int(SslTls)).toInt());
         out.insert(QStringLiteral("user"), s.value(QStringLiteral("user")).toString());
+        out.insert(QStringLiteral("email"), s.value(QStringLiteral("email")).toString());
+        out.insert(QStringLiteral("displayName"),
+                   s.value(QStringLiteral("displayName")).toString());
+        out.insert(QStringLiteral("organization"),
+                   s.value(QStringLiteral("organization")).toString());
         out.insert(QStringLiteral("smtpHost"), s.value(QStringLiteral("smtpHost")).toString());
         out.insert(QStringLiteral("smtpPort"), s.value(QStringLiteral("smtpPort"), 587).toInt());
         out.insert(QStringLiteral("smtpSecurity"),
@@ -992,6 +1058,7 @@ QVariantMap MailClient::accountDetails(int index) const
                    s.value(QStringLiteral("signature")).toString());
         out.insert(QStringLiteral("htmlMail"),
                    s.value(QStringLiteral("htmlMail"), true).toBool());
+        out.insert(QStringLiteral("local"), s.value(QStringLiteral("local"), false).toBool());
     }
     s.endArray();
     return out;
@@ -1001,15 +1068,44 @@ void MailClient::saveAccountDetails(int index, const QVariantMap &d)
 {
     const QString trimmedHost = d.value(QStringLiteral("host")).toString().trimmed();
     const QString trimmedUser = d.value(QStringLiteral("user")).toString().trimmed();
+    const QString trimmedEmail = d.value(QStringLiteral("email")).toString().trimmed();
+    // The display name goes into a header, so a newline in it would be a
+    // header-injection point — same treatment the compose fields get.
+    static const QRegularExpression headerCrlfRe(QStringLiteral("[\\r\\n]"));
+    const QString displayName = d.value(QStringLiteral("displayName"))
+                                    .toString()
+                                    .remove(headerCrlfRe)
+                                    .trimmed();
+    const QString organization = d.value(QStringLiteral("organization"))
+                                     .toString()
+                                     .remove(headerCrlfRe)
+                                     .trimmed();
     const QString password = d.value(QStringLiteral("password")).toString();
     const bool savePassword = d.value(QStringLiteral("savePassword"), true).toBool();
     const int authType = d.value(QStringLiteral("authType"), 0).toInt();
 
     QSettings s = appSettings();
+    // An imported archive keeps its storage key forever, and stops being a
+    // local (never-connecting) account the moment a server is filled in —
+    // that is the whole upgrade path from "dead archive" to live account.
+    bool wasLocal = false;
+    QString cacheKey;
     const int count = s.beginReadArray(QStringLiteral("accounts"));
+    if (index >= 0 && index < count) {
+        s.setArrayIndex(index);
+        wasLocal = s.value(QStringLiteral("local"), false).toBool();
+        cacheKey = s.value(QStringLiteral("cacheKey")).toString();
+    }
     s.endArray();
     if (index < 0 || index > count)
         index = count; // append as a new account
+    // The account dialog states the type outright ("Imported account"), so
+    // take it at its word. The old rule — an archive stays one while it has no
+    // server — remains the fallback for callers that do not say, which is what
+    // the import path itself relies on.
+    const bool stillLocal = d.contains(QStringLiteral("local"))
+        ? d.value(QStringLiteral("local")).toBool()
+        : (wasLocal && trimmedHost.isEmpty());
 
     s.beginWriteArray(QStringLiteral("accounts"), qMax(count, index + 1));
     s.setArrayIndex(index);
@@ -1017,6 +1113,9 @@ void MailClient::saveAccountDetails(int index, const QVariantMap &d)
     s.setValue(QStringLiteral("port"), d.value(QStringLiteral("port"), 993).toInt());
     s.setValue(QStringLiteral("security"), d.value(QStringLiteral("security"), 0).toInt());
     s.setValue(QStringLiteral("user"), trimmedUser);
+    s.setValue(QStringLiteral("email"), trimmedEmail);
+    s.setValue(QStringLiteral("displayName"), displayName);
+    s.setValue(QStringLiteral("organization"), organization);
     s.setValue(QStringLiteral("smtpHost"),
                d.value(QStringLiteral("smtpHost")).toString().trimmed());
     s.setValue(QStringLiteral("smtpPort"), d.value(QStringLiteral("smtpPort"), 587).toInt());
@@ -1028,6 +1127,8 @@ void MailClient::saveAccountDetails(int index, const QVariantMap &d)
                d.value(QStringLiteral("clientSecret")).toString());
     s.setValue(QStringLiteral("signature"), d.value(QStringLiteral("signature")).toString());
     s.setValue(QStringLiteral("htmlMail"), d.value(QStringLiteral("htmlMail"), true).toBool());
+    s.setValue(QStringLiteral("local"), stillLocal);
+    s.setValue(QStringLiteral("cacheKey"), cacheKey);
     s.endArray();
 
     if (authType == 0) {
@@ -1046,25 +1147,57 @@ void MailClient::saveAccountDetails(int index, const QVariantMap &d)
     switchAccountInternal(index, authType == 0 ? password : QString());
 }
 
-void MailClient::removeAccount(int index)
+/// Every per-account setting, in one place: the account array is rewritten
+/// wholesale when an account is removed or reordered, and a key missing from
+/// this list is a key silently dropped from every account by that rewrite.
+static QStringList accountSettingKeys()
 {
-    QSettings s = appSettings();
+    return {QStringLiteral("host"),         QStringLiteral("port"),
+            QStringLiteral("security"),     QStringLiteral("user"),
+            QStringLiteral("email"),        QStringLiteral("displayName"),
+            QStringLiteral("organization"),
+            QStringLiteral("smtpHost"),     QStringLiteral("smtpPort"),
+            QStringLiteral("smtpSecurity"), QStringLiteral("authType"),
+            QStringLiteral("clientId"),
+            QStringLiteral("clientSecret"), QStringLiteral("signature"),
+            QStringLiteral("htmlMail"),     QStringLiteral("local"),
+            QStringLiteral("cacheKey")};
+}
+
+/// Reads the whole account array out of \a s so it can be rewritten.
+static QList<QVariantMap> readAccountArray(QSettings &s)
+{
+    const QStringList keys = accountSettingKeys();
     QList<QVariantMap> accounts;
     const int count = s.beginReadArray(QStringLiteral("accounts"));
     for (int i = 0; i < count; ++i) {
         s.setArrayIndex(i);
         QVariantMap a;
-        const QStringList keys = {
-            QStringLiteral("host"), QStringLiteral("port"), QStringLiteral("security"),
-            QStringLiteral("user"), QStringLiteral("smtpHost"), QStringLiteral("smtpPort"),
-            QStringLiteral("smtpSecurity"), QStringLiteral("authType"),
-            QStringLiteral("clientId"), QStringLiteral("clientSecret"),
-            QStringLiteral("signature"), QStringLiteral("htmlMail")};
         for (const QString &k : keys)
             a.insert(k, s.value(k));
         accounts.append(a);
     }
     s.endArray();
+    return accounts;
+}
+
+/// Replaces the account array in \a s with \a accounts.
+static void writeAccountArray(QSettings &s, const QList<QVariantMap> &accounts)
+{
+    s.remove(QStringLiteral("accounts"));
+    s.beginWriteArray(QStringLiteral("accounts"), accounts.size());
+    for (int i = 0; i < accounts.size(); ++i) {
+        s.setArrayIndex(i);
+        for (auto it = accounts.at(i).constBegin(); it != accounts.at(i).constEnd(); ++it)
+            s.setValue(it.key(), it.value());
+    }
+    s.endArray();
+}
+
+void MailClient::removeAccount(int index)
+{
+    QSettings s = appSettings();
+    QList<QVariantMap> accounts = readAccountArray(s);
     if (index < 0 || index >= accounts.size())
         return;
 
@@ -1079,14 +1212,7 @@ void MailClient::removeAccount(int index)
     }
 
     accounts.removeAt(index);
-    s.remove(QStringLiteral("accounts"));
-    s.beginWriteArray(QStringLiteral("accounts"), accounts.size());
-    for (int i = 0; i < accounts.size(); ++i) {
-        s.setArrayIndex(i);
-        for (auto it = accounts.at(i).constBegin(); it != accounts.at(i).constEnd(); ++it)
-            s.setValue(it.key(), it.value());
-    }
-    s.endArray();
+    writeAccountArray(s, accounts);
 
     if (accounts.isEmpty()) {
         teardownSession();
@@ -1094,11 +1220,356 @@ void MailClient::removeAccount(int index)
         m_messageModel.clear();
         m_host.clear();
         m_user.clear();
+        m_email.clear();
         Q_EMIT accountChanged();
         Q_EMIT accountsChanged();
         return;
     }
     switchAccountInternal(qMin(m_currentAccount, int(accounts.size()) - 1), QString());
+}
+
+void MailClient::moveAccount(int from, int to)
+{
+    QSettings s = appSettings();
+    QList<QVariantMap> accounts = readAccountArray(s);
+    if (from == to || from < 0 || from >= accounts.size() || to < 0 || to >= accounts.size())
+        return;
+
+    accounts.move(from, to);
+    writeAccountArray(s, accounts);
+
+    // Order is presentation only: nothing keyed on an account (wallet entry,
+    // message cache) uses its position, so no session teardown is needed. The
+    // stored current-account index does, though — it has to follow the account
+    // it pointed at, or a reorder would silently switch accounts.
+    if (m_currentAccount == from)
+        m_currentAccount = to;
+    else if (from < m_currentAccount && m_currentAccount <= to)
+        --m_currentAccount;
+    else if (to <= m_currentAccount && m_currentAccount < from)
+        ++m_currentAccount;
+    s.setValue(QStringLiteral("currentAccount"), m_currentAccount);
+    Q_EMIT accountsChanged();
+}
+
+// --- Thunderbird import ---------------------------------------------------
+
+// The body-text extractor lives with the viewer code below; the importer
+// reuses it so imported mail is searchable exactly like fetched mail.
+static QString indexTextFor(KMime::Message *msg);
+
+/// One mbox file found under the import root, and the mailbox it becomes.
+struct MboxSource {
+    QString filePath;
+    QString mailBox;
+};
+
+/// True for a file that holds Thunderbird mbox mail. The ".msf" index next to
+/// it is the strong signal; without one, accept a file that begins like an
+/// mbox. Everything else Thunderbird keeps next to its mail — indexes, filter
+/// rules, junk training data — is ruled out by suffix first.
+static bool looksLikeMbox(const QFileInfo &info)
+{
+    static const QStringList kNoise = {
+        QStringLiteral("msf"),    QStringLiteral("dat"),  QStringLiteral("html"),
+        QStringLiteral("sqlite"), QStringLiteral("json")};
+    if (!info.isFile() || kNoise.contains(info.suffix().toLower()))
+        return false;
+    if (QFileInfo::exists(info.filePath() + QLatin1String(".msf")))
+        return true;
+    QFile f(info.filePath());
+    return f.open(QIODevice::ReadOnly) && f.read(5) == "From ";
+}
+
+/// Collects every mbox under \a dir, depth first. Thunderbird materialises
+/// the folder hierarchy as "<name>" (the mail) plus "<name>.sbd/" (the
+/// children), so stripping ".sbd" recovers the mailbox path.
+static void collectMboxFiles(const QDir &dir, const QString &prefix, QList<MboxSource> *out)
+{
+    const auto entries =
+        dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QFileInfo &info : entries) {
+        if (info.isDir()) {
+            QString name = info.fileName();
+            if (name.endsWith(QLatin1String(".sbd")))
+                name.chop(4);
+            if (name.isEmpty())
+                continue;
+            collectMboxFiles(QDir(info.filePath()),
+                             prefix.isEmpty() ? name : prefix + QLatin1Char('/') + name, out);
+        } else if (looksLikeMbox(info)) {
+            out->append({info.filePath(), prefix.isEmpty()
+                                              ? info.fileName()
+                                              : prefix + QLatin1Char('/') + info.fileName()});
+        }
+    }
+}
+
+/// Depth-first order with parents directly above their children — the sidebar
+/// derives the tree from row order plus separator count, so "Inbox" must sit
+/// immediately before "Inbox/Work" (a plain string sort could wedge
+/// "Inbox-old" between them).
+static void sortMailboxTree(QList<MboxSource> *sources)
+{
+    std::sort(sources->begin(), sources->end(), [](const MboxSource &a, const MboxSource &b) {
+        const QStringList pa = a.mailBox.split(QLatin1Char('/'));
+        const QStringList pb = b.mailBox.split(QLatin1Char('/'));
+        for (int i = 0; i < pa.size() && i < pb.size(); ++i) {
+            const int c = QString::compare(pa.at(i), pb.at(i), Qt::CaseInsensitive);
+            if (c != 0)
+                return c < 0;
+        }
+        return pa.size() < pb.size();
+    });
+}
+
+/// True for a real mbox From_ separator. Starting with "From " is not enough:
+/// Thunderbird does not always quote body paragraphs that begin with "From ",
+/// so the line must also end the way every writer's From_ line does — in a
+/// ctime-style timestamp ("Thu Jan 01 10:00:00 2015", sender optional).
+static bool isMboxSeparator(const QByteArray &line)
+{
+    if (!line.startsWith("From "))
+        return false;
+    static const QRegularExpression kFromLine(QStringLiteral(
+        "^From (?:\\S+ )?\\w{3} \\w{3} [ \\d]?\\d \\d{1,2}:\\d\\d(?::\\d\\d)? \\d{4}"));
+    return kFromLine.match(QString::fromLatin1(line)).hasMatch();
+}
+
+/// Streams \a path message by message: the classic mbox rule, a From_ line
+/// right after a blank line (or at file start) begins a new message.
+/// Returns false when the callback asked to stop.
+static bool forEachMboxMessage(const QString &path, const std::function<bool(QByteArray &&)> &fn)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return true; // unreadable: nothing to deliver, but not a stop
+    QByteArray current;
+    bool prevBlank = true;
+    while (!f.atEnd()) {
+        const QByteArray line = f.readLine();
+        if (prevBlank && isMboxSeparator(line)) {
+            if (!current.isEmpty() && !fn(std::move(current)))
+                return false;
+            current = QByteArray(); // the separator line is not part of the message
+        } else {
+            current += line;
+        }
+        prevBlank = line == "\n" || line == "\r\n";
+    }
+    if (!current.isEmpty() && !fn(std::move(current)))
+        return false;
+    return true;
+}
+
+void MailClient::importThunderbird(const QUrl &dir)
+{
+    if (m_importThread) {
+        Q_EMIT errorOccurred(tr("An import is already running."));
+        return;
+    }
+    const QString path = dir.isLocalFile() ? dir.toLocalFile() : dir.toString();
+    if (!QFileInfo(path).isDir()) {
+        Q_EMIT importFinished(false, tr("Not a folder: %1").arg(path));
+        return;
+    }
+
+    // The account appears in the pane right away, named after the profile
+    // folder; its folder list fills in when the worker finishes. It is an
+    // ordinary account in every visible way — the "local" flag that keeps it
+    // from ever connecting stays out of sight.
+    QString name = QDir(path).dirName();
+    if (name.endsWith(QLatin1String(".sbd")))
+        name.chop(4);
+    if (name.isEmpty())
+        name = tr("Imported mail");
+    QSettings s = appSettings();
+    QList<QVariantMap> accounts = readAccountArray(s);
+    // A second import of the same profile gets its own account and its own
+    // storage key — never silently merged into the first one's cache.
+    QStringList takenNames, takenKeys;
+    for (const QVariantMap &a : std::as_const(accounts)) {
+        takenNames << a.value(QStringLiteral("user")).toString();
+        takenKeys << a.value(QStringLiteral("cacheKey")).toString();
+    }
+    QString unique = name;
+    for (int n = 2; takenNames.contains(unique)
+                    || takenKeys.contains(QStringLiteral("import:") + unique);
+         ++n)
+        unique = name + QStringLiteral(" (%1)").arg(n);
+    const QString storeKey = QStringLiteral("import:") + unique;
+
+    QVariantMap account;
+    account.insert(QStringLiteral("user"), unique);
+    account.insert(QStringLiteral("local"), true);
+    account.insert(QStringLiteral("cacheKey"), storeKey);
+    accounts.append(account);
+    writeAccountArray(s, accounts);
+    Q_EMIT accountsChanged();
+
+    setStatus(tr("Importing %1").arg(unique));
+    const bool fts = m_store.ftsAvailable();
+    m_importStop.storeRelaxed(0);
+    m_importThread = QThread::create([this, path, storeKey, unique, fts] {
+        QSqlDatabase db = MailStore::openWorkerConnection(QStringLiteral("mailstore-import"));
+        QList<MboxSource> sources;
+        if (db.isOpen()) {
+            collectMboxFiles(QDir(path), QString(), &sources);
+            sortMailboxTree(&sources);
+        }
+        QStringList folders;
+        qint64 total = 0;
+        bool stopped = false;
+        for (const MboxSource &src : std::as_const(sources)) {
+            if (m_importStop.loadRelaxed()) {
+                stopped = true;
+                break;
+            }
+            folders.append(src.mailBox);
+            const QString scoped = storeKey + QChar(0x1f) + src.mailBox;
+            // For the rare message without a Date header: the mbox's own
+            // timestamp beats 1970 (and keeps the row out of ghost territory).
+            const QDateTime fallbackDate = QFileInfo(src.filePath).lastModified();
+            qint64 uid = 0;
+            QList<MessageListModel::Header> headers;
+            QList<MailStore::BodyWrite> bodies;
+            auto flush = [&] {
+                MailStore::storeHeadersOn(db, scoped, headers, fts);
+                MailStore::writeBodiesOn(db, bodies);
+                headers.clear();
+                bodies.clear();
+            };
+            const bool completed = forEachMboxMessage(src.filePath, [&](QByteArray &&raw) {
+                if (m_importStop.loadRelaxed())
+                    return false;
+                KMime::Message msg;
+                msg.setContent(KMime::CRLFtoLF(raw));
+                msg.parse();
+                // Thunderbird's own flags travel inside the message: bit 0x1
+                // is read, 0x8 is "deleted, not compacted yet" — not mail.
+                const auto *status = msg.headerByType("X-Mozilla-Status");
+                const uint flags =
+                    status ? status->asUnicodeString().trimmed().toUInt(nullptr, 16) : 0;
+                if (flags & 0x0008)
+                    return true;
+                MessageListModel::Header h;
+                h.uid = ++uid;
+                if (const auto *subject = std::as_const(msg).subject())
+                    h.subject = subject->asUnicodeString();
+                if (const auto *from = std::as_const(msg).from())
+                    h.from = from->asUnicodeString();
+                if (const auto *date = std::as_const(msg).date())
+                    h.date = date->dateTime();
+                if (!h.date.isValid())
+                    h.date = fallbackDate;
+                if (const auto *mid = std::as_const(msg).messageID(); mid && !mid->isEmpty())
+                    h.msgid = QString::fromLatin1(mid->identifier());
+                // Without Thunderbird flags everything counts as read — an
+                // archive must not arrive as ten years of unread badges.
+                h.seen = status ? (flags & 0x0001) : true;
+                h.attachKind = MailStore::headIndicatesAttachment(msg.head())
+                    ? MessageListModel::GenericAttachment
+                    : MessageListModel::NoAttachment;
+                // Deliberately no authInfo and no suspicious flag: imported
+                // mail is never validated (SPF/DKIM verdicts from another
+                // client's era would only produce noise).
+                MailStore::BodyWrite w;
+                w.scopedFolder = scoped;
+                w.uid = h.uid;
+                w.indexText = indexTextFor(&msg);
+                w.parts = stripAttachments(&msg);
+                if (!w.parts.isEmpty()) {
+                    msg.assemble();
+                    w.raw = msg.encodedContent();
+                } else {
+                    w.raw = raw;
+                }
+                headers.append(h);
+                bodies.append(std::move(w));
+                ++total;
+                if (headers.size() >= 50) {
+                    flush();
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, unique, total] {
+                            setStatus(tr("Importing %1 — %2 messages").arg(unique).arg(total));
+                        },
+                        Qt::QueuedConnection);
+                }
+                return true;
+            });
+            flush();
+            if (!completed) {
+                stopped = true;
+                break;
+            }
+        }
+        if (db.isOpen())
+            db.close();
+        QSqlDatabase::removeDatabase(QStringLiteral("mailstore-import"));
+
+        QMetaObject::invokeMethod(
+            this,
+            [this, storeKey, folders, total, unique, stopped] {
+                if (folders.isEmpty()) {
+                    // Nothing found: take the just-created account back out
+                    // rather than leaving an empty shell in the pane.
+                    QSettings s = appSettings();
+                    QList<QVariantMap> accounts = readAccountArray(s);
+                    for (int i = accounts.size() - 1; i >= 0; --i) {
+                        if (accounts.at(i).value(QStringLiteral("cacheKey")) == storeKey)
+                            accounts.removeAt(i);
+                    }
+                    writeAccountArray(s, accounts);
+                    Q_EMIT accountsChanged();
+                    setStatus({});
+                    Q_EMIT importFinished(false, tr("No Thunderbird mail found in that folder."));
+                    return;
+                }
+                m_store.storeFolders(storeKey, folders);
+                ++m_cachedFolderRevision;
+                Q_EMIT cachedFoldersChanged();
+                Q_EMIT accountsChanged();
+                // On a fresh install the pane is already "on" the imported
+                // slot (currentAccount 0), but nothing ever loaded it — switch
+                // for real so the archive appears without a restart.
+                {
+                    QSettings s = appSettings();
+                    const QList<QVariantMap> accounts = readAccountArray(s);
+                    for (int i = 0; i < accounts.size(); ++i) {
+                        if (accounts.at(i).value(QStringLiteral("cacheKey")) == storeKey
+                            && i == m_currentAccount) {
+                            switchAccountInternal(i, QString(), folders.first());
+                            break;
+                        }
+                    }
+                }
+                if (stopped) {
+                    setStatus(tr("Import interrupted"));
+                    Q_EMIT importFinished(false,
+                                          tr("Import of %1 was interrupted — what was already "
+                                             "imported is browsable.")
+                                              .arg(unique));
+                    return;
+                }
+                setStatus(tr("Imported %1 — %2 in %3")
+                              .arg(unique)
+                              .arg(countNoun(total, "message", "messages"))
+                              .arg(countNoun(folders.size(), "folder", "folders")));
+                Q_EMIT importFinished(true,
+                                      tr("Imported %1: %2 in %3.")
+                                          .arg(unique)
+                                          .arg(countNoun(total, "message", "messages"))
+                                          .arg(countNoun(folders.size(), "folder", "folders")));
+            },
+            Qt::QueuedConnection);
+    });
+    connect(m_importThread, &QThread::finished, this, [this] {
+        m_importThread->deleteLater();
+        m_importThread = nullptr;
+    });
+    m_importThread->setPriority(QThread::LowPriority);
+    m_importThread->start();
 }
 
 void MailClient::switchAccount(int index)
@@ -1148,7 +1619,14 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     const auto cached = m_store.cachedHeaders(m_selectedFolder);
     updatePageAnchor(cached);
     m_messageModel.setHeaders(cached);
-    if (!sessionPassword.isEmpty()) {
+    if (m_local) {
+        // A local archive has no server and no secret — don't touch the
+        // keyring, and never try to connect. The cache shown above is all
+        // there is, and that is the point.
+        ++m_walletGen; // cancel any in-flight wallet read
+        m_password.clear();
+        m_secretReady = true;
+    } else if (!sessionPassword.isEmpty()) {
         ++m_walletGen; // cancel any in-flight wallet read
         m_password = sessionPassword;
         m_secretReady = true;
@@ -1159,6 +1637,12 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     Q_EMIT accountChanged();
     Q_EMIT accountsChanged();
 
+    if (m_local) {
+        setStatus(tr("%1 — %2 messages")
+                      .arg(m_selectedFolder)
+                      .arg(m_store.cachedHeaderCount(m_selectedFolder)));
+        return;
+    }
     if (!hasAccount())
         return;
     if (m_secretReady)
@@ -1221,7 +1705,21 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
     const QString fromAddr = ownAddress();
 
     auto msg = std::make_shared<KMime::Message>();
-    msg->from()->fromUnicodeString(fromAddr);
+    // Built as a Mailbox rather than a "Name <addr>" string so KMime does the
+    // quoting and RFC 2047 encoding — a display name may hold a comma, a
+    // quote, or non-ASCII, none of which survive naive concatenation.
+    KMime::Types::Mailbox fromMailbox;
+    fromMailbox.setAddress(fromAddr.toUtf8());
+    if (!m_displayName.isEmpty())
+        fromMailbox.setName(m_displayName);
+    msg->from()->addAddress(fromMailbox);
+    // Organization is optional, and an empty one is not a header worth
+    // sending — recipients would see a blank field rather than nothing.
+    if (!m_organization.isEmpty()) {
+        auto org = std::make_unique<KMime::Headers::Generic>("Organization");
+        org->fromUnicodeString(m_organization);
+        msg->setHeader(std::move(org));
+    }
     for (const QString &addr : toList)
         msg->to()->fromUnicodeString(msg->to()->asUnicodeString().isEmpty()
                                          ? addr.trimmed()
@@ -1463,6 +1961,13 @@ void MailClient::appendToSentFolder(const QByteArray &rawMessage)
 
 QString MailClient::ownAddress() const
 {
+    // What the account explicitly says it sends as, when it says so. The rest
+    // is the pre-"email"-field fallback: it only ever guessed right when the
+    // login happened to be the address, or the mail domain happened to match
+    // the SMTP host's parent. Kept so accounts saved before the field existed
+    // behave exactly as they did.
+    if (!m_email.isEmpty())
+        return m_email;
     return m_user.contains(QLatin1Char('@'))
         ? m_user
         : m_user + QLatin1Char('@') + m_smtpHost.section(QLatin1Char('.'), 1);
@@ -1793,10 +2298,28 @@ void MailClient::setStatus(const QString &text)
         return;
 
     const int maxTrail = 6;
-    if (!m_statusTrail.isEmpty() && statusStem(m_statusTrail.first()) == statusStem(text)) {
-        if (m_statusTrail.first() == text)
+    // Collapse against the whole trail, not just its head. Two operations
+    // reporting progress at once take turns at the head, so a head-only check
+    // never matched and the trail filled with one alternating pair repeated
+    // over and over — "Importing Mail — 43931 messages · Trash — caching 1
+    // body · Importing Mail — 43581 messages · …". One crumb per subject is
+    // what the collapse was always meant to give.
+    int existing = -1;
+    const QString stem = statusStem(text);
+    for (int i = 0; i < m_statusTrail.size(); ++i) {
+        if (statusStem(m_statusTrail.at(i)) == stem) {
+            existing = i;
+            break;
+        }
+    }
+    if (existing >= 0) {
+        if (m_statusTrail.at(existing) == text)
             return; // identical — nothing changed
-        m_statusTrail.first() = text; // same subject, updated detail/numbers
+        // Updated in place rather than moved to the front: with two operations
+        // running, promoting every update would have them swapping positions
+        // on each tick, which reads as flicker even though it is only ever two
+        // crumbs. Their numbers change where they stand.
+        m_statusTrail[existing] = text;
     } else {
         m_statusTrail.prepend(text);
         while (m_statusTrail.size() > maxTrail)
@@ -2159,6 +2682,10 @@ void MailClient::acquireTokenAndConnect()
 
 void MailClient::connectAccount()
 {
+    // A local archive never connects — silently, so nothing in the UI ever
+    // hints that this account is anything other than a quiet one.
+    if (m_local)
+        return;
     if (!hasAccount()) {
         Q_EMIT errorOccurred(tr("No account configured yet."));
         return;
@@ -2344,6 +2871,12 @@ MailClient::~MailClient()
     qCDebug(logTrace, "shutdown: joining reindex");
     if (m_reindexThread)
         m_reindexThread->wait();
+    // The importer checks the stop flag per message, so this join is short; a
+    // partial import stays browsable and a re-import gets its own account.
+    qCDebug(logTrace, "shutdown: stopping import");
+    m_importStop.storeRelaxed(1);
+    if (m_importThread)
+        m_importThread->wait();
     // A vacuum cannot be interrupted; joining is the only safe option, and it
     // is why the UI warns before starting one.
     qCDebug(logTrace, "shutdown: joining vacuum");
@@ -2390,18 +2923,49 @@ void MailClient::reclaimDiskSpace()
     m_syncPaused = true;
     m_backfillTimer.stop();
     m_reindexTimer.stop();
-    // VACUUM takes an exclusive lock — every other writer must be finished,
-    // not merely asked to stop, before it starts.
-    stopAllMailPurge();
-    stopAttachmentMigration();
-    // The body writer was the one background writer left running through a
-    // rebuild: its batches would have sat on busy_timeout for 15 s a piece
-    // against the exclusive lock, and any that timed out would have lost a
-    // fetched body. Stopping it flushes the queue first.
-    stopBodyWriter();
-    const qint64 before = m_store.databaseBytes();
+    // Ask the writers to stop, but do NOT join them here. A worker only checks
+    // its cancel flag between batches, and a batch mid-statement on a large
+    // cache can run for many seconds — joining on the GUI thread blocked the
+    // event loop for exactly that long, so the desktop marked the window
+    // unresponsive and offered to kill it, all before the "Reclaiming disk
+    // space" dialog had had a chance to paint.
+    m_purgeCancel.storeRelaxed(1);
+    m_migrateCancel.storeRelaxed(1);
+    if (m_bodyWriterThread) {
+        // The body writer was the one background writer left running through a
+        // rebuild: its batches would have sat on busy_timeout for 15 s a piece
+        // against the exclusive lock, and any that timed out would have lost a
+        // fetched body. Stopping it flushes the queue first.
+        m_bodyWriterStop.storeRelaxed(1);
+        m_bodyWriteWake.wakeAll();
+    }
     setStatus(tr("Reclaiming disk space — this can take several minutes"));
+    startVacuumWhenWritersIdle();
+}
 
+/// True once every background writer has stopped. The purge and migration
+/// threads clear their own pointer from a queued finished handler, so a null
+/// pointer means stopped *and* reaped; the body writer is joined here, which
+/// costs nothing once it has finished.
+bool MailClient::writersIdle() const
+{
+    return !m_purgeThread && !m_migrateThread
+        && (!m_bodyWriterThread || m_bodyWriterThread->isFinished());
+}
+
+/// VACUUM takes an exclusive lock, so every other writer must have finished —
+/// not merely been asked to stop — before it starts. Waiting for that by
+/// polling keeps the event loop running, which is what lets the modal dialog
+/// appear and the window keep answering the compositor.
+void MailClient::startVacuumWhenWritersIdle()
+{
+    if (!writersIdle()) {
+        QTimer::singleShot(100, this, [this] { startVacuumWhenWritersIdle(); });
+        return;
+    }
+    stopBodyWriter(); // already finished: joins and deletes immediately
+
+    const qint64 before = m_store.databaseBytes();
     m_vacuumThread = QThread::create([this, before] {
         QString error;
         const bool ok = MailStore::vacuum(&error);
@@ -3316,9 +3880,13 @@ void MailClient::openFolder(const QString &mailBox)
 
     if (!m_connected || !m_session) {
         // Not cached.size(): that is one page (max 1000 rows), not the folder.
-        setStatus(tr("%1 — offline, %2 cached")
-                      .arg(mailBox)
-                      .arg(m_store.cachedHeaderCount(mailBox)));
+        // A local archive is not "offline" — the cache is the whole account.
+        setStatus(m_local ? tr("%1 — %2 messages")
+                                .arg(mailBox)
+                                .arg(m_store.cachedHeaderCount(mailBox))
+                          : tr("%1 — offline, %2 cached")
+                                .arg(mailBox)
+                                .arg(m_store.cachedHeaderCount(mailBox)));
         return;
     }
     setBusy(true);
@@ -3634,6 +4202,24 @@ void MailClient::loadMoreMessages()
     fetchOlderFromServer();
 }
 
+bool MailClient::loadAllCachedMessages()
+{
+    if (m_searchActive || m_pageUid <= 0)
+        return false;
+    // One unlimited query rather than a loop of pages: the folder index
+    // already orders these rows, so the cost is in handing them to the model,
+    // and doing that once beats doing it eighty times. For a local archive
+    // this is the whole folder, and so genuinely the oldest message; for a
+    // server account it is as far back as the cache goes — anything older
+    // still has to be backfilled before it can be jumped to.
+    const auto rest = m_store.cachedHeadersBefore(m_selectedFolder, m_pageDate, m_pageUid, -1);
+    if (rest.isEmpty())
+        return false;
+    updatePageAnchor(rest);
+    m_messageModel.appendHeaders(rest);
+    return true;
+}
+
 void MailClient::fetchOlderFromServer()
 {
     if (!m_connected || !m_session || m_busy || m_headerFetch
@@ -3810,6 +4396,17 @@ void MailClient::searchMessages(const QString &query, int field)
             return;
         }
         m_messageModel.applyFilter(re);
+        return;
+    }
+
+    // A local archive has no server to ask, but the whole archive is in the
+    // cache — the local index pass IS the search.
+    if (m_local && !m_selectedFolder.isEmpty()) {
+        m_searchSeen.clear();
+        m_searching = true;
+        m_searchFound = 0;
+        Q_EMIT searchingChanged();
+        localKeywordFilter(trimmed, tr("Search results"), /*append=*/false, field == 0);
         return;
     }
 
@@ -4952,7 +5549,10 @@ void MailClient::startDkimVerification(MessageContext *ctx)
     ctx->m_dkimTrusted = false;
     ctx->m_dkimChecking = false;
     ctx->m_dkimAttempt = 0;
-    if (!m_dkimVerifier || ctx->m_raw.isEmpty()) {
+    // No verification for imported archive mail: the DNS keys its signatures
+    // were made against are long gone, so every check would report a failure
+    // that says nothing about the message.
+    if (m_local || !m_dkimVerifier || ctx->m_raw.isEmpty()) {
         Q_EMIT ctx->dkimChanged();
         return;
     }
@@ -5185,7 +5785,11 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
             ? local.toString(QStringLiteral("hh:mm"))
             : local.toString(m_dateFormat + QStringLiteral(" hh:mm"));
     }
-    const QString authInfo = trustedAuthResults(cmsg, trustedAuthDomainsForHost(m_host));
+    // Imported archive mail gets no authentication verdicts at all: there is
+    // no receiving server whose Authentication-Results could be trusted, and
+    // years-old DKIM keys are long rotated — every check would just fail.
+    const QString authInfo =
+        m_local ? QString() : trustedAuthResults(cmsg, trustedAuthDomainsForHost(m_host));
 
     ctx->m_subject = subject;
     ctx->m_from = from;
@@ -5225,6 +5829,10 @@ MessageContext *MailClient::detachReading()
     ctx->m_textBody = src->m_textBody;
     ctx->m_raw = src->m_raw;
     ctx->m_uid = src->m_uid;
+    // What makes this message *this* message: a uid is only unique within a
+    // folder, and a folder name only within an account.
+    ctx->m_sourceKey = accountKey() + QLatin1Char('\n') + m_selectedFolder
+        + QLatin1Char('\n') + QString::number(src->m_uid);
     ctx->m_senderAddress = src->m_senderAddress;
     ctx->m_junk = src->m_junk;
     ctx->m_remoteAllowed = src->m_remoteAllowed;

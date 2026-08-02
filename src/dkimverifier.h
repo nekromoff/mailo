@@ -159,14 +159,22 @@ private:
     /// signature and its seal with the same selector more often than not, and a
     /// long chain would otherwise mean a DNS round trip per hop.
     ArcResult verifyArcChain(const QByteArray &head, const QByteArray &body,
-                             QHash<QString, QByteArray> *keyCache) const;
+                             QHash<QString, QByteArray> *keyCache);
 
     /// DNS TXT for a `<selector>._domainkey.<domain>` record, through
-    /// \a cache. An empty result with *\a tempError false means "no such key".
+    /// \a cache (per message) and m_dnsCache (across messages, TTL-bound).
+    /// An empty result with *\a tempError false means "no such key".
     QByteArray publicKeyRecord(const QString &dnsName, bool *tempError,
-                               QHash<QString, QByteArray> *cache) const;
+                               QHash<QString, QByteArray> *cache);
 
     QByteArray m_testKeyRecord;
+
+    /// Cross-message DNS cache. Only touched from the verifier's own thread.
+    struct CachedKey {
+        QByteArray record; ///< empty = the domain publishes no such key
+        qint64 expiry = 0; ///< secsSinceEpoch after which it must be re-asked
+    };
+    QHash<QString, CachedKey> m_dnsCache;
 };
 
 Q_DECLARE_METATYPE(DkimResult)

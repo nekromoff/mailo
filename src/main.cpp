@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
+#include <QApplication>
 #include <QGuiApplication>
 #include <QIcon>
 #include <QQmlApplicationEngine>
@@ -53,7 +54,12 @@ int main(int argc, char *argv[])
     ViewerSchemeHandler::registerScheme();
     QtWebEngineQuick::initialize();
 
-    QGuiApplication app(argc, argv);
+    // QApplication, not QGuiApplication, purely for the file pickers. KDE's
+    // native ones are widget-based, so without QtWidgets in the process the
+    // platform theme cannot offer them and Qt Quick's own pickers open
+    // instead — no Places sidebar, and colors of their own rather than the
+    // desktop's. Nothing else here uses a widget.
+    QApplication app(argc, argv);
     QGuiApplication::setOrganizationName(QStringLiteral("mailo"));
     QGuiApplication::setApplicationName(QStringLiteral("mailo"));
     QGuiApplication::setApplicationVersion(QStringLiteral(MAILO_VERSION));
@@ -78,6 +84,14 @@ int main(int argc, char *argv[])
 
     if (qEnvironmentVariableIsEmpty("QT_QUICK_CONTROLS_STYLE"))
         QQuickStyle::setStyle(QStringLiteral("org.kde.desktop"));
+    // What anything org.kde.desktop does not implement falls back to. It does
+    // not implement the file/folder/color pickers, and off a KDE session (no
+    // platform theme to supply the native ones) Qt Quick's are what opens.
+    // Left to itself that fallback is the Basic style, whose colors are
+    // hardcoded rather than taken from the palette: a pale blue selection
+    // under white text, roughly 1.6:1, and identical in a dark theme. Fusion
+    // follows the system palette instead.
+    QQuickStyle::setFallbackStyle(QStringLiteral("Fusion"));
 
     ViewerSchemeHandler *viewerHandler = ViewerSchemeHandler::install();
 

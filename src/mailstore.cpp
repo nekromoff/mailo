@@ -497,12 +497,21 @@ qint64 MailStore::maxCachedUid(const QString &folder)
 void MailStore::storeHeaders(const QString &folder,
                              const QList<MessageListModel::Header> &headers)
 {
-    if (!m_db.isOpen() || headers.isEmpty())
+    if (!m_db.isOpen())
         return;
     SlowGuard guard("storeHeaders");
-    m_db.transaction();
-    const QString key = scoped(folder);
-    QSqlQuery q(m_db);
+    storeHeadersOn(m_db, scoped(folder), headers, m_ftsAvailable);
+}
+
+void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
+                               const QList<MessageListModel::Header> &headers,
+                               bool ftsAvailable)
+{
+    if (!db.isOpen() || headers.isEmpty())
+        return;
+    db.transaction();
+    const QString key = scopedFolder;
+    QSqlQuery q(db);
     // Header refreshes only know "has attachment or not" (attach 0/1); a
     // refined kind (2 = calendar invite) learned from the full body survives.
     q.prepare(QStringLiteral(
@@ -520,8 +529,8 @@ void MailStore::storeHeaders(const QString &folder,
         " suspicious = excluded.suspicious, auth = excluded.auth,"
         " attach = CASE WHEN messages.attach > 1 AND excluded.attach = 1"
         " THEN messages.attach ELSE excluded.attach END"));
-    QSqlQuery ins(m_db);
-    if (m_ftsAvailable) {
+    QSqlQuery ins(db);
+    if (ftsAvailable) {
         // Keyed by messages.rowid — an O(1) lookup. Never filter fts by its
         // UNINDEXED folder/uid columns here: that is a full-index scan.
         ins.prepare(QStringLiteral(
@@ -542,7 +551,7 @@ void MailStore::storeHeaders(const QString &folder,
         q.addBindValue(h.attachKind);
         q.addBindValue(h.msgid.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : h.msgid);
         q.exec();
-        if (m_ftsAvailable) {
+        if (ftsAvailable) {
             ins.addBindValue(h.subject);
             ins.addBindValue(h.from);
             ins.addBindValue(key);
@@ -552,7 +561,7 @@ void MailStore::storeHeaders(const QString &folder,
             ins.exec();
         }
     }
-    m_db.commit();
+    db.commit();
 }
 
 void MailStore::setAttachKind(const QString &folder, qint64 uid, int kind)
