@@ -62,6 +62,10 @@ QVariant FolderModel::data(const QModelIndex &index, int role) const
         return hasChildren(allIndex);
     case ExpandedRole:
         return !m_collapsed.contains(f.mailBox);
+    case UnreadRole:
+        return m_unread.value(f.mailBox, 0);
+    case HiddenUnreadRole:
+        return m_hiddenUnread.value(allIndex, 0);
     }
     return {};
 }
@@ -75,7 +79,21 @@ QHash<int, QByteArray> FolderModel::roleNames() const
         {SelectableRole, "selectable"},
         {HasChildrenRole, "hasChildren"},
         {ExpandedRole, "expanded"},
+        {UnreadRole, "unread"},
+        {HiddenUnreadRole, "hiddenUnread"},
     };
+}
+
+void FolderModel::setUnreadCounts(QHash<QString, int> counts)
+{
+    if (counts == m_unread)
+        return; // recounts land often and usually say the same thing
+    m_unread = std::move(counts);
+    recomputeHiddenUnread();
+    if (m_visible.isEmpty())
+        return;
+    Q_EMIT dataChanged(index(0), index(m_visible.size() - 1),
+                       {UnreadRole, HiddenUnreadRole});
 }
 
 QStringList FolderModel::allMailBoxes() const
@@ -179,5 +197,27 @@ void FolderModel::rebuildVisible()
         m_visible.append(i);
         if (m_collapsed.contains(f.mailBox))
             skipDeeperThan = f.level;
+    }
+    recomputeHiddenUnread();
+}
+
+void FolderModel::recomputeHiddenUnread()
+{
+    m_hiddenUnread.assign(m_all.size(), 0);
+    const QSet<int> visible(m_visible.cbegin(), m_visible.cend());
+    for (int i = 0; i < m_all.size(); ++i) {
+        if (visible.contains(i))
+            continue; // it is on screen and speaks for itself
+        const int unread = m_unread.value(m_all.at(i).mailBox, 0);
+        if (unread == 0)
+            continue;
+        // Credit every ancestor, not just the nearest: with two levels folded
+        // the number has to reach the one row that is actually drawn.
+        for (int j = i - 1, level = m_all.at(i).level; j >= 0 && level > 0; --j) {
+            if (m_all.at(j).level < level) {
+                level = m_all.at(j).level;
+                m_hiddenUnread[j] += unread;
+            }
+        }
     }
 }

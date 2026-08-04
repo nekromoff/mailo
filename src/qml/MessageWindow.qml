@@ -21,6 +21,11 @@ Item {
     /// The uiSettings object from Main.qml (for the bgColor override).
     property var ui: null
 
+    /// Marks this page as showing a message, so the host can route the mail
+    /// shortcuts (Reply, Forward) at whatever is actually on screen instead of
+    /// assuming the reading pane.
+    readonly property bool isMessageTab: true
+
     signal replyRequested(bool replyAll)
     signal forwardRequested()
 
@@ -62,6 +67,8 @@ Item {
         anchors.fill: parent
         context: win.context
         ui: win.ui
+        // Find and View source belong to the tab in front; see MessageViewer.
+        shortcutsActive: win.StackLayout.isCurrentItem
         Kirigami.Theme.colorSet: Kirigami.Theme.Window
         Kirigami.Theme.inherit: false
         onReplyRequested: replyAll => win.replyRequested(replyAll)

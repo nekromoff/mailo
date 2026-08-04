@@ -60,13 +60,128 @@ Item {
     // closes outright on success.
     property bool sending: false
 
+    // --- OpenPGP -----------------------------------------------------------
+
+    /// Sign / encrypt this message. Initialised from the account defaults when
+    /// the window opens; both stay switchable per message.
+    property bool pgpSign: false
+    property bool pgpEncrypt: false
+
+    /// True when encryption was switched off by a missing key rather than by
+    /// the user. Only then may it switch itself back on — an explicit "off"
+    /// from the user has to stay off.
+    property bool pgpEncryptSuppressed: false
+
+    /// address -> fingerprint for every recipient typed so far, "" where no
+    /// usable key is available. Recomputed as the fields are edited, because it is
+    /// what decides whether encryption is possible at all.
+    property var pgpRecipientKeys: ({})
+
+    readonly property bool pgpAvailable: Pgp.available && Mail.accountPgpKeyFp !== ""
+
+    function recipientList() {
+        const all = (toField.text + "," + ccField.text + "," + bccField.text).split(",")
+        const out = []
+        for (let i = 0; i < all.length; ++i) {
+            const a = all[i].trim()
+            if (a.length > 0 && out.indexOf(a) < 0)
+                out.push(a)
+        }
+        return out
+    }
+
+    /// Recipients we hold no encryption key for.
+    function missingKeys() {
+        const out = []
+        const list = recipientList()
+        for (let i = 0; i < list.length; ++i) {
+            if (!pgpRecipientKeys[list[i]])
+                out.push(list[i])
+        }
+        return out
+    }
+
+    /// Addresses already looked up this session, so a field being typed into
+    /// does not fire a lookup per keystroke — and so an address with no
+    /// published key is asked about once, not forever.
+    property var pgpLookedUp: ({})
+
+    function refreshRecipientKeys() {
+        if (!pgpAvailable) {
+            pgpRecipientKeys = ({})
+            return
+        }
+        pgpRecipientKeys = Pgp.encryptionKeysFor(recipientList())
+        const missing = missingKeys()
+        // A recipient whose key is missing must not leave encryption armed:
+        // the send would be refused, which is worse than the toggle going off
+        // in front of the user.
+        if (pgpEncrypt && missing.length > 0) {
+            pgpEncrypt = false
+            // Remember that it was the missing key that turned it off, not the
+            // user — so it can come back on by itself below.
+            pgpEncryptSuppressed = true
+        } else if (pgpEncryptSuppressed && missing.length === 0
+                   && Mail.accountPgpEncryptByDefault) {
+            // The recipient changed to one we do have a key for. The account
+            // says encrypt by default, so honour that rather than leaving the
+            // message quietly unencrypted because of a recipient who is no
+            // longer on it.
+            pgpEncrypt = true
+            pgpEncryptSuppressed = false
+        }
+        if (missing.length === 0 && !pgpEncrypt)
+            pgpEncryptSuppressed = false
+        if (Mail.accountPgpAutoWkd)
+            autoWkdTimer.restart()
+    }
+
+    /// Automatic WKD, once the typing settles. Only WKD: it asks the
+    /// recipient's own domain, which mailing them tells anyway. A keyserver
+    /// lookup would tell a third party who is about to be written to, so it
+    /// stays a deliberate click in the key manager (doc/openpgp.md §7).
+    Timer {
+        id: autoWkdTimer
+        interval: 1200
+        onTriggered: {
+            if (!sheet.pgpAvailable || !Mail.accountPgpAutoWkd)
+                return
+            const missing = sheet.missingKeys()
+            for (let i = 0; i < missing.length; ++i) {
+                const a = missing[i]
+                // Only complete-looking addresses: half-typed ones would send
+                // a query per keystroke to domains that do not exist.
+                if (sheet.pgpLookedUp[a] || a.indexOf("@") < 1 || a.indexOf(".") < 0)
+                    continue
+                sheet.pgpLookedUp[a] = true
+                Pgp.lookupWkd(a)
+            }
+        }
+    }
+
+    Connections {
+        target: Pgp
+        function onKeysChanged() { sheet.refreshRecipientKeys() }
+    }
+
     // Single send entry point for the button and the Ctrl+Enter shortcut.
     function doSend() {
         if (toField.text.trim().length === 0 || sending)
             return
+        // Never a silent downgrade: if encryption is on and a key is missing,
+        // the user decides what happens (doc/openpgp.md §9).
+        if (pgpEncrypt) {
+            const missing = missingKeys()
+            if (missing.length > 0) {
+                missingKeyDialog.addresses = missing
+                missingKeyDialog.open()
+                return
+            }
+        }
         sending = true
         Mail.sendMail(toField.text, ccField.text, bccField.text,
-                      subjectField.text, bodyEdit.text, attachments)
+                      subjectField.text, bodyEdit.text, attachments,
+                      pgpSign, pgpEncrypt)
     }
 
     /// Set while closing deliberately (sent, draft saved, discard confirmed),
@@ -160,6 +275,12 @@ Item {
         attachments = []
         content.ccExpanded = false
         focusBodyOnOpen = false
+        // The account's defaults, then the recipient scan — which may switch
+        // encryption back off if a key turns out to be missing.
+        pgpSign = Mail.accountPgpSignByDefault
+        pgpEncrypt = Mail.accountPgpEncryptByDefault
+        pgpEncryptSuppressed = Mail.accountPgpEncryptByDefault
+        refreshRecipientKeys()
         present()
     }
 
@@ -357,6 +478,91 @@ Item {
         }
     }
 
+    /// Reached only when encryption is on and a recipient has no key. Three
+    /// ways out, and none of them is "send it in the clear without saying so"
+    /// (doc/openpgp.md §9).
+    QQC2.Dialog {
+        id: missingKeyDialog
+        parent: QQC2.Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        title: "No key for every recipient"
+
+        property var addresses: []
+        /// Set while a lookup started from here is running, so the dialog can
+        /// report what came of it instead of closing on a silence.
+        property bool looking: false
+
+        footer: QQC2.DialogButtonBox {
+            QQC2.Button {
+                text: "Look up the key"
+                icon.name: "download"
+                enabled: Pgp.available && !missingKeyDialog.looking
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.ActionRole
+                onClicked: {
+                    missingKeyDialog.looking = true
+                    // WKD only: it asks the recipient's own domain, which
+                    // mailing them tells anyway. A keyserver would tell a third
+                    // party who is about to be written to, so that stays a
+                    // separate, deliberate action in the key manager.
+                    for (let i = 0; i < missingKeyDialog.addresses.length; ++i)
+                        Pgp.lookupWkd(missingKeyDialog.addresses[i])
+                }
+            }
+            QQC2.Button {
+                text: "Send unencrypted"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.DestructiveRole
+                onClicked: {
+                    missingKeyDialog.close()
+                    sheet.pgpEncrypt = false
+                    sheet.sending = true
+                    Mail.sendMail(toField.text, ccField.text, bccField.text,
+                                  subjectField.text, bodyEdit.text, sheet.attachments,
+                                  sheet.pgpSign, false)
+                }
+            }
+            QQC2.Button {
+                text: "Cancel"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.RejectRole
+                onClicked: missingKeyDialog.close()
+            }
+        }
+
+        Connections {
+            target: Pgp
+            enabled: missingKeyDialog.looking
+            function onKeysChanged() {
+                sheet.refreshRecipientKeys()
+                if (sheet.missingKeys().length === 0) {
+                    missingKeyDialog.looking = false
+                    missingKeyDialog.close()
+                    sheet.pgpEncrypt = true
+                    sheet.doSend()
+                }
+            }
+            function onLookupFinished(address, found, source) {
+                if (!found)
+                    missingKeyDialog.looking = false
+            }
+        }
+
+        contentItem: QQC2.Label {
+            width: Kirigami.Units.gridUnit * 22
+            text: {
+                const who = missingKeyDialog.addresses.join(", ")
+                if (missingKeyDialog.looking)
+                    return "Looking for a published key for " + who + "…"
+                return "This message is set to be encrypted, but no OpenPGP key "
+                     + "is available for " + who + ".\n\n"
+                     + "Mailo will not encrypt to the others and quietly leave "
+                     + who + " out, and it will not send in the clear without "
+                     + "asking. Look the key up, send this one unencrypted, or "
+                     + "cancel and deal with it later."
+            }
+            wrapMode: Text.Wrap
+        }
+    }
+
     QQC2.Dialog {
         id: discardDialog
         parent: QQC2.Overlay.overlay
@@ -393,7 +599,7 @@ Item {
                     discardDialog.close()
                     Mail.saveDraft(toField.text, ccField.text, bccField.text,
                                    subjectField.text, bodyEdit.text, sheet.attachments,
-                                   sheet.sourceDraftUid)
+                                   sheet.sourceDraftUid, sheet.pgpSign, sheet.pgpEncrypt)
                 }
             }
             QQC2.Button {
@@ -459,6 +665,21 @@ Item {
         onActivated: attachDialog.open()
     }
 
+    // List shortcuts. The formatting toolbar is out of the Tab chain, so these
+    // are how a list is made without the mouse; they only act while the body
+    // has focus, since that is the only place a list means anything. The
+    // sequences are the ones mail clients already use.
+    Shortcut {
+        sequence: "Ctrl+Shift+8"
+        enabled: sheet.pageActive && bodyEdit.activeFocus
+        onActivated: docHandler.toggleBulletList()
+    }
+    Shortcut {
+        sequence: "Ctrl+Shift+7"
+        enabled: sheet.pageActive && bodyEdit.activeFocus
+        onActivated: docHandler.toggleOrderedList()
+    }
+
     // Send shortcut (configurable; default Ctrl+Return). Also accepts the
     // numeric-keypad Enter alongside the configured sequence, and honours the
     // Send button's guard.
@@ -483,6 +704,9 @@ Item {
         AddressField {
             id: toField
             Layout.fillWidth: true
+            // Which recipients we hold keys for decides whether encryption is
+            // even possible, so it follows the field as it is typed.
+            onTextChanged: sheet.refreshRecipientKeys()
             placeholderText: "To (comma-separated)"
             // White field on the gray panel.
             Kirigami.Theme.colorSet: Kirigami.Theme.View
@@ -548,6 +772,7 @@ Item {
             Kirigami.Theme.colorSet: Kirigami.Theme.View
             Kirigami.Theme.inherit: false
         }
+
         QQC2.TextField {
             id: subjectField
             Layout.fillWidth: true
@@ -556,12 +781,115 @@ Item {
             Kirigami.Theme.inherit: false
         }
 
-        // Formatting toolbar
+        // Formatting toolbar.
+        //
+        // Tab order through the composer is the order a message is written in:
+        // recipients, subject, how it is sent (encrypt/sign), what goes with it
+        // (Attach), then the message itself. The formatting buttons are the one
+        // thing deliberately left out — Tab would land on five icons nobody is
+        // reaching for on the way to the body — so they carry shortcuts instead
+        // (Ctrl+B/I, Ctrl+Shift+8 and Ctrl+Shift+7, handled in the body below)
+        // and set activeFocusOnTab explicitly rather than leaving it to the
+        // style's focus policy.
         RowLayout {
             Layout.fillWidth: true
             spacing: Kirigami.Units.smallSpacing
 
+            // Encryption and signing sit with the formatting buttons because
+            // they are the same kind of thing: choices about this one message.
             QQC2.ToolButton {
+                id: encryptButton
+                activeFocusOnTab: true
+                visible: sheet.pgpAvailable
+                // A padlock, not the "mail-encrypted" envelope: next to the
+                // signing envelope the two were indistinguishable at 16px.
+                icon.name: "object-locked"
+                checkable: true
+                checked: sheet.pgpEncrypt
+                // Encrypting to a recipient whose key we do not hold is not
+                // possible, so the button says so rather than failing on send.
+                enabled: sheet.missingKeys().length === 0
+                         || sheet.recipientList().length === 0
+                onClicked: {
+                    sheet.pgpEncrypt = checked
+                    // From here the user has said what they want; nothing
+                    // switches it back on their behalf.
+                    sheet.pgpEncryptSuppressed = false
+                }
+                QQC2.ToolTip.text: {
+                    const missing = sheet.missingKeys()
+                    if (missing.length > 0)
+                        return "No OpenPGP key available for " + missing.join(", ")
+                             + ". Look one up in Settings → Encryption → Manage keys."
+                    return "Encrypt this message. The subject line is never "
+                         + "encrypted — it travels in the clear."
+                }
+                QQC2.ToolTip.visible: hovered
+            }
+            QQC2.ToolButton {
+                id: signButton
+                activeFocusOnTab: true
+                visible: sheet.pgpAvailable
+                icon.name: "mail-signed"
+                checkable: true
+                checked: sheet.pgpSign
+                onClicked: sheet.pgpSign = checked
+                QQC2.ToolTip.text: "Sign this message with your OpenPGP key, so "
+                                   + "recipients can tell it really came from you"
+                QQC2.ToolTip.visible: hovered
+            }
+            // Key status for whoever is in the recipient fields. It lives
+            // beside the toggles it explains rather than in the header block,
+            // where it pushed the Subject field around as addresses were
+            // typed. Elided: this is a hint, not a paragraph.
+            // A key lookup is a network round trip to the recipient's domain,
+            // so it needs to look like one.
+            Spinner {
+                running: sheet.pgpAvailable && Pgp.busy
+                         && sheet.recipientList().length > 0
+                Layout.alignment: Qt.AlignVCenter
+            }
+            QQC2.Label {
+                visible: sheet.pgpAvailable && sheet.recipientList().length > 0
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 16
+                elide: Text.ElideRight
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                opacity: 0.8
+                text: {
+                    const missing = sheet.missingKeys()
+                    if (missing.length > 0 && Pgp.busy)
+                        return "looking for a key…"
+                    if (missing.length === 0)
+                        return "key available for every recipient"
+                    return missing.length === 1
+                        ? "no key available for " + missing[0]
+                        : "no key available for " + missing.length + " recipients"
+                }
+                QQC2.ToolTip.text: {
+                    const missing = sheet.missingKeys()
+                    if (missing.length === 0)
+                        return "An OpenPGP key is available for every recipient, so "
+                             + "this message can be encrypted."
+                    return "No OpenPGP key available for " + missing.join(", ")
+                         + (Mail.accountPgpAutoWkd
+                            ? " — Mailo is asking their domain for one."
+                            : " — encryption is unavailable for this message.")
+                }
+                QQC2.ToolTip.visible: hovered
+                HoverHandler { id: keyStatusHover }
+                property bool hovered: keyStatusHover.hovered
+            }
+
+            // Fixed height, never fillHeight: this row sits in a ColumnLayout,
+            // and a separator that fills it stretches the whole toolbar down
+            // the window.
+            Kirigami.Separator {
+                visible: sheet.pgpAvailable
+                Layout.preferredHeight: Kirigami.Units.gridUnit
+                Layout.alignment: Qt.AlignVCenter
+            }
+            QQC2.ToolButton {
+                activeFocusOnTab: false
                 icon.name: "format-text-bold"
                 checkable: true
                 checked: docHandler.bold
@@ -570,6 +898,7 @@ Item {
                 QQC2.ToolTip.visible: hovered
             }
             QQC2.ToolButton {
+                activeFocusOnTab: false
                 icon.name: "format-text-italic"
                 checkable: true
                 checked: docHandler.italic
@@ -578,6 +907,13 @@ Item {
                 QQC2.ToolTip.visible: hovered
             }
             QQC2.SpinBox {
+                // A SpinBox is three focusable things in a trenchcoat: taking
+                // the control itself out of the chain leaves its inner editor
+                // in it, which is what still caught Tab here. NoFocus settles
+                // it for the whole control, editor included.
+                focusPolicy: Qt.NoFocus
+                activeFocusOnTab: false
+                Component.onCompleted: if (contentItem) contentItem.activeFocusOnTab = false
                 from: 6
                 to: 48
                 value: docHandler.fontSize
@@ -586,19 +922,24 @@ Item {
                 QQC2.ToolTip.visible: hovered
             }
             QQC2.ToolButton {
+                activeFocusOnTab: false
                 icon.name: "format-list-unordered"
                 onClicked: docHandler.toggleBulletList()
-                QQC2.ToolTip.text: "Bulleted list"
+                QQC2.ToolTip.text: "Bulleted list (Ctrl+Shift+8). Typing "
+                                   + "\"- \" at the start of a line also starts one."
                 QQC2.ToolTip.visible: hovered
             }
             QQC2.ToolButton {
+                activeFocusOnTab: false
                 icon.name: "format-list-ordered"
                 onClicked: docHandler.toggleOrderedList()
-                QQC2.ToolTip.text: "Numbered list"
+                QQC2.ToolTip.text: "Numbered list (Ctrl+Shift+7). Typing "
+                                   + "\"1. \" at the start of a line also starts one."
                 QQC2.ToolTip.visible: hovered
             }
             Item { Layout.fillWidth: true }
             QQC2.ToolButton {
+                activeFocusOnTab: true
                 icon.name: "mail-attachment"
                 text: "Attach"
                 onClicked: attachDialog.open()
@@ -618,6 +959,11 @@ Item {
                 delegate: QQC2.Button {
                     required property url modelData
                     required property int index
+                    // Tabbable on purpose: the chips sit between Attach and the
+                    // body, so attaching a file and then removing it again is
+                    // all keyboard work. Space or Enter on a focused chip
+                    // removes that attachment.
+                    activeFocusOnTab: true
                     icon.name: "edit-delete-remove"
                     text: modelData.toString().split("/").pop()
                     onClicked: {
@@ -650,8 +996,10 @@ Item {
                 Kirigami.Theme.colorSet: Kirigami.Theme.View
                 Kirigami.Theme.inherit: false
 
-                // Standard formatting shortcuts (Ctrl+B / Ctrl+I) toggle the
-                // toolbar's bold/italic on the current selection.
+                // Formatting is keyboard-only work here — the toolbar is out of
+                // the Tab chain (see below), so every button it holds has a
+                // shortcut. Bold/italic are the standard ones; the list pair
+                // follows what mail clients already use (Ctrl+Shift+8 / 7).
                 Keys.onPressed: event => {
                     if (event.modifiers & Qt.ControlModifier) {
                         if (event.key === Qt.Key_B) {
@@ -661,6 +1009,45 @@ Item {
                             docHandler.italic = !docHandler.italic
                             event.accepted = true
                         }
+                        // The list pair is a Shortcut below rather than a key
+                        // code here: Shift+8 is not Key_8 on every layout, and
+                        // QKeySequence knows that where a raw key code does not.
+                        return
+                    }
+                    // Writing a list before there is one is how people start
+                    // one; make it the real thing rather than leaving them a
+                    // line that only looks like it. A dash needs the space
+                    // after it — "-" alone is still a dash — while a number is
+                    // committed by its own "." or ")", which is already a
+                    // marker and nothing else.
+                    if (event.key === Qt.Key_Space) {
+                        if (docHandler.startBulletList())
+                            event.accepted = true
+                    } else if (event.text === "." || event.text === ")") {
+                        // event.text, not a key code: ")" is Shift+0 on some
+                        // layouts and its own key on others.
+                        if (docHandler.startOrderedList(event.text))
+                            event.accepted = true
+                    } else if (event.key === Qt.Key_Return
+                               || event.key === Qt.Key_Enter) {
+                        // Enter on an empty item ends the list: the first Enter
+                        // made the empty item, this one leaves it behind.
+                        if (docHandler.leaveEmptyListItem())
+                            event.accepted = true
+                    } else if (event.key === Qt.Key_Tab) {
+                        // In a list, Tab is a level rather than a character or
+                        // a jump to the next field; outside one it stays the
+                        // way out of the body.
+                        if (docHandler.indentListItem())
+                            event.accepted = true
+                    } else if (event.key === Qt.Key_Backtab) {
+                        if (docHandler.outdentListItem())
+                            event.accepted = true
+                    } else if (event.key === Qt.Key_Backspace) {
+                        // At the start of an item there is no character to
+                        // rub out, so Backspace steps back out of the level.
+                        if (docHandler.outdentAtBlockStart())
+                            event.accepted = true
                     }
                 }
             }
@@ -687,7 +1074,8 @@ Item {
                 QQC2.ToolTip.visible: hovered
                 onClicked: Mail.saveDraft(toField.text, ccField.text, bccField.text,
                                           subjectField.text, bodyEdit.text, sheet.attachments,
-                                          sheet.sourceDraftUid)
+                                          sheet.sourceDraftUid, sheet.pgpSign,
+                                          sheet.pgpEncrypt)
             }
             Item { Layout.fillWidth: true } // spacer takes the remaining left space
 

@@ -2,6 +2,7 @@
 // the parse that KIMAP has already performed?
 #include <KMime/Message>
 #include <QByteArray>
+#include <QCryptographicHash>
 #include <QFile>
 #include <cstdio>
 
@@ -49,8 +50,11 @@ static QByteArray realistic()
 
 static void report(const char *label, const QByteArray &got, const QByteArray &want)
 {
-    printf("%-34s %-6s (%lld vs %lld bytes)\n", label, got == want ? "SAME" : "DIFFER",
-           (long long)got.size(), (long long)want.size());
+    // The digest is printed so a variant can be matched against bytes this
+    // program never sees — in particular the bodies.raw of a real cache.
+    printf("%-34s %-6s (%lld vs %lld bytes) sha256=%s\n", label,
+           got == want ? "SAME" : "DIFFER", (long long)got.size(), (long long)want.size(),
+           QCryptographicHash::hash(got, QCryptographicHash::Sha256).toHex().left(16).constData());
     if (got != want) {
         qsizetype i = 0;
         while (i < got.size() && i < want.size() && got[i] == want[i])
@@ -78,5 +82,13 @@ int main(int argc, char **argv)
     report("encodedContent()", KMime::LFtoCRLF(msg->encodedContent()), original);
     report("head() + body()",
            KMime::LFtoCRLF(msg->head() + QByteArrayLiteral("\n") + msg->body()), original);
+
+    // assemble() is the destructive one: it marks every part dirty, so the
+    // following encodedContent() re-encodes each body from its decoded form
+    // using KMime's own quoted-printable choices rather than the sender's.
+    // Nothing above this line reproduces that, which is why a test that only
+    // exercised setContent()+parse() cleared KMime by mistake.
+    msg->assemble();
+    report("assemble() + encodedContent()", KMime::LFtoCRLF(msg->encodedContent()), original);
     return 0;
 }

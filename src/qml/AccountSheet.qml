@@ -21,7 +21,12 @@ Item {
     // No Cancel: everything outside the Accounts page applies live, so the
     // button only ever discarded account edits while silently keeping the
     // rest. Escape (and the tab's close button) dismisses without saving.
-    function close() { closeRequested() }
+    function close() {
+        // Leaving is a commit for the autosaved half of the form: a field left
+        // focused when the tab is dismissed has still been filled in.
+        savePrefs()
+        closeRequested()
+    }
 
     // Chrome-gray panel (Window color set), same treatment as the compose
     // page; the user's bgColor override wins.
@@ -36,6 +41,13 @@ Item {
 
     /// 0 = Accounts, 1 = General, 2 = Look and feel, 3 = Shortcuts
     property int page: 0
+    // Leaving the Accounts page commits what was typed on it, the same as
+    // leaving a field does.
+    onPageChanged: savePrefs()
+
+    // The tab going away — including with the window — is the last chance to
+    // store a field that still had focus.
+    Component.onDestruction: savePrefs()
 
     /// True while a shortcut-capture button is reading raw key presses — the
     /// Esc shortcut below stands down so Esc can cancel the capture instead
@@ -46,8 +58,7 @@ Item {
     /// the old open() semantics — reload the account form on every opening —
     /// stay unchanged).
     function open() {
-        editIndex = Mail.accountNames.length > 0 ? Mail.currentAccount : -1
-        loadDetails()
+        selectAccount(Mail.accountNames.length > 0 ? Mail.currentAccount : -1)
         present()
     }
 
@@ -106,12 +117,168 @@ Item {
     /// MailClient::loadAccount). Kept in step with that rule so the field shows
     /// what sending would actually use rather than leaving it to be guessed
     /// behind the user's back.
+    // --- OpenPGP key selection -------------------------------------------
+    //
+    // The account stores a fingerprint and nothing else; everything shown here
+    // is looked up in the keyring each time, so a key deleted or expired
+    // outside mailo shows up as what it now is rather than as a stale label.
+
+    /// Fingerprint of the key chosen for this account; "" = encryption off.
+    property string pgpKeyFp: ""
+
+    /// Secret keys that carry this account's address, as maps from
+    /// PgpEngine::secretKeysFor. Reloaded when the keyring or the address
+    /// changes — a key generated for the address should appear without
+    /// reopening the page.
+    property var pgpKeyChoices: []
+
+    /// True while the stored fingerprint names a key that is not in the
+    /// keyring (deleted elsewhere, or the account address was changed). The
+    /// key still gets a row, marked as missing: silently dropping it would
+    /// turn "your mail is signed" into "your mail is not" with no notice.
+    readonly property bool pgpKeyMissing: {
+        if (pgpKeyFp === "")
+            return false
+        for (let i = 0; i < pgpKeyChoices.length; ++i)
+            if (pgpKeyChoices[i].fingerprint === pgpKeyFp)
+                return false
+        return true
+    }
+
+    function pgpShortFingerprint(fp) {
+        if (!fp)
+            return ""
+        const tail = fp.length > 16 ? fp.slice(-16) : fp
+        return tail.replace(/(.{4})/g, "$1 ").trim()
+    }
+
+    function pgpKeyLabel(k) {
+        const who = (k.name && k.name !== "") ? k.name : k.email
+        let label = (who && who !== "" ? who + " — " : "") + pgpShortFingerprint(k.fingerprint)
+        if (k.missing)
+            label += " (not in your keyring)"
+        else if (k.revoked)
+            label += " (revoked)"
+        else if (k.expired)
+            label += " (expired)"
+        return label
+    }
+
+    readonly property var pgpKeyLabels: {
+        const labels = ["None — do not sign or encrypt"]
+        for (let i = 0; i < pgpKeyChoices.length; ++i)
+            labels.push(pgpKeyLabel(pgpKeyChoices[i]))
+        // Last entry, and not a key: an action. A user whose key lives in a
+        // backup file rather than in GnuPG's keyring would otherwise find an
+        // empty picker and no way forward from it.
+        labels.push("Import a private key file…")
+        return labels
+    }
+
+    /// Index of the "Import a private key file…" row — the one entry that
+    /// selects nothing.
+    readonly property int pgpImportIndex: pgpKeyChoices.length + 1
+
+    readonly property int pgpKeyIndex: {
+        if (pgpKeyFp === "")
+            return 0
+        for (let i = 0; i < pgpKeyChoices.length; ++i)
+            if (pgpKeyChoices[i].fingerprint === pgpKeyFp)
+                return i + 1
+        return 0
+    }
+
+    readonly property var pgpSelectedKey:
+        pgpKeyIndex > 0 ? pgpKeyChoices[pgpKeyIndex - 1] : null
+
+    readonly property bool pgpKeyHintIsBad:
+        pgpSelectedKey !== null && (pgpSelectedKey.missing === true
+                                    || pgpSelectedKey.bad === true)
+
+    readonly property string pgpKeyHint: {
+        if (pgpKeyFp === "") {
+            if (Pgp.available && pgpKeyChoices.length === 0
+                && emailField.text.trim() !== "")
+                return "No usable key in your keyring carries this address — "
+                     + "expired and revoked keys are not offered. Generate "
+                     + "one, or pick \"Import a private key file…\" above to "
+                     + "point GnuPG at a key you already have — an exported "
+                     + "backup, or one from another machine."
+            return ""
+        }
+        const k = pgpSelectedKey
+        if (k === null)
+            return ""
+        if (k.missing === true)
+            return "This key is no longer in your keyring. Import it again, or "
+                 + "choose another one."
+        if (k.revoked === true)
+            return "This key is revoked and cannot be used."
+        if (k.expired === true)
+            return "This key has expired. Extend it in GnuPG or choose another one."
+        // An expiry that arrives unannounced means signing simply stops
+        // working one morning, and correspondents' copies of the key go stale
+        // at the same time. Six weeks is enough notice to extend it and let
+        // the new expiry date propagate.
+        if (k.expires && !isNaN(k.expires.getTime())) {
+            const days = Math.floor((k.expires.getTime() - Date.now()) / 86400000)
+            if (days <= 42)
+                return days <= 0
+                    ? "This key expires today. Extend it in GnuPG."
+                    : "This key expires in " + days + (days === 1 ? " day" : " days")
+                      + ". Extend it in GnuPG before it does — a key that has "
+                      + "expired cannot sign, and your correspondents' copies "
+                      + "need the new date."
+        }
+        const full = k.fingerprint.replace(/(.{4})/g, "$1 ").trim()
+        // An invalid QDateTime — a key that never expires — arrives as an
+        // Invalid Date, which formats as "Invalid Date" rather than failing.
+        return full + (k.expires && !isNaN(k.expires.getTime())
+                       ? " · expires " + Qt.formatDate(k.expires, Locale.ShortFormat)
+                       : " · never expires")
+    }
+
+    /// Rebuilds the key list for the address currently in the form.
+    function reloadPgpKeys() {
+        if (!Pgp.available) {
+            pgpKeyChoices = []
+            return
+        }
+        const choices = Pgp.secretKeysFor(emailField.text.trim())
+        // A stored key that no longer matches still belongs in the list — see
+        // pgpKeyMissing.
+        if (pgpKeyFp !== "") {
+            let found = false
+            for (let i = 0; i < choices.length; ++i)
+                if (choices[i].fingerprint === pgpKeyFp)
+                    found = true
+            if (!found) {
+                const known = Pgp.keyInfo(pgpKeyFp)
+                if (known.fingerprint !== undefined) {
+                    // In the keyring, just not for this address — which is the
+                    // user's business, not something to overrule.
+                    choices.push(known)
+                } else {
+                    choices.push({fingerprint: pgpKeyFp, name: "", email: "",
+                                  missing: true, bad: true})
+                }
+            }
+        }
+        pgpKeyChoices = choices
+    }
+
+    Connections {
+        target: Pgp
+        function onKeysChanged() { sheet.reloadPgpKeys() }
+    }
+
     function derivedSmtpHost(imapHost) {
         const h = imapHost.trim()
         return h.length > 0 ? h.replace(/^imap/, "smtp") : ""
     }
 
     function loadDetails() {
+        loading = true
         const d = Mail.accountDetails(editIndex)
         hostPinned = (d.host ?? "") !== ""
         hostField.text = d.host ?? ""
@@ -144,6 +311,153 @@ Item {
         authBox.currentIndex = (d.local ?? false) ? 3 : (d.authType ?? 0)
         signatureEdit.text = d.signature ?? ""
         htmlMailBox.checked = d.htmlMail ?? true
+        pgpKeyFp = d.pgpKeyFp ?? ""
+        pgpSignBox.checked = d.pgpSignByDefault ?? false
+        pgpEncryptBox.checked = d.pgpEncryptByDefault ?? false
+        pgpAutoWkdBox.checked = d.pgpAutoWkd ?? true
+        reloadPgpKeys()
+        loading = false
+        // The baseline every later autosave is compared against: what is on
+        // screen now is what is stored.
+        savedPrefs = currentPrefs()
+        savedConnection = currentConnection()
+        prefsSaved = false
+        savedFlashTimer.stop()
+    }
+
+    /// The server and identity half of the form — everything the Save button
+    /// still owns, because changing any of it re-keys the cache and the wallet
+    /// entry and costs a reconnect.
+    function currentConnection() {
+        return {
+            host: hostField.text.trim(),
+            port: portField.value,
+            security: securityBox.currentIndex,
+            user: userField.text.trim(),
+            email: emailField.text.trim(),
+            smtpHost: smtpHostField.text.trim(),
+            smtpPort: smtpPortField.value,
+            smtpSecurity: smtpSecurityBox.currentIndex,
+            authType: authBox.currentIndex,
+            savePassword: savePasswordBox.checked,
+            password: passwordField.text
+        }
+    }
+
+    /// Those fields as last stored. Empty for a new account, which is why the
+    /// footer asks for a Save from the first keystroke.
+    property var savedConnection: ({})
+
+    readonly property bool connectionDirty: {
+        const now = currentConnection()
+        for (const k in now) {
+            if (savedConnection[k] !== now[k])
+                return true
+        }
+        return false
+    }
+
+    /// Moves the form to another account (or to the new-account draft),
+    /// storing whatever the current one had pending first.
+    function selectAccount(index) {
+        savePrefs()
+        editIndex = index
+        loadDetails()
+    }
+
+    // --- Autosaving the preference half of the form ----------------------
+    //
+    // Two halves, saved differently on purpose. Everything that only decides
+    // how mail is written — the display name, organization, signature, format,
+    // and the OpenPGP settings — is stored as soon as the field is done with,
+    // through MailClient::saveAccountPrefs, which writes settings and stops
+    // there. The server and identity fields still go through the Save button:
+    // they name the cache and the wallet entry and they cost a reconnect, and
+    // committing a half-typed address on the way past is not a thing to do
+    // quietly.
+
+    /// True while loadDetails() is filling the form. Every change it makes is
+    /// a stored value arriving, not an edit, and saving it back would write
+    /// the previous account's values into the newly selected one.
+    property bool loading: false
+
+    /// The preferences as last written, so a focus change that changed nothing
+    /// writes nothing.
+    property var savedPrefs: ({})
+
+    /// The preference fields as they stand.
+    function currentPrefs() {
+        return {
+            displayName: displayNameField.text,
+            organization: organizationField.text,
+            signature: signatureEdit.text,
+            htmlMail: htmlMailBox.checked,
+            pgpKeyFp: sheet.pgpKeyFp,
+            // Without a key both are meaningless, and a stale "sign by
+            // default" left behind after the key was cleared would fail on
+            // every send instead of doing nothing.
+            pgpSignByDefault: sheet.pgpKeyFp !== "" && pgpSignBox.checked,
+            pgpEncryptByDefault: sheet.pgpKeyFp !== "" && pgpEncryptBox.checked,
+            pgpAutoWkd: pgpAutoWkdBox.checked
+        }
+    }
+
+    /// Stores the preference fields if any of them changed. Called when a
+    /// field is finished with — focus left, box ticked — and again on the way
+    /// out of the page, the account, or the tab.
+    function savePrefs() {
+        if (loading || editIndex < 0)
+            return
+        // An account that has since been removed or reordered: editIndex would
+        // now point at somebody else's settings. The C++ side bounds-checks
+        // too; this keeps the in-range-but-wrong-account case out of it.
+        if (editIndex >= Mail.accountNames.length)
+            return
+        const now = currentPrefs()
+        let changed = false
+        for (const k in now) {
+            if (savedPrefs[k] !== now[k])
+                changed = true
+        }
+        if (!changed)
+            return
+        Mail.saveAccountPrefs(editIndex, now)
+        savedPrefs = now
+        savedFlashTimer.restart()
+    }
+
+    /// How long "Saved" stays up. Long enough to be read, short enough that it
+    /// is not still claiming a save that happened a minute ago — and it takes
+    /// the Save button's place while it does, so it cannot be missed.
+    Timer {
+        id: savedFlashTimer
+        interval: 3000
+        onTriggered: sheet.prefsSaved = false
+        onRunningChanged: if (running) sheet.prefsSaved = true
+    }
+    property bool prefsSaved: false
+
+    /// Writes a window UI setting and says so. The Look and Shortcuts pages
+    /// have no Save button — every change there applies and stores itself, so
+    /// the footer's "Saved" is the only confirmation there is. Setting the
+    /// value through here rather than directly is what keeps that promise:
+    /// a change that skipped it would land silently.
+    /// The confirmation fires even when the value picked is the one already
+    /// stored: picking the same color or pressing the same key is still an
+    /// action taken, and a button that answers nothing reads as broken.
+    function setUi(key, value) {
+        if (!ui)
+            return
+        if (ui[key] !== value)
+            ui[key] = value
+        savedFlashTimer.restart()
+    }
+
+    /// Same for the application-wide settings behind the General page.
+    function setMail(key, value) {
+        if (Mail[key] !== value)
+            Mail[key] = value
+        savedFlashTimer.restart()
     }
 
     /// Persists the account form (the Save button). The tab stays open —
@@ -191,8 +505,26 @@ Item {
             authType: sheet.localAccount ? 0 : authBox.currentIndex,
             local: sheet.localAccount,
             signature: signatureEdit.text,
-            htmlMail: htmlMailBox.checked
+            htmlMail: htmlMailBox.checked,
+            // Only a pointer into the keyring — no key material is ever
+            // written to mailo's settings.
+            pgpKeyFp: sheet.pgpKeyFp,
+            // Without a key both are meaningless, and a stale "sign by
+            // default" left behind after the key was cleared would fail on
+            // every send instead of doing nothing.
+            pgpSignByDefault: sheet.pgpKeyFp !== "" && pgpSignBox.checked,
+            pgpEncryptByDefault: sheet.pgpKeyFp !== "" && pgpEncryptBox.checked,
+            pgpAutoWkd: pgpAutoWkdBox.checked
         })
+        // A new account is now a real one, and the form is editing it — say so,
+        // or its preferences would have nowhere to autosave to until the user
+        // picked it out of the list again.
+        if (editIndex < 0)
+            editIndex = Mail.currentAccount
+        // The explicit save wrote the preference half too, so both baselines
+        // move with it.
+        savedPrefs = currentPrefs()
+        savedConnection = currentConnection()
         // Saving does not close: a tab stays until the user closes it, and
         // settings are commonly saved several times in a sitting.
     }
@@ -229,6 +561,92 @@ Item {
         }
     }
 
+    KeyManagerSheet {
+        id: keyManagerSheet
+        // Which account a new key made from in there would be for.
+        ownerAddress: emailField.text.trim()
+        ownerName: displayNameField.text.trim()
+    }
+
+    /// Points GnuPG at a private key that is not in its keyring yet — an
+    /// exported backup, or a key moved from another machine. GnuPG asks for the
+    /// file's passphrase itself if it has one; Mailo never sees the key
+    /// material. From then on it is an ordinary key in the keyring, which is
+    /// also the honest thing to tell the user (the label below says so).
+    FileDialog {
+        id: privateKeyDialog
+        title: "Import a private key"
+        nameFilters: ["Key files (*.asc *.gpg *.pgp *.key)", "All files (*)"]
+        onAccepted: {
+            sheet.pgpStatus = "Importing…"
+            sheet.pgpStatusIsError = false
+            Pgp.importKeyFile(selectedFile)
+        }
+    }
+
+    /// Key generation, opened from the button below. Prefilled from the
+    /// account being edited — this key is meant to be its identity.
+    NewKeyDialog {
+        id: generateKeyDialog
+    }
+
+    /// One line under the account form for whatever the last key operation
+    /// did — generation and lookups finish long after the click that started
+    /// them, and silence would read as nothing having happened.
+    property string pgpStatus: ""
+    property bool pgpStatusIsError: false
+
+    Connections {
+        target: Pgp
+        function onKeyGenerated(fingerprint, error) {
+            if (error !== "") {
+                sheet.pgpStatus = "Key generation failed: " + error
+                sheet.pgpStatusIsError = true
+                return
+            }
+            // Neither a key nor an error: the passphrase prompt was dismissed.
+            if (fingerprint === "") {
+                sheet.pgpStatus = "Key generation was cancelled."
+                sheet.pgpStatusIsError = false
+                return
+            }
+            sheet.pgpStatus = "New key created."
+            sheet.pgpStatusIsError = false
+            // Adopt it straight away: generating a key from this page is a
+            // statement about what this account should sign with.
+            sheet.pgpKeyFp = fingerprint
+            sheet.reloadPgpKeys()
+            sheet.savePrefs()
+        }
+        function onErrorOccurred(text) {
+            sheet.pgpStatus = text
+            sheet.pgpStatusIsError = true
+        }
+        function onSecretKeyImported(fingerprint) {
+            // Importing a private key on the account page is a statement about
+            // what this account should sign with, so it is adopted straight
+            // away — the same as generating one.
+            sheet.pgpStatus = "Private key imported. It is now in GnuPG's keyring."
+            sheet.pgpStatusIsError = false
+            if (fingerprint !== "")
+                sheet.pgpKeyFp = fingerprint
+            sheet.reloadPgpKeys()
+            sheet.savePrefs()
+        }
+        function onImportFinished(imported, unchanged, error) {
+            if (error !== "") {
+                sheet.pgpStatus = "Import failed: " + error
+                sheet.pgpStatusIsError = true
+            } else if (imported === 0 && unchanged === 0) {
+                sheet.pgpStatus = "No key was found in that file."
+                sheet.pgpStatusIsError = true
+            }
+            // Success is reported by onSecretKeyImported for a private key;
+            // a public-only file says nothing here, because the account page
+            // is not where public keys are managed.
+        }
+    }
+
     DocumentHandler {
         id: signatureDocHandler
         document: signatureEdit.textDocument
@@ -259,7 +677,7 @@ Item {
     ColorDialog {
         id: bgColorDialog
         onAccepted: {
-            sheet.ui.bgColor = selectedColor.toString()
+            sheet.setUi("bgColor", selectedColor.toString())
             bgColorField.text = sheet.ui.bgColor
         }
     }
@@ -267,7 +685,7 @@ Item {
     ColorDialog {
         id: scaleColorDialog
         property int scaleIndex: 0
-        onAccepted: sheet.ui["scaleColor" + scaleIndex] = selectedColor.toString()
+        onAccepted: sheet.setUi("scaleColor" + scaleIndex, selectedColor.toString())
     }
 
     ColumnLayout {
@@ -385,11 +803,11 @@ Item {
                             if (isDraft) {
                                 // Already editing it — reloading would wipe
                                 // whatever has been typed so far.
+                                sheet.savePrefs()
                                 sheet.editIndex = -1
                                 return
                             }
-                            sheet.editIndex = index
-                            sheet.loadDetails()
+                            sheet.selectAccount(index)
                         }
                     }
                 }
@@ -399,10 +817,7 @@ Item {
                 icon.name: "list-add"
                 text: "New account"
                 highlighted: sheet.editIndex === -1
-                onClicked: {
-                    sheet.editIndex = -1
-                    sheet.loadDetails()
-                }
+                onClicked: sheet.selectAccount(-1)
             }
             QQC2.Button {
                 Layout.fillWidth: true
@@ -465,6 +880,9 @@ Item {
                     Layout.fillWidth: true
                     Layout.preferredWidth: Kirigami.Units.gridUnit * 12
                     placeholderText: "Full name"
+                    // Stored when the field is done with, not per keystroke.
+                    onActiveFocusChanged: if (!activeFocus) sheet.savePrefs()
+                    onEditingFinished: sheet.savePrefs()
                 }
                 QQC2.TextField {
                     id: organizationField
@@ -475,6 +893,8 @@ Item {
                     // the one most accounts leave empty. Only the chrome
                     // fades — text the user has typed stays full contrast.
                     opacity: activeFocus || text !== "" ? 1.0 : 0.75
+                    onActiveFocusChanged: if (!activeFocus) sheet.savePrefs()
+                    onEditingFinished: sheet.savePrefs()
                 }
             }
             QQC2.TextField {
@@ -488,6 +908,9 @@ Item {
                 onTextEdited: {
                     if (!sheet.userPinned)
                         userField.text = text
+                    // Which keys count as this account's identity is a question
+                    // about the address, so the picker follows it as it is typed.
+                    sheet.reloadPgpKeys()
                     // An archive has no server, and guessing one for it is not
                     // a harmless guess: an imported account stays local only
                     // while its server field is empty, so filling it in here
@@ -628,6 +1051,7 @@ Item {
                 Kirigami.FormData.label: "Message format:"
                 text: "Send HTML mail"
                 checked: true
+                onToggled: sheet.savePrefs()
             }
             QQC2.Label {
                 visible: !sheet.localAccount
@@ -637,6 +1061,164 @@ Item {
                       + "recipient can read it. Untick to send plain text only."
                 wrapMode: Text.Wrap
                 opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            // --- Encryption (OpenPGP) ---
+            //
+            // Nothing here holds key material: the only thing stored with the
+            // account is a fingerprint pointing into the user's GnuPG home
+            // (doc/openpgp.md §8). An imported archive gets the key manager and
+            // reading, but no signing or encrypting options — it never sends.
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Encryption"
+                Kirigami.FormData.isSection: true
+            }
+            QQC2.Label {
+                visible: !Pgp.available
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: Pgp.unavailableReason
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            RowLayout {
+                visible: Pgp.available && !sheet.localAccount
+                Kirigami.FormData.label: "Encryption key:"
+                spacing: Kirigami.Units.smallSpacing
+
+                QQC2.ComboBox {
+                    id: pgpKeyBox
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: Kirigami.Units.gridUnit * 18
+                    model: sheet.pgpKeyLabels
+                    // Index 0 is always "None", so the model index is one ahead
+                    // of the key list — keep the two in step in one place.
+                    currentIndex: sheet.pgpKeyIndex
+                    onActivated: {
+                        if (index === sheet.pgpImportIndex) {
+                            // An action, not a choice: put the selection back
+                            // where it was and let the file picker decide.
+                            currentIndex = Qt.binding(() => sheet.pgpKeyIndex)
+                            privateKeyDialog.open()
+                            return
+                        }
+                        sheet.pgpKeyFp =
+                            index === 0 ? "" : (sheet.pgpKeyChoices[index - 1].fingerprint ?? "")
+                        sheet.savePrefs()
+                    }
+                }
+                QQC2.Button {
+                    icon.name: "view-refresh"
+                    display: QQC2.AbstractButton.IconOnly
+                    text: "Reload keys"
+                    onClicked: Pgp.refresh()
+                    QQC2.ToolTip.text: "Re-read the keyring"
+                    QQC2.ToolTip.visible: hovered
+                }
+            }
+            QQC2.Label {
+                visible: Pgp.available && !sheet.localAccount && text !== ""
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: sheet.pgpKeyHint
+                wrapMode: Text.Wrap
+                // Red and bold only when the chosen key cannot actually be
+                // used, matching the DKIM badge's rule.
+                font.bold: sheet.pgpKeyHintIsBad
+                color: sheet.pgpKeyHintIsBad ? Kirigami.Theme.negativeTextColor
+                                             : Kirigami.Theme.textColor
+                opacity: sheet.pgpKeyHintIsBad ? 1.0 : 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            QQC2.CheckBox {
+                id: pgpSignBox
+                visible: Pgp.available && !sheet.localAccount
+                enabled: sheet.pgpKeyFp !== ""
+                Kirigami.FormData.label: "New message:"
+                text: "Sign"
+                onToggled: sheet.savePrefs()
+            }
+            QQC2.CheckBox {
+                id: pgpEncryptBox
+                visible: Pgp.available && !sheet.localAccount
+                enabled: sheet.pgpKeyFp !== ""
+                Kirigami.FormData.label: ""
+                // Just the preference. Earlier wordings ("Encrypt when every
+                // recipient has a key") put the *constraint* in the label,
+                // which read as something the user was opting into — but not
+                // holding a recipient's key makes encryption impossible
+                // whether this is ticked or not, and at tick time there are no
+                // recipients to speak of yet. The constraint belongs below.
+                text: "Encrypt"
+                onToggled: sheet.savePrefs()
+            }
+            QQC2.Label {
+                visible: Pgp.available && !sheet.localAccount
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "These set how the compose window opens; both stay "
+                      + "switchable per message.\n\n"
+                      + "Encrypting needs a public key for each recipient. When "
+                      + "one is missing, Mailo leaves encryption off for that "
+                      + "message and says so — it never quietly sends in the "
+                      + "clear.\n\n"
+                      + "The subject line is never encrypted — it travels in the "
+                      + "clear whatever these say."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            QQC2.CheckBox {
+                id: pgpAutoWkdBox
+                visible: Pgp.available && !sheet.localAccount
+                Kirigami.FormData.label: "Key discovery:"
+                text: "Look up recipient keys automatically"
+                onToggled: sheet.savePrefs()
+                QQC2.ToolTip.text: "Asks the recipient's own domain for a published "
+                                   + "key. Mailing someone already tells their "
+                                   + "domain that much. Keyservers are never asked "
+                                   + "without a click."
+                QQC2.ToolTip.visible: hovered
+            }
+            RowLayout {
+                visible: Pgp.available
+                Kirigami.FormData.label: sheet.localAccount ? "Keys:" : ""
+                spacing: Kirigami.Units.smallSpacing
+
+                QQC2.Button {
+                    icon.name: "application-pgp-keys"
+                    text: "Manage keys…"
+                    onClicked: {
+                        keyManagerSheet.accountAddress = emailField.text.trim()
+                        keyManagerSheet.open()
+                    }
+                }
+                QQC2.Button {
+                    visible: !sheet.localAccount
+                    icon.name: "list-add"
+                    text: "Generate a new key…"
+                    enabled: emailField.text.trim() !== ""
+                    onClicked: {
+                        // Set rather than bound: the dialog's fields are the
+                        // user's to correct once it is open.
+                        generateKeyDialog.address = emailField.text.trim()
+                        generateKeyDialog.displayName = displayNameField.text.trim()
+                        generateKeyDialog.open()
+                    }
+                }
+            }
+            QQC2.Label {
+                visible: Pgp.available && sheet.pgpStatus !== ""
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: sheet.pgpStatus
+                wrapMode: Text.Wrap
+                font.bold: sheet.pgpStatusIsError
+                color: sheet.pgpStatusIsError ? Kirigami.Theme.negativeTextColor
+                                              : Kirigami.Theme.textColor
+                opacity: sheet.pgpStatusIsError ? 1.0 : 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
 
@@ -695,6 +1277,11 @@ Item {
                         textFormat: TextEdit.RichText
                         wrapMode: TextEdit.Wrap
                         persistentSelection: true
+                        // The formatting buttons above take focus off the
+                        // editor and put it back, so this saves rather more
+                        // often than the text changes — savePrefs() writes
+                        // only when something actually differs.
+                        onActiveFocusChanged: if (!activeFocus) sheet.savePrefs()
                     }
                 }
                 QQC2.Label {
@@ -733,7 +1320,7 @@ Item {
                 validator: IntValidator { bottom: 0; top: 1440 }
                 onTextEdited: {
                     if (acceptableInput)
-                        Mail.refreshMinutes = parseInt(text)
+                        sheet.setMail("refreshMinutes", parseInt(text))
                 }
             }
             QQC2.Label {
@@ -741,6 +1328,41 @@ Item {
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Checks the open folder for new mail on this schedule when "
                       + "real-time push (IMAP IDLE) is not active. 0 turns it off."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Spam"
+                Kirigami.FormData.isSection: true
+            }
+            QQC2.TextField {
+                id: spamDaysField
+                Kirigami.FormData.label: "Delete spam after (days):"
+                implicitWidth: Kirigami.Units.gridUnit * 4
+                text: Mail.spamRetentionDays
+                validator: IntValidator { bottom: 0; top: 3650 }
+                onTextEdited: {
+                    if (acceptableInput)
+                        sheet.setMail("spamRetentionDays", parseInt(text))
+                }
+            }
+            QQC2.CheckBox {
+                Kirigami.FormData.label: ""
+                text: "Skip trash for spam"
+                checked: Mail.spamSkipTrash
+                onToggled: sheet.setMail("spamSkipTrash", checked)
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Spam sent longer ago than this is "
+                      + "removed automatically, once per connection — going by the "
+                      + "date the message carries, the one shown in the list. 0 keeps it "
+                      + "forever. With Skip trash on, deleting spam — by hand or "
+                      + "on this schedule — destroys it outright instead of "
+                      + "filing it in the trash to be cleared out twice."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -759,13 +1381,38 @@ Item {
                 readonly property var formats: ["dd/MM/yyyy", "dd.MM.yyyy", "dd-MM-yyyy",
                                                 "MM/dd/yyyy", "yyyy-MM-dd"]
                 currentIndex: Math.max(0, formats.indexOf(Mail.dateFormat))
-                onActivated: Mail.dateFormat = formats[currentIndex]
+                onActivated: sheet.setMail("dateFormat", formats[currentIndex])
             }
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Used for message dates in the list and the reading pane. "
                       + "Messages from today show only their time."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Sender authentication"
+                Kirigami.FormData.isSection: true
+            }
+            QQC2.CheckBox {
+                id: authVerifyBox
+                Kirigami.FormData.label: ""
+                text: "Verify DKIM, ARC, SPF and DMARC"
+                checked: Mail.authVerification
+                onToggled: sheet.setMail("authVerification", checked)
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Checks whether a message really came from the domain it "
+                      + "claims, and shows the result when you open it. DKIM and "
+                      + "ARC signatures are verified here, against keys looked up "
+                      + "in DNS; SPF and DMARC are read from what your mail server "
+                      + "reported. Turning this off stops all of it: no keys are "
+                      + "looked up, and no result is shown or stored."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -783,7 +1430,7 @@ Item {
                 validator: IntValidator { bottom: 0; top: 1024 }
                 onTextEdited: {
                     if (acceptableInput)
-                        Mail.maxBodyMB = parseInt(text)
+                        sheet.setMail("maxBodyMB", parseInt(text))
                 }
             }
             QQC2.Label {
@@ -859,7 +1506,7 @@ Item {
             QQC2.CheckBox {
                 Kirigami.FormData.label: "Log activity to console:"
                 checked: Mail.debugLogging
-                onToggled: Mail.debugLogging = checked
+                onToggled: sheet.setMail("debugLogging", checked)
             }
             QQC2.Label {
                 Kirigami.FormData.label: ""
@@ -889,7 +1536,7 @@ Item {
                 Kirigami.FormData.label: "Row size:"
                 model: ["Compact", "Medium", "Wide"]
                 currentIndex: sheet.ui ? sheet.ui.rowDensity : 1
-                onActivated: sheet.ui.rowDensity = currentIndex
+                onActivated: sheet.setUi("rowDensity", currentIndex)
             }
 
             // Only the composer is offered both ways: writing a message next
@@ -900,7 +1547,7 @@ Item {
                 Kirigami.FormData.label: "Compose in:"
                 model: ["Tab", "Separate window"]
                 currentIndex: sheet.ui && sheet.ui.composeInWindow ? 1 : 0
-                onActivated: sheet.ui.composeInWindow = (currentIndex === 1)
+                onActivated: sheet.setUi("composeInWindow", currentIndex === 1)
             }
             QQC2.Label {
                 Kirigami.FormData.label: ""
@@ -923,7 +1570,7 @@ Item {
                     // close the dialog before editingFinished ever fired.
                     onTextEdited: {
                         if (text === "" || /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(text))
-                            sheet.ui.bgColor = text
+                            sheet.setUi("bgColor", text)
                     }
                 }
                 Rectangle { // swatch
@@ -949,7 +1596,7 @@ Item {
                     QQC2.ToolTip.text: "Reset to theme default"
                     QQC2.ToolTip.visible: hovered
                     onClicked: {
-                        sheet.ui.bgColor = ""
+                        sheet.setUi("bgColor", "")
                         bgColorField.text = ""
                     }
                 }
@@ -966,15 +1613,21 @@ Item {
                 Kirigami.FormData.isSection: true
             }
             Repeater {
-                model: [1, 2, 3, 4, 5]
+                // 0 is "no label": it takes any mark off instead of putting one
+                // on, so it has a shortcut but nothing to pick a color for. It
+                // leads the list because that is where it belongs when reading
+                // down the rows — none, then 1 to 5.
+                model: [0, 1, 2, 3, 4, 5]
                 RowLayout {
                     id: scaleRow
                     required property int modelData
+                    readonly property bool isNoLabel: modelData === 0
                     readonly property string keyProp: "scaleKey" + modelData
                     readonly property string colorProp: "scaleColor" + modelData
                     // "Scale" is what the settings keys call these (scaleColor1…5);
                     // there is no scale to speak of, so the UI says what they are.
-                    Kirigami.FormData.label: "Label " + modelData + ":"
+                    Kirigami.FormData.label: isNoLabel ? "No label:"
+                                                       : "Label " + modelData + ":"
                     spacing: Kirigami.Units.smallSpacing
 
                     QQC2.Button {
@@ -1009,7 +1662,7 @@ Item {
                             }
                             const seq = shortcutsForm.sequenceFromEvent(event)
                             if (seq !== "") {
-                                sheet.ui[scaleRow.keyProp] = seq
+                                sheet.setUi(scaleRow.keyProp, seq)
                                 capturing = false
                             }
                         }
@@ -1019,9 +1672,10 @@ Item {
                         enabled: sheet.ui && sheet.ui[scaleRow.keyProp] !== ""
                         QQC2.ToolTip.text: "Clear shortcut"
                         QQC2.ToolTip.visible: hovered
-                        onClicked: sheet.ui[scaleRow.keyProp] = ""
+                        onClicked: sheet.setUi(scaleRow.keyProp, "")
                     }
                     Rectangle { // swatch; hatched look when undefined
+                        visible: !scaleRow.isNoLabel
                         width: Kirigami.Units.gridUnit * 1.2
                         height: width
                         radius: 3
@@ -1037,6 +1691,7 @@ Item {
                         }
                     }
                     QQC2.Button {
+                        visible: !scaleRow.isNoLabel
                         text: "Pick…"
                         icon.name: "color-picker"
                         onClicked: {
@@ -1049,11 +1704,12 @@ Item {
                         }
                     }
                     QQC2.Button {
+                        visible: !scaleRow.isNoLabel
                         icon.name: "edit-clear"
                         enabled: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
                         QQC2.ToolTip.text: "Clear color"
                         QQC2.ToolTip.visible: hovered
-                        onClicked: sheet.ui[scaleRow.colorProp] = ""
+                        onClicked: sheet.setUi(scaleRow.colorProp, "")
                     }
                 }
             }
@@ -1062,6 +1718,7 @@ Item {
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Pressing a label shortcut marks the selected messages "
                       + "with that color (press again to clear the mark). "
+                      + "No label removes all labels from any marked message. "
                       + "Defined colors appear next to the search bar as a "
                       + "quick filter."
                 wrapMode: Text.Wrap
@@ -1112,7 +1769,8 @@ Item {
                 model: [
                     {label: "Select message:", key: "shortcutSelect", def: "Ins"},
                     {label: "Delete message:", key: "shortcutDelete", def: "Del"},
-                    {label: "Classify as junk:", key: "shortcutJunk", def: "J"},
+                    {label: "Mark as spam:", key: "shortcutJunk", def: "J"},
+                    {label: "Not spam:", key: "shortcutNotSpam", def: "Shift+J"},
                     {label: "Compose:", key: "shortcutCompose", def: "C"},
                     {label: "Reply:", key: "shortcutReply", def: "R"},
                     {label: "Forward:", key: "shortcutForward", def: "F"},
@@ -1159,7 +1817,7 @@ Item {
                             }
                             const seq = shortcutsForm.sequenceFromEvent(event)
                             if (seq !== "") {
-                                sheet.ui[modelData.key] = seq
+                                sheet.setUi(modelData.key, seq)
                                 capturing = false
                             }
                         }
@@ -1168,7 +1826,7 @@ Item {
                         icon.name: "edit-clear"
                         QQC2.ToolTip.text: "Reset to default (" + modelData.def + ")"
                         QQC2.ToolTip.visible: hovered
-                        onClicked: sheet.ui[modelData.key] = modelData.def
+                        onClicked: sheet.setUi(modelData.key, modelData.def)
                     }
                 }
             }
@@ -1177,7 +1835,9 @@ Item {
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Click a shortcut, then press the new key or combination "
                       + "(Esc cancels). Shortcuts act in the mail and folder "
-                      + "lists and apply immediately."
+                      + "lists and apply immediately. The label keys — No label "
+                      + "and 1 to 5 — live under Look and feel → Mark emails, "
+                      + "next to the color each one marks with."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1220,26 +1880,100 @@ Item {
         } // StackLayout
         } // content RowLayout
 
-        // Footer: the Save button (and its "what's missing" hint), only on
-        // the Accounts page — every other page applies as you change it.
+        // Footer: the Save button (and its "what's missing" hint) on the
+        // Accounts page; on the pages that apply as you change them, the same
+        // slot says so and flashes "Saved" when one of them lands. Only About
+        // has nothing to report.
         RowLayout {
             Layout.fillWidth: true
             spacing: 0
-            visible: sheet.page === 0
+            visible: sheet.page !== 4
 
+            // What the form still needs. The other two things the footer used
+            // to say live in the button now — a small grey line beside a Save
+            // button is exactly what nobody reads.
             QQC2.Label {
-                visible: sheet.detailsMissing !== ""
                 Layout.leftMargin: Kirigami.Units.largeSpacing
+                visible: sheet.page === 0 && sheet.detailsMissing !== ""
                 text: "Needs " + sheet.detailsMissing
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
             Item { Layout.fillWidth: true }
-            QQC2.Button {
-                text: "Save"
-                icon.name: "document-save"
-                enabled: sheet.detailsMissing === ""
-                onClicked: sheet.saveAccount()
+
+            // One slot, one message. The button says what the page's state is
+            // — there is something to save, or everything is saved — and an
+            // autosave takes the slot over for a moment to say so itself.
+            // Sized to the wider of the two so the footer never reflows on the
+            // swap.
+            Item {
+                implicitWidth: Math.max(sheet.page === 0 ? saveButton.implicitWidth
+                                                         : autoSaveNote.implicitWidth,
+                                        savedFlash.implicitWidth)
+                implicitHeight: Math.max(saveButton.implicitHeight, savedFlash.implicitHeight)
+
+                // The live pages' equivalent of "All saved": there is no
+                // button to press, so the slot stands there saying that is
+                // deliberate until a change makes it flash.
+                QQC2.Label {
+                    id: autoSaveNote
+                    anchors.centerIn: parent
+                    text: "Changes save automatically"
+                    opacity: sheet.page !== 0 && !sheet.prefsSaved ? 0.8 : 0.0
+                    visible: opacity > 0
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    Behavior on opacity { NumberAnimation { duration: 300 } }
+                }
+
+                QQC2.Button {
+                    id: saveButton
+                    anchors.centerIn: parent
+                    // The server half of the form is all this still owns; see
+                    // savePrefs(). Nothing pending is a state worth stating
+                    // rather than a button worth offering — reconnecting on
+                    // demand is the toolbar's Reconnect button, not this.
+                    text: sheet.connectionDirty ? "Save" : "All saved"
+                    icon.name: sheet.connectionDirty ? "document-save" : "dialog-ok"
+                    enabled: sheet.connectionDirty && sheet.detailsMissing === ""
+                    highlighted: enabled
+                    onClicked: sheet.saveAccount()
+                    opacity: sheet.prefsSaved ? 0.0 : 1.0
+                    visible: sheet.page === 0 && opacity > 0
+                    Behavior on opacity { NumberAnimation { duration: 300 } }
+                    QQC2.ToolTip.text: sheet.connectionDirty
+                        ? "Stores the server, address and password, and reconnects. "
+                          + "The name, signature and encryption settings save themselves."
+                        : "Everything on this page is stored. Use Reconnect in the "
+                          + "toolbar to dial the server again."
+                    QQC2.ToolTip.visible: hovered
+                }
+
+                RowLayout {
+                    id: savedFlash
+                    anchors.centerIn: parent
+                    spacing: Kirigami.Units.smallSpacing
+                    opacity: sheet.prefsSaved ? 1.0 : 0.0
+                    visible: opacity > 0
+                    // Arrives rather than appears: a short rise into place,
+                    // then a slower fade back to the button.
+                    anchors.verticalCenterOffset: sheet.prefsSaved
+                                                  ? 0 : Kirigami.Units.smallSpacing
+                    Behavior on opacity { NumberAnimation { duration: 150 } }
+                    Behavior on anchors.verticalCenterOffset {
+                        NumberAnimation { duration: 150; easing.type: Easing.OutCubic }
+                    }
+
+                    Kirigami.Icon {
+                        source: "dialog-ok"
+                        color: Kirigami.Theme.positiveTextColor
+                        implicitWidth: Kirigami.Units.iconSizes.small
+                        implicitHeight: Kirigami.Units.iconSizes.small
+                    }
+                    QQC2.Label {
+                        text: "Saved"
+                        color: Kirigami.Theme.positiveTextColor
+                    }
+                }
             }
         }
     }

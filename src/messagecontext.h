@@ -78,6 +78,46 @@ class MessageContext : public QObject
     /// Short human-readable reason, for the tooltip.
     Q_PROPERTY(QString arcDetail READ arcDetail NOTIFY dkimChanged)
 
+    /// OpenPGP state of this message: "" (nothing), "encrypted" (decrypted and
+    /// shown), "failed" (encrypted, and we could not read it), or "partial"
+    /// (OpenPGP inside a larger message — never decrypted for display, see
+    /// doc/openpgp.md §3).
+    Q_PROPERTY(QString cryptoState READ cryptoState NOTIFY cryptoChanged)
+    /// True between opening an encrypted message and gpg answering. The
+    /// passphrase prompt lives in this window, so it can be a long while.
+    Q_PROPERTY(bool cryptoChecking READ cryptoChecking NOTIFY cryptoChanged)
+    /// One line for the badge's tooltip.
+    Q_PROPERTY(QString cryptoDetail READ cryptoDetail NOTIFY cryptoChanged)
+    /// The OpenPGP signature verdict, or "" when the message carries none:
+    /// "valid", "unverified", "unknownKey", "expired", "revoked", "error".
+    /// Deliberately no "invalid" — see PgpSignatureInfo.
+    Q_PROPERTY(QString signatureStatus READ signatureStatus NOTIFY cryptoChanged)
+    /// Who the signature says signed it, named from our own keyring rather
+    /// than from anything the message claims. May be empty for a valid
+    /// signature whose key carries no name.
+    Q_PROPERTY(QString signerName READ signerName NOTIFY cryptoChanged)
+    Q_PROPERTY(QString signerEmail READ signerEmail NOTIFY cryptoChanged)
+    Q_PROPERTY(QString signerFingerprint READ signerFingerprint NOTIFY cryptoChanged)
+    /// The only property a "signed by X" badge may key off: a valid signature
+    /// AND a signing address that matches the From header. A valid signature
+    /// from an unrelated key is exactly what a forger's own key produces —
+    /// the same rule dkimTrusted follows, for the same reason.
+    Q_PROPERTY(bool signerTrusted READ signerTrusted NOTIFY cryptoChanged)
+    /// The key this message was encrypted to (a key ID), when it was
+    /// encrypted to one of ours. Lets the viewer open the key manager on it
+    /// for a message that carries no signature to name a key instead.
+    Q_PROPERTY(QString decryptionKeyId READ decryptionKeyId NOTIFY cryptoChanged)
+    /// True once decrypted content is what the viewer is showing. The remote-
+    /// content opt-in keys off this: a request made from decrypted mail can
+    /// carry the plaintext back to whoever chose the URL.
+    Q_PROPERTY(bool showingDecrypted READ showingDecrypted NOTIFY cryptoChanged)
+    /// Description of a public key this message carries as an attachment
+    /// ("key for jane@example.com"), or "" when it carries none. Nothing is
+    /// imported without the reader asking: a key that arrives by mail is a
+    /// claim about an identity, and accepting it silently is how the wrong key
+    /// ends up trusted.
+    Q_PROPERTY(QString attachedKeyName READ attachedKeyName NOTIFY cryptoChanged)
+
 public:
     explicit MessageContext(MailClient *client);
     ~MessageContext() override;
@@ -102,6 +142,20 @@ public:
     QString arcStatus() const { return m_arcStatus; }
     QString arcSealer() const { return m_arcSealer; }
     QString arcDetail() const { return m_arcDetail; }
+    QString cryptoState() const { return m_cryptoState; }
+    bool cryptoChecking() const { return m_cryptoChecking; }
+    QString cryptoDetail() const { return m_cryptoDetail; }
+    bool showingDecrypted() const { return m_decrypted != nullptr; }
+    QString decryptionKeyId() const { return m_decryptionKeyId; }
+    QString signatureStatus() const { return m_signatureStatus; }
+    QString signerName() const { return m_signerName; }
+    QString signerEmail() const { return m_signerEmail; }
+    QString signerFingerprint() const { return m_signerFingerprint; }
+    bool signerTrusted() const { return m_signerTrusted; }
+    QString attachedKeyName() const { return m_attachedKeyName; }
+    /// Imports the key this message carries. Reports through PgpEngine's
+    /// importFinished, which the viewer is already listening to.
+    Q_INVOKABLE void importAttachedKey();
 
     // View URLs for the HTML / Text / Source toggle (this message's, always —
     // independent of what the reading pane shows).
@@ -130,6 +184,7 @@ Q_SIGNALS:
     void messageChanged();
     void remoteContentAllowedChanged();
     void dkimChanged();
+    void cryptoChanged();
 
 private:
     friend class MailClient;
@@ -139,17 +194,49 @@ private:
     /// Sets the flag without persisting a per-sender preference.
     void applyRemoteAllowed(bool allow);
 
+    /// Overwrites the decrypted message held in memory, then drops it.
+    ///
+    /// Called when the message goes away — cleared, or the window closed. Qt's
+    /// containers free without overwriting, so without this the plaintext
+    /// stays in the heap until something else happens to reuse those pages.
+    ///
+    /// Best effort, and worth being exact about the limits: Qt strings are
+    /// copy-on-write, so if a copy of a buffer is still alive elsewhere this
+    /// wipes ours and leaves theirs; nothing here is in locked memory, so the
+    /// pages can reach swap; and a crash runs no destructors at all, so a core
+    /// dump can still contain a message that was open. Closing a message is
+    /// covered. Those three are not.
+    void wipeSecrets();
+
+    /// Declares whether this context is holding decrypted plaintext, which is
+    /// what suppresses core dumps for as long as any context is. Idempotent,
+    /// so the reference count cannot drift.
+    void markPlaintextHeld(bool held);
+
     MailClient *m_client = nullptr;
     QPointer<ViewerSchemeHandler> m_handler;
     quint64 m_viewerContext = 0; // 0 = not allocated yet
 
     std::shared_ptr<KMime::Message> m_message; ///< keeps attachment parts alive
+    /// The decrypted inner MIME tree, when there is one. Held only here, in
+    /// memory, for exactly as long as the message is open: it is never written
+    /// to the cache, the search index or the attachment store (doc/openpgp.md
+    /// §4). m_message and m_raw stay the ciphertext as it arrived.
+    std::shared_ptr<KMime::Message> m_decrypted;
+    /// The plaintext gpg produced, exactly as it produced it. Held for the
+    /// same reason m_raw is: a signature inside a decrypted message is over
+    /// these octets, not over whatever re-serialising the parsed tree yields.
+    /// In memory only, and dropped with the message (doc/openpgp.md §4).
+    QByteArray m_decryptedRaw;
+    /// Whether this context is counted in the core-dump suppression above.
+    bool m_plaintextHeld = false;
     QList<KMime::Content *> m_attachmentParts; ///< owned by m_message
     QVariantList m_attachments;
     QString m_htmlBody;  ///< raw HTML part
     QString m_textBody;  ///< plain-text part
     QByteArray m_raw;    ///< complete RFC-822 source
     qint64 m_uid = -1;
+    QString m_folder;    ///< mailbox this message was opened from
     QString m_sourceKey; ///< account + folder + uid; see sourceKey()
     QString m_senderAddress; ///< addr-spec of the sender (remote-content key)
     bool m_junk = false;
@@ -163,7 +250,40 @@ private:
     QString m_arcStatus;
     QString m_arcSealer;
     QString m_arcDetail;
+    QString m_cryptoState;
+    QString m_cryptoDetail;
+    QString m_decryptionKeyId;
+    QString m_signatureStatus;
+    QString m_signerName;
+    QString m_signerEmail;
+    QString m_signerFingerprint;
+    QString m_attachedKeyName;
+    /// The attached key block itself, kept so importing it does not depend on
+    /// the message still being parsed when the reader gets around to clicking.
+    QByteArray m_attachedKeyData;
+    bool m_signerTrusted = false;
+    bool m_cryptoChecking = false;
+    /// The verify job this context is waiting for, 0 when it is not.
+    quint64 m_verifyJob = 0;
+    /// Whether the octets handed to the OpenPGP verifier were the message's
+    /// own, sliced out of the raw bytes, rather than rebuilt from the parsed
+    /// tree. Decides whether a mismatch may be reported as a fact about the
+    /// message — the same question m_dkimFromCache settles for DKIM.
+    bool m_pgpOctetsExact = false;
+    /// Whether the bytes the OpenPGP signature was checked against came out of
+    /// the offline cache. Bodies written by older builds are not the octets
+    /// that arrived, so a mismatch against them says nothing about the message
+    /// until it has been refetched once — see MailClient::healCachedBody.
+    bool m_pgpFromCache = false;
+    /// The decrypt job this context is waiting for, 0 when it is not. Results
+    /// for any other id belong to a message the reader has already left.
+    quint64 m_decryptJob = 0;
+
     bool m_dkimTrusted = false;
     bool m_dkimChecking = false;
     int m_dkimAttempt = 0; ///< DNS retries used for this message so far
+    /// Whether the bytes handed to the verifier came from the offline cache
+    /// rather than straight off the wire. Decides how a body-hash mismatch is
+    /// reported: our stored copy may be at fault, the server's copy is not.
+    bool m_dkimFromCache = false;
 };

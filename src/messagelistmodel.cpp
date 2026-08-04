@@ -3,6 +3,8 @@
 
 #include "messagelistmodel.h"
 
+#include "spamheuristics.h"
+
 #include <QDebug>
 #include <QElapsedTimer>
 
@@ -50,6 +52,15 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
         return h.attachKind == CalendarAttachment;
     case ColorLabelRole:
         return h.colorLabel;
+    case CryptoRole:
+        return h.crypto;
+    case SpamRole:
+        // Only the confident tail is shown. "Unsure" deliberately renders as
+        // nothing at all: a maybe-mark on an ordinary message is a false
+        // positive the reader still has to spend attention dismissing.
+        return h.spamState != 3 && h.spamScore >= SpamHeuristics::SpamThreshold;
+    case SpamDetailRole:
+        return h.spamDetail;
     }
     return {};
 }
@@ -67,6 +78,9 @@ QHash<int, QByteArray> MessageListModel::roleNames() const
         {AttachmentRole, "hasAttachment"},
         {CalendarRole, "calendarAttachment"},
         {ColorLabelRole, "colorLabel"},
+        {CryptoRole, "crypto"},
+        {SpamRole, "spam"},
+        {SpamDetailRole, "spamDetail"},
     };
 }
 
@@ -123,6 +137,11 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
             // The color mark is local-only — the server never knows it.
             if (existing.colorLabel != 0)
                 merged.colorLabel = existing.colorLabel;
+            // Same as attachKind: a head-only refresh sees the outer content
+            // type and nothing else, so it must not undo what the body taught
+            // us (inline PGP, or a signature inside an encrypted message).
+            if (existing.crypto > merged.crypto && merged.crypto > 0)
+                merged.crypto = existing.crypto;
             primeKeys(merged);
             existing = merged;
             const int row = visibleRowOf(known.value());
@@ -379,6 +398,19 @@ void MessageListModel::removeByUids(const QList<qint64> &uids)
         m_rows.append(m_byUid.value(uid));
 }
 
+void MessageListModel::setCrypto(qint64 uid, int kind)
+{
+    const auto it = m_byUid.constFind(uid);
+    if (it == m_byUid.constEnd() || m_all.at(it.value()).crypto == kind)
+        return;
+    m_all[it.value()].crypto = kind;
+    const int row = visibleRowOf(it.value());
+    if (row >= 0) {
+        const QModelIndex idx = index(row);
+        Q_EMIT dataChanged(idx, idx, {CryptoRole});
+    }
+}
+
 void MessageListModel::setAttachKind(qint64 uid, int kind)
 {
     const auto it = m_byUid.constFind(uid);
@@ -389,6 +421,28 @@ void MessageListModel::setAttachKind(qint64 uid, int kind)
     if (row >= 0) {
         const QModelIndex idx = index(row);
         Q_EMIT dataChanged(idx, idx, {AttachmentRole, CalendarRole});
+    }
+}
+
+QString MessageListModel::fromAt(int row) const
+{
+    return (row >= 0 && row < m_rows.size()) ? m_all.at(m_rows.at(row)).from : QString();
+}
+
+void MessageListModel::clearSpam(qint64 uid)
+{
+    const auto it = m_byUid.constFind(uid);
+    if (it == m_byUid.constEnd())
+        return;
+    const int allIndex = it.value();
+    Header &h = m_all[allIndex];
+    h.spamScore = 0;
+    h.spamState = 3;
+    h.spamDetail.clear();
+    const int row = visibleRowOf(allIndex);
+    if (row >= 0) {
+        const QModelIndex idx = index(row, 0);
+        Q_EMIT dataChanged(idx, idx, {SpamRole, SpamDetailRole});
     }
 }
 
@@ -424,6 +478,15 @@ void MessageListModel::setColorLabel(qint64 uid, int color)
         const QModelIndex idx = index(row);
         Q_EMIT dataChanged(idx, idx, {ColorLabelRole});
     }
+}
+
+void MessageListModel::markUnseen(int row)
+{
+    if (row < 0 || row >= m_rows.size())
+        return;
+    m_all[m_rows.at(row)].seen = false;
+    const QModelIndex idx = index(row);
+    Q_EMIT dataChanged(idx, idx, {SeenRole});
 }
 
 void MessageListModel::markSeen(int row)

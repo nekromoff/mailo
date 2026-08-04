@@ -4,6 +4,7 @@
 #include "mailstore.h"
 
 #include "attachmentstore.h"
+#include "spamheuristics.h"
 
 #include <QDateTime>
 #include <QHash>
@@ -180,6 +181,59 @@ bool MailStore::open()
     // "not known yet" and is what backfillMessageIds() looks for; '' means
     // "looked, and the message has no Message-ID".
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN msgid TEXT"));
+    // Our own DKIM/ARC verdict, kept so a message is verified once rather than
+    // on every open. That is not just a speed matter: re-checking costs a DNS
+    // query per open, and for a message whose attachments were lifted out of
+    // the body there is no longer a byte-exact copy to re-check against — the
+    // verdict recorded while we still had one is the only honest answer.
+    // Empty status = never verified, which is what makes this self-filling.
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN dkim TEXT DEFAULT ''"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN dkim_detail TEXT DEFAULT ''"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN dkim_trusted INTEGER DEFAULT 0"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN arc TEXT DEFAULT ''"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN arc_sealer TEXT DEFAULT ''"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN arc_detail TEXT DEFAULT ''"));
+    // OpenPGP shape of the message (doc/openpgp.md §8): 0 none, 1 encrypted,
+    // 2 signed, 3 both. Set from the raw head at header-store time and refined
+    // once the body arrives, exactly like attach.
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN crypto INTEGER DEFAULT 0"));
+    // Local spam verdict (see spamheuristics.h). The score is stored rather
+    // than the verdict so that moving a threshold re-judges old mail instead of
+    // freezing yesterday's opinion into the cache. spam_state says how much was
+    // known when it was computed — 0 never scored, 1 headers only, 2 with the
+    // body, 3 exempt under Rule 0 — which is what lets the score be refined
+    // when the body lands rather than treated as final.
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_score INTEGER DEFAULT 0"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_state INTEGER DEFAULT 0"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_detail TEXT DEFAULT ''"));
+    // The allowlist asks "have I ever written to this address", across every
+    // account and ignoring any +tag. Neither half of the (account, address)
+    // primary key can answer that, hence a normalized column of its own.
+    q.exec(QStringLiteral("ALTER TABLE recipients ADD COLUMN addr_norm TEXT DEFAULT ''"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_recipients_norm"
+                          " ON recipients(addr_norm)"));
+    if (!migrationDone(m_db, QStringLiteral("recipients_norm"))) {
+        // Small table (one row per person ever mailed), so a full rewrite here
+        // is nothing like a sweep over messages. The CASE only splits on '+'
+        // once the local part is known to contain one, so a '+' in a domain
+        // cannot truncate the address.
+        q.exec(QStringLiteral(
+            "UPDATE recipients SET addr_norm = CASE"
+            " WHEN instr(substr(address, 1, instr(address, '@') - 1), '+') > 0"
+            "  THEN substr(address, 1, instr(address, '+') - 1)"
+            "       || substr(address, instr(address, '@'))"
+            " ELSE address END"
+            " WHERE addr_norm = '' OR addr_norm IS NULL"));
+        markMigrationDone(m_db, QStringLiteral("recipients_norm"));
+    }
+    // Carrying the sort keys, for the same reason idx_messages_color does:
+    // "every failing message in this folder, newest first" is then a seek plus
+    // a LIMIT rather than a full folder read and sort. The lookup on open goes
+    // through the (folder, uid) primary key and needs neither of these.
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_dkim"
+                          " ON messages(folder, dkim, date DESC, uid DESC)"));
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_arc"
+                          " ON messages(folder, arc, date DESC, uid DESC)"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_msgid"
                           " ON messages(msgid)"));
     // (folder, color) alone could find the rows but not order them, so the
@@ -421,6 +475,10 @@ static QList<MessageListModel::Header> readHeaderRows(QSqlQuery &q)
         h.authInfo = q.value(6).toString();
         h.attachKind = q.value(7).toInt();
         h.colorLabel = q.value(8).toInt();
+        h.crypto = q.value(9).toInt();
+        h.spamScore = q.value(10).toInt();
+        h.spamState = q.value(11).toInt();
+        h.spamDetail = q.value(12).toString();
         out.append(h);
     }
     return out;
@@ -433,7 +491,8 @@ QList<MessageListModel::Header> MailStore::cachedHeaders(const QString &folder, 
     SlowGuard guard("cachedHeaders");
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
-                             " color FROM messages WHERE folder = ?"
+                             " color, crypto, spam_score, spam_state, spam_detail"
+                             " FROM messages WHERE folder = ?"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(limit);
@@ -448,7 +507,8 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
         return {};
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
-                             " color FROM messages WHERE folder = ?"
+                             " color, crypto, spam_score, spam_state, spam_detail"
+                             " FROM messages WHERE folder = ?"
                              " AND (date < ? OR (date = ? AND uid < ?))"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
@@ -466,7 +526,8 @@ QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder,
         return {};
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
-                             " color FROM messages WHERE folder = ? AND color = ?"
+                             " color, crypto, spam_score, spam_state, spam_detail"
+                             " FROM messages WHERE folder = ? AND color = ?"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(color);
@@ -516,8 +577,9 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
     // refined kind (2 = calendar invite) learned from the full body survives.
     q.prepare(QStringLiteral(
         "INSERT INTO messages"
-        " (folder, uid, subject, sender, date, seen, suspicious, auth, attach, msgid)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " (folder, uid, subject, sender, date, seen, suspicious, auth, attach, msgid,"
+        " crypto, spam_score, spam_state, spam_detail)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(folder, uid) DO UPDATE SET"
         " subject = excluded.subject, sender = excluded.sender, date = excluded.date,"
         // Never overwrite a known Message-ID with an unknown one: a header
@@ -528,7 +590,19 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         " seen = MAX(messages.seen, excluded.seen),"
         " suspicious = excluded.suspicious, auth = excluded.auth,"
         " attach = CASE WHEN messages.attach > 1 AND excluded.attach = 1"
-        " THEN messages.attach ELSE excluded.attach END"));
+        " THEN messages.attach ELSE excluded.attach END,"
+        // Same rule for crypto: a header refresh can only see the outer type,
+        // so it must not undo "signed *and* encrypted" learned from the body.
+        " crypto = CASE WHEN messages.crypto > excluded.crypto AND excluded.crypto > 0"
+        " THEN messages.crypto ELSE excluded.crypto END,"
+        // A header refresh only ever knows what the headers say, so it must not
+        // undo a richer verdict: a score computed with the body (state 2), or a
+        // sender the user has since cleared by hand (state 3), both outrank it.
+        " spam_score = CASE WHEN messages.spam_state > excluded.spam_state"
+        " THEN messages.spam_score ELSE excluded.spam_score END,"
+        " spam_detail = CASE WHEN messages.spam_state > excluded.spam_state"
+        " THEN messages.spam_detail ELSE excluded.spam_detail END,"
+        " spam_state = MAX(messages.spam_state, excluded.spam_state)"));
     QSqlQuery ins(db);
     if (ftsAvailable) {
         // Keyed by messages.rowid — an O(1) lookup. Never filter fts by its
@@ -550,6 +624,10 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         q.addBindValue(h.authInfo);
         q.addBindValue(h.attachKind);
         q.addBindValue(h.msgid.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : h.msgid);
+        q.addBindValue(h.crypto);
+        q.addBindValue(h.spamScore);
+        q.addBindValue(h.spamState);
+        q.addBindValue(h.spamDetail);
         q.exec();
         if (ftsAvailable) {
             ins.addBindValue(h.subject);
@@ -564,12 +642,40 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
     db.commit();
 }
 
+void MailStore::setSpamVerdict(const QString &folder, qint64 uid, int score, int state,
+                               const QString &detail)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET spam_score = ?, spam_state = ?,"
+                             " spam_detail = ? WHERE folder = ? AND uid = ?"));
+    q.addBindValue(score);
+    q.addBindValue(state);
+    q.addBindValue(detail);
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
 void MailStore::setAttachKind(const QString &folder, qint64 uid, int kind)
 {
     if (!m_db.isOpen())
         return;
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("UPDATE messages SET attach = ? WHERE folder = ? AND uid = ?"));
+    q.addBindValue(kind);
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
+void MailStore::setCrypto(const QString &folder, qint64 uid, int kind)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET crypto = ? WHERE folder = ? AND uid = ?"));
     q.addBindValue(kind);
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
@@ -583,6 +689,79 @@ void MailStore::setColorLabel(const QString &folder, qint64 uid, int color)
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("UPDATE messages SET color = ? WHERE folder = ? AND uid = ?"));
     q.addBindValue(color);
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
+MailStore::AuthVerdict MailStore::authVerdict(const QString &folder, qint64 uid)
+{
+    AuthVerdict v;
+    if (!m_db.isOpen())
+        return v;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT dkim, dkim_detail, dkim_trusted, arc, arc_sealer, arc_detail"
+        " FROM messages WHERE folder = ? AND uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    if (q.exec() && q.next()) {
+        v.dkimStatus = q.value(0).toString();
+        v.dkimDetail = q.value(1).toString();
+        v.dkimTrusted = q.value(2).toBool();
+        v.arcStatus = q.value(3).toString();
+        v.arcSealer = q.value(4).toString();
+        v.arcDetail = q.value(5).toString();
+    }
+    return v;
+}
+
+void MailStore::storeAuthVerdict(const QString &folder, qint64 uid, const AuthVerdict &v)
+{
+    if (!m_db.isOpen() || v.isEmpty())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE messages SET dkim = ?, dkim_detail = ?, dkim_trusted = ?,"
+        " arc = ?, arc_sealer = ?, arc_detail = ? WHERE folder = ? AND uid = ?"));
+    q.addBindValue(v.dkimStatus);
+    q.addBindValue(v.dkimDetail);
+    q.addBindValue(v.dkimTrusted ? 1 : 0);
+    q.addBindValue(v.arcStatus);
+    q.addBindValue(v.arcSealer);
+    q.addBindValue(v.arcDetail);
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
+QList<qint64> MailStore::uidsOlderThan(const QString &folder, qint64 cutoffSecs)
+{
+    QList<qint64> out;
+    if (!m_db.isOpen() || folder.isEmpty())
+        return out;
+    QSqlQuery q(m_db);
+    // date <= 0 is a message whose Date header was missing or unparseable —
+    // the rows that show as 1970. Treated as old: a message that cannot say
+    // when it was sent should not be able to sit in spam forever by saying
+    // nothing.
+    q.prepare(QStringLiteral("SELECT uid FROM messages"
+                             " WHERE folder = ? AND (date < ? OR date <= 0)"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(cutoffSecs);
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out.append(q.value(0).toLongLong());
+    return out;
+}
+
+void MailStore::setUnseen(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET seen = 0 WHERE folder = ? AND uid = ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
     q.exec();
@@ -1284,6 +1463,51 @@ void MailStore::renameFolderOn(QSqlDatabase &db, const QString &account,
     db.commit();
 }
 
+QHash<QString, int> MailStore::unreadCountsOn(QSqlDatabase &db, const QString &account)
+{
+    QHash<QString, int> out;
+    if (!db.isOpen() || account.isEmpty())
+        return out;
+
+    QSqlQuery q(db);
+    // A partial index over unread rows only. The full (folder, seen) index
+    // would be one entry per cached message — hundreds of thousands of them,
+    // for a question about the few that are unread. This one holds only the
+    // unread rows, so it stays small and the count below is an index-only
+    // range scan.
+    //
+    // Building it is still one pass over `messages`, which is why this runs on
+    // a worker connection and is done once, recorded in meta_flags. Without it
+    // the planner picked idx_messages_color and had to visit every row of the
+    // account in the table to read `seen`.
+    if (!migrationDone(db, QStringLiteral("unseen_index1"))) {
+        if (q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_unseen"
+                                  " ON messages(folder) WHERE seen = 0")))
+            markMigrationDone(db, QStringLiteral("unseen_index1"));
+    }
+
+    // Half-open range over "account\x1f<folder>", the same trick renameFolderOn
+    // uses — a LIKE could not seek the index.
+    const QString lo = account + QChar(0x1f);
+    QString hi = lo;
+    hi[hi.size() - 1] = QChar(0x20);
+
+    q.prepare(QStringLiteral("SELECT folder, count(*) FROM messages"
+                             " WHERE folder >= ? AND folder < ? AND seen = 0"
+                             " GROUP BY folder"));
+    q.addBindValue(lo);
+    q.addBindValue(hi);
+    if (!q.exec())
+        return out;
+    while (q.next()) {
+        const QString key = q.value(0).toString();
+        const int count = q.value(1).toInt();
+        if (count > 0)
+            out.insert(key.mid(lo.size()), count); // strip the account scope
+    }
+    return out;
+}
+
 int MailStore::purgeChunkOn(QSqlDatabase &db, const QString &key, int limit)
 {
     if (!db.isOpen() || key.isEmpty() || limit <= 0)
@@ -1553,16 +1777,73 @@ void MailStore::addRecipient(const QString &address, const QString &name)
         return;
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral(
-        "INSERT INTO recipients (account, address, name, last_used, use_count)"
-        " VALUES (?, ?, ?, ?, 1)"
+        "INSERT INTO recipients (account, address, addr_norm, name, last_used, use_count)"
+        " VALUES (?, ?, ?, ?, ?, 1)"
         " ON CONFLICT(account, address) DO UPDATE SET"
         "  use_count = use_count + 1, last_used = excluded.last_used,"
+        "  addr_norm = excluded.addr_norm,"
         "  name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END"));
     q.addBindValue(m_accountKey);
     q.addBindValue(address.trimmed().toLower());
+    q.addBindValue(SpamHeuristics::normalizeAddress(address));
     q.addBindValue(name.trimmed());
     q.addBindValue(QDateTime::currentSecsSinceEpoch());
     q.exec();
+}
+
+bool MailStore::isKnownCorrespondent(const QString &address)
+{
+    if (!m_db.isOpen())
+        return false;
+    const QString needle = SpamHeuristics::normalizeAddress(address);
+    if (needle.isEmpty() || !needle.contains(QLatin1Char('@')))
+        return false;
+    // Deliberately not filtered by account: a person you wrote to from one
+    // address is the same person when they write to another of yours, and
+    // scoping the allowlist per account would mark their reply as spam in every
+    // mailbox but the one you happened to use.
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT 1 FROM recipients WHERE addr_norm = ? LIMIT 1"));
+    q.addBindValue(needle);
+    return q.exec() && q.next();
+}
+
+QSet<QString> MailStore::knownCorrespondents(const QSet<QString> &addresses)
+{
+    QSet<QString> out;
+    if (!m_db.isOpen() || addresses.isEmpty())
+        return out;
+    // One statement for a whole FETCH batch. Scoring runs over every header the
+    // sync delivers, and a query per message would put a few thousand round
+    // trips on the path that also has to keep the list responsive.
+    QStringList needles;
+    needles.reserve(addresses.size());
+    for (const QString &a : addresses) {
+        const QString n = SpamHeuristics::normalizeAddress(a);
+        if (!n.isEmpty() && n.contains(QLatin1Char('@')))
+            needles.append(n);
+    }
+    if (needles.isEmpty())
+        return out;
+    // Chunked: SQLite's default parameter limit is 999, and a large folder can
+    // easily deliver more distinct senders than that in one batch.
+    constexpr int chunk = 500;
+    for (qsizetype start = 0; start < needles.size(); start += chunk) {
+        const QStringList slice = needles.mid(start, chunk);
+        const QString placeholders =
+            QStringList(slice.size(), QStringLiteral("?")).join(QLatin1Char(','));
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral("SELECT DISTINCT addr_norm FROM recipients"
+                                 " WHERE addr_norm IN (%1)")
+                      .arg(placeholders));
+        for (const QString &n : slice)
+            q.addBindValue(n);
+        if (!q.exec())
+            continue;
+        while (q.next())
+            out.insert(q.value(0).toString());
+    }
+    return out;
 }
 
 QStringList MailStore::recipientCompletions(const QString &prefix, int limit)
@@ -1685,6 +1966,9 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
             h.authInfo = q.value(6).toString();
             h.attachKind = q.value(7).toInt();
             h.colorLabel = q.value(8).toInt();
+            h.spamScore = q.value(9).toInt();
+            h.spamState = q.value(10).toInt();
+            h.spamDetail = q.value(11).toString();
             batch.append(h);
             if (batch.size() < kBatch)
                 continue;
@@ -1706,7 +1990,7 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
         // milliseconds (EXPLAIN: LIST SUBQUERY vs SCAN f per row).
         q.prepare(QStringLiteral(
             "SELECT m.uid, m.subject, m.sender, m.date, m.seen, m.suspicious, m.auth, m.attach,"
-            " m.color FROM messages m"
+            " m.color, m.spam_score, m.spam_state, m.spam_detail FROM messages m"
             " WHERE m.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)"
             " AND m.folder = ? ORDER BY m.date DESC LIMIT 200"));
         // Quote as a literal phrase so FTS5 operators in user input can't
@@ -1731,7 +2015,8 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
     // the token-based FTS index cannot ("gari" inside "hungarian").
     QSqlQuery like(db);
     like.prepare(QStringLiteral(
-        "SELECT uid, subject, sender, date, seen, suspicious, auth, attach, color FROM messages"
+        "SELECT uid, subject, sender, date, seen, suspicious, auth, attach, color,"
+        " spam_score, spam_state, spam_detail FROM messages"
         " WHERE folder = ? AND (subject LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\')"
         " ORDER BY date DESC LIMIT 200"));
     QString escaped = keyword;

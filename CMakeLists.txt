@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailo VERSION 1.1 LANGUAGES CXX)
+project(mailo VERSION 1.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,6 +23,28 @@ pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 # DKIM signature verification (see dkimverifier.cpp). Only libcrypto is needed —
 # no TLS — and it is already in the process via Qt Network.
 pkg_check_modules(LIBCRYPTO REQUIRED IMPORTED_TARGET libcrypto)
+# OpenPGP key handling (see doc/openpgp.md). Optional on purpose: the AppImage
+# has no gnupg to talk to, and everything else in mailo works without it. When
+# it is missing the encryption UI is hidden and PgpEngine reports why — see
+# MAILO_HAVE_OPENPGP below and PgpEngine::available().
+option(MAILO_OPENPGP "Build OpenPGP support (needs Gpgmepp and QGpgmeQt6)" ON)
+if(MAILO_OPENPGP)
+    find_package(Gpgmepp QUIET)
+    find_package(QGpgmeQt6 QUIET)
+    if(Gpgmepp_FOUND AND QGpgmeQt6_FOUND)
+        set(MAILO_HAVE_OPENPGP ON)
+    else()
+        set(MAILO_HAVE_OPENPGP OFF)
+        # All three: the Gpgmepp and QGpgmeQt6 configs both resolve a Gpgme
+        # dependency, which comes from the C library's own dev package — with
+        # only the two C++ ones installed, both find_packages fail here.
+        message(STATUS "OpenPGP support disabled: Gpgmepp/QGpgmeQt6 not found "
+                       "(install libgpgme-dev libgpgmepp-dev libqgpgmeqt6-dev)")
+    endif()
+else()
+    set(MAILO_HAVE_OPENPGP OFF)
+    message(STATUS "OpenPGP support disabled by MAILO_OPENPGP=OFF")
+endif()
 
 qt_standard_project_setup(REQUIRES 6.5)
 
@@ -34,6 +56,8 @@ qt_add_executable(mailo
     src/dkimverifier.h
     src/publicsuffixlist.cpp
     src/publicsuffixlist.h
+    src/spamheuristics.cpp
+    src/spamheuristics.h
     src/messagecontext.cpp
     src/messagecontext.h
     src/foldermodel.cpp
@@ -50,6 +74,16 @@ qt_add_executable(mailo
     src/oauthhelper.h
     src/viewersecurity.cpp
     src/viewersecurity.h
+    src/securewipe.cpp
+    src/securewipe.h
+    src/pgpengine.cpp
+    src/pgpengine.h
+    src/pgpmime.cpp
+    src/pgpmime.h
+    src/keydiscovery.cpp
+    src/keydiscovery.h
+    src/pgpkeymodel.cpp
+    src/pgpkeymodel.h
 )
 
 # Must be set before qt_add_qml_module(), which bakes the autogen path into the
@@ -63,6 +97,9 @@ set_source_files_properties(src/qml/MessageViewer.qml PROPERTIES QT_RESOURCE_ALI
 set_source_files_properties(src/qml/ComposeSheet.qml PROPERTIES QT_RESOURCE_ALIAS ComposeSheet.qml)
 set_source_files_properties(src/qml/ComposeWindow.qml PROPERTIES QT_RESOURCE_ALIAS ComposeWindow.qml)
 set_source_files_properties(src/qml/MessageWindow.qml PROPERTIES QT_RESOURCE_ALIAS MessageWindow.qml)
+set_source_files_properties(src/qml/KeyManagerSheet.qml PROPERTIES QT_RESOURCE_ALIAS KeyManagerSheet.qml)
+set_source_files_properties(src/qml/NewKeyDialog.qml PROPERTIES QT_RESOURCE_ALIAS NewKeyDialog.qml)
+set_source_files_properties(src/qml/Spinner.qml PROPERTIES QT_RESOURCE_ALIAS Spinner.qml)
 set_source_files_properties(src/qml/HoverToolTip.qml PROPERTIES QT_RESOURCE_ALIAS HoverToolTip.qml)
 set_source_files_properties(src/qml/SelectableValue.qml PROPERTIES QT_RESOURCE_ALIAS SelectableValue.qml)
 set_source_files_properties(src/qml/ExpandableValue.qml PROPERTIES QT_RESOURCE_ALIAS ExpandableValue.qml)
@@ -73,11 +110,14 @@ qt_add_qml_module(mailo
     QML_FILES
         src/qml/Main.qml
         src/qml/AccountSheet.qml
+        src/qml/KeyManagerSheet.qml
+        src/qml/NewKeyDialog.qml
         src/qml/MessageViewer.qml
         src/qml/ComposeSheet.qml
         src/qml/ComposeWindow.qml
         src/qml/MessageWindow.qml
         src/qml/HoverToolTip.qml
+        src/qml/Spinner.qml
         src/qml/SelectableValue.qml
         src/qml/ExpandableValue.qml
 )
@@ -102,6 +142,11 @@ target_link_libraries(mailo PRIVATE
     PkgConfig::ZSTD
     PkgConfig::LIBCRYPTO
 )
+
+if(MAILO_HAVE_OPENPGP)
+    target_link_libraries(mailo PRIVATE Gpgmepp QGpgmeQt6)
+    target_compile_definitions(mailo PRIVATE MAILO_HAVE_OPENPGP)
+endif()
 
 target_compile_definitions(mailo PRIVATE MAILO_VERSION="${PROJECT_VERSION}")
 
@@ -180,6 +225,11 @@ qml6-module-qtquick-controls, \
 qml6-module-qtquick-layouts, \
 qml6-module-qtquick-dialogs, \
 qml6-module-qtwebengine")
+# Recommends, not Depends: without gnupg mailo runs exactly as before, with the
+# encryption settings hidden and PgpEngine saying why. Anyone who wants
+# OpenPGP wants gpg-agent's passphrase handling with it, which is why the agent
+# is named rather than left to gnupg's own dependencies.
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "gnupg, gpg-agent")
 include(CPack)
 
 qt_add_executable(attachmenttest tests/attachmenttest.cpp
@@ -211,9 +261,65 @@ target_link_libraries(dkimchecktool PRIVATE
 qt_add_executable(rawfidelitytest tests/rawfidelitytest.cpp)
 target_link_libraries(rawfidelitytest PRIVATE Qt6::Core KPim6::Mime)
 
+# Diagnostic: where do the octets of a stored message diverge from the octets
+# that arrived? Refetches sampled UIDs with its own minimal IMAP client (using
+# KIMAP would beg the question) and compares wire / KMime round-trip / cache,
+# with a DKIM verdict for each. Needs the wallet password and DNS.
+#   ./fidelitytool --account 0 --folder INBOX --count 30
+qt_add_executable(fidelitytool tests/fidelitytool.cpp
+    src/dkimverifier.cpp src/dkimverifier.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+target_link_libraries(fidelitytool PRIVATE
+    Qt6::Core Qt6::Network Qt6::Sql KPim6::Mime KPim6::IMAP
+    Qt6Keychain::Qt6Keychain PkgConfig::LIBCRYPTO)
+
+# Diagnostic, not a pass/fail test: scores .eml files with the real heuristics
+# and prints every rule that fired, plus a confusion matrix over a ham and a
+# spam corpus. The weights in spamheuristics.cpp are only defensible against
+# numbers this produces.
+#   ./spamtool --ham good/ --spam junk/ --quiet
+qt_add_executable(spamtool tests/spamtool.cpp
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+target_link_libraries(spamtool PRIVATE Qt6::Core Qt6::Network KPim6::Mime)
+
+set(_mailo_tests attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest
+                 fidelitytool pgpmimetest securewipetest spamtool)
+
+# Checks what SecureWipe guarantees, and pins the one thing it deliberately
+# refuses to do (overwrite a shared buffer, which would wipe a private copy and
+# look like protection). Also checks that core-dump suppression is reversible.
+qt_add_executable(securewipetest tests/securewipetest.cpp
+    src/securewipe.cpp src/securewipe.h)
+target_include_directories(securewipetest PRIVATE src)
+target_link_libraries(securewipetest PRIVATE Qt6::Core PkgConfig::LIBCRYPTO)
+
+# Checks the RFC 3156 structure parser against fixed vectors — including the
+# MIME-mixing shapes it must refuse to treat as encrypted. Self-contained: no
+# keyring, no network, no gpg, so it runs anywhere. Exit 0 = all matched.
+qt_add_executable(pgpmimetest tests/pgpmimetest.cpp src/pgpmime.cpp src/pgpmime.h)
+target_include_directories(pgpmimetest PRIVATE src)
+target_link_libraries(pgpmimetest PRIVATE Qt6::Core KPim6::Mime)
+
+# Diagnostic: drives PgpEngine against a real keyring without the GUI — key
+# listing, identity matching, import/export, and the two lookup paths.
+# Set GNUPGHOME to a throwaway directory first.
+#   GNUPGHOME=/tmp/kr ./pgpkeytool --for me@example.com
+if(MAILO_HAVE_OPENPGP)
+    qt_add_executable(pgpkeytool tests/pgpkeytool.cpp
+        src/pgpengine.cpp src/pgpengine.h
+        src/pgpmime.cpp src/pgpmime.h
+        src/keydiscovery.cpp src/keydiscovery.h)
+    target_include_directories(pgpkeytool PRIVATE src)
+    target_link_libraries(pgpkeytool PRIVATE
+        Qt6::Core Qt6::Network KPim6::Mime Gpgmepp QGpgmeQt6)
+    target_compile_definitions(pgpkeytool PRIVATE MAILO_HAVE_OPENPGP)
+    list(APPEND _mailo_tests pgpkeytool)
+endif()
+
 # Keep the test and diagnostic targets out of the build root: both the
 # binaries and the AUTOMOC/AUTOUIC scratch dirs land under build/tests/.
-foreach(_test attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest)
+foreach(_test ${_mailo_tests})
     set_target_properties(${_test} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
         AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/tests/${_test}_autogen")

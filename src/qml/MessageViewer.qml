@@ -18,6 +18,13 @@ ColumnLayout {
     /// from here, so several viewers can be on screen at once.
     property var context: null
 
+    /// Whether this viewer is the one the user is looking at. Shortcut objects
+    /// are window-wide, so with a message tab open there are several viewers
+    /// alive at once and every one of them would answer Find or View source —
+    /// Qt sees that as an ambiguous overload and fires none of them. The host
+    /// sets this on the visible viewer only.
+    property bool shortcutsActive: true
+
     /// The uiSettings object from Main.qml (for the configurable shortcuts).
     /// Null is tolerated everywhere: the built-in defaults are used then.
     property var ui: null
@@ -53,6 +60,92 @@ ColumnLayout {
         // opt-in to render the (still sandboxed) HTML.
         viewMode = context.junkTextOnly ? "text" : "html"
         web.url = context.bodyUrl
+    }
+
+    /// How the OpenPGP signature is stated on the badge.
+    ///
+    /// A name appears only when the signature is valid *and* the signing key
+    /// carries the From address — signerTrusted. A valid signature from an
+    /// unrelated key is exactly what a forger's own key produces, so it gets
+    /// the warning wording instead of a reassuring one. And nothing here ever
+    /// says "invalid": Mailo cannot prove it is checking the octets that were
+    /// signed, so a mismatch is reported as unverified (doc/openpgp.md §3).
+    function signatureText() {
+        if (!context)
+            return ""
+        if (context.cryptoChecking)
+            return "checking signature…"
+        switch (context.signatureStatus) {
+        case "valid":
+            if (context.signerTrusted) {
+                const who = context.signerName.length > 0 ? context.signerName
+                                                          : context.signerEmail
+                return "✓ signed by " + who
+            }
+            return "⚠ signed by another address"
+        case "modified":
+            // Established against octets we know are original: the signed part
+            // is not the part that arrived. After a mailing list or forwarder
+            // that is ordinary, so this states what happened rather than
+            // accusing anyone — the same wording rule the DKIM badge follows.
+            return "⚠ modified after signing"
+        case "unverified":
+            // We could not reproduce what was signed, so this claims nothing
+            // about the message at all.
+            return "signature not verified"
+        case "unknownKey":
+            return "signed with a key you do not have"
+        case "expired":
+            return "⚠ signed with an expired key"
+        case "revoked":
+            return "⚠ signed with a revoked key"
+        case "error":
+            return "signature not checked"
+        default:
+            return "signed"
+        }
+    }
+
+    /// The key manager, opened from the badge. One per viewer: a detached
+    /// message window has no settings page to borrow one from.
+    KeyManagerSheet {
+        id: viewerKeyManager
+        accountAddress: viewer.senderAddress()
+    }
+
+    /// The key this message's badge is about, for the key manager: the signer
+    /// when there is a signature to attribute, otherwise the sender's own key
+    /// if we hold one. Empty when neither is known, which is when the badge is
+    /// not clickable.
+    ///
+    /// Deliberately never the key the message was encrypted *to*. That one is
+    /// the reader's own, and opening it from a badge that describes where the
+    /// message came from answers a question nobody asked — the reader wants
+    /// the other party's key, not their own.
+    function inspectableKey() {
+        if (!context)
+            return ""
+        if (context.signerFingerprint.length > 0)
+            return context.signerFingerprint
+        // Unsigned: no key was used on the sender's side, so there is nothing
+        // this message can attribute. Their public key is still the useful
+        // thing to open if the keyring has one.
+        const addr = viewer.senderAddress()
+        if (addr.length > 0) {
+            const found = Pgp.encryptionKeysFor([addr])
+            if (found[addr] !== undefined && found[addr].length > 0)
+                return found[addr]
+        }
+        return ""
+    }
+
+    /// The bare address of the sender, for a key lookup. The From header is
+    /// "Name <addr>" as often as not.
+    function senderAddress() {
+        if (!context)
+            return ""
+        const m = /<([^>]+)>/.exec(context.from)
+        return (m ? m[1] : context.from).trim()
     }
 
     /// Switch the rendered representation. Shared by the HTML/Text/Source
@@ -113,12 +206,12 @@ ColumnLayout {
 
     Shortcut {
         sequences: [viewer.ui ? viewer.ui.shortcutFind : "Ctrl+F"]
-        enabled: viewer.hasMessage
+        enabled: viewer.shortcutsActive && viewer.hasMessage
         onActivated: viewer.openFind()
     }
     Shortcut {
         sequences: [viewer.ui ? viewer.ui.shortcutSource : "Ctrl+U"]
-        enabled: viewer.hasMessage
+        enabled: viewer.shortcutsActive && viewer.hasMessage
         onActivated: viewer.toggleSource()
     }
     // Esc closes the bar wherever focus sits (the field handles it itself, but
@@ -127,17 +220,17 @@ ColumnLayout {
     // the two never compete for the key.
     Shortcut {
         sequence: "Esc"
-        enabled: viewer.findActive
+        enabled: viewer.shortcutsActive && viewer.findActive
         onActivated: viewer.closeFind()
     }
     Shortcut {
         sequences: ["F3", "Ctrl+G"]
-        enabled: viewer.findActive
+        enabled: viewer.shortcutsActive && viewer.findActive
         onActivated: viewer.findRun(false)
     }
     Shortcut {
         sequences: ["Shift+F3", "Ctrl+Shift+G"]
-        enabled: viewer.findActive
+        enabled: viewer.shortcutsActive && viewer.findActive
         onActivated: viewer.findRun(true)
     }
 
@@ -165,16 +258,36 @@ ColumnLayout {
         const cleaned = authInfo
             .replace(/"(?:[^"\\]|\\.)*"/g, '""')
             .replace(/\([^()]*\)/g, " ")
+        // A message may carry several DKIM signatures — the sender's and a
+        // forwarder's, say — and the server reports one verdict per signature.
+        // Grouped by method rather than listed one per signature: repeating
+        // "dkim=pass · dkim=pass" tells the reader nothing, and spelling a
+        // disagreement as "dkim=pass · dkim=fail" reads like a contradiction
+        // rather than like two signatures. "dkim=pass, fail" says what it is.
         const fields = cleaned.split(";")
-        let verdicts = []
+        let order = []      // methods in the order the server listed them
+        let results = ({})  // method → its distinct results, in order
         for (let i = 1; i < fields.length; ++i) { // field 0 is the authserv-id
             const m = /^\s*(dkim|spf|dmarc)\s*=\s*([a-z]+)/i.exec(fields[i])
-            if (m)
-                verdicts.push(m[1].toLowerCase() + "=" + m[2].toLowerCase())
+            if (!m)
+                continue
+            const method = m[1].toLowerCase()
+            const result = m[2].toLowerCase()
+            if (!results[method]) {
+                results[method] = []
+                order.push(method)
+            }
+            if (results[method].indexOf(result) === -1)
+                results[method].push(result)
         }
-        return verdicts
-            .map(v => /(fail|permerror)$/.test(v) ? v + " ❗" : v)
-            .join(" · ")
+        return order.map(method => {
+            const list = results[method]
+            // Suffix match, so softfail and hardfail are flagged too. One
+            // failure among several signatures still earns the mark: the
+            // reader needs to know something did not check out.
+            const failed = list.some(r => /(fail|permerror)$/.test(r))
+            return method + "=" + list.join(", ") + (failed ? " ❗" : "")
+        }).join(" · ")
     }
 
     // Envelope header block above the preview
@@ -296,20 +409,163 @@ ColumnLayout {
             }
         }
 
-        Item { visible: authRow.visible } // caption column stays empty
+        // One security line: encryption first, then what we can say about who
+        // sent it. Encryption leads because it answers the question the reader
+        // asks first — who else could read this — and because it is shown
+        // whether or not sender authentication is switched on, which the
+        // badges after it are not.
+        Item { visible: securityRow.visible } // caption column stays empty
         RowLayout {
-            id: authRow
+            id: securityRow
             Layout.fillWidth: true
             spacing: Kirigami.Units.largeSpacing
-            visible: dkimLabel.text.length > 0 || arcLabel.text.length > 0
-                     || serverAuthLabel.text.length > 0
+            // The crypto half stands alone (it carries the attached-key offer,
+            // which any message may have); the authentication half is gated on
+            // the setting, so a verdict left over from before the switch was
+            // flipped can never stay on screen.
+            visible: cryptoLabel.text.length > 0 || importKeyButton.visible
+                     || (Mail.authVerification
+                         && (dkimLabel.text.length > 0 || arcLabel.text.length > 0
+                             || serverAuthLabel.text.length > 0))
+
+            QQC2.Label {
+                id: cryptoLabel
+                visible: text.length > 0
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                color: {
+                    if (!viewer.context || viewer.context.cryptoChecking)
+                        return Kirigami.Theme.textColor
+                    const sig = viewer.context.signatureStatus
+                    // A signature that does not hold up outranks the lock: a
+                    // message can be perfectly encrypted and still not be from
+                    // whom it claims.
+                    if (sig === "revoked" || sig === "expired" || sig === "modified"
+                        || (sig === "valid" && !viewer.context.signerTrusted))
+                        return Kirigami.Theme.neutralTextColor
+                    if (viewer.context.cryptoState === "encrypted"
+                        || (sig === "valid" && viewer.context.signerTrusted))
+                        return Kirigami.Theme.positiveTextColor
+                    // Neither "could not decrypt" nor "partly encrypted" is an
+                    // accusation — nothing here says the message was tampered
+                    // with, only that we cannot show all of it. Red is reserved
+                    // for a signature we can prove is bad, which — until the
+                    // octets are known-original — is never.
+                    if (viewer.context.cryptoState === "failed"
+                        || viewer.context.cryptoState === "partial")
+                        return Kirigami.Theme.neutralTextColor
+                    return Kirigami.Theme.textColor
+                }
+                opacity: viewer.context && viewer.context.cryptoChecking ? 0.6 : 1
+                text: {
+                    if (!viewer.context)
+                        return ""
+                    switch (viewer.context.cryptoState) {
+                    case "decrypting":
+                        return "decrypting…"
+                    case "encrypted":
+                        return "🔒 Encrypted"
+                    case "signedEncrypted":
+                        return "🔒 Encrypted, " + viewer.signatureText()
+                    case "signed":
+                        return viewer.signatureText()
+                    case "failed":
+                        return "🔓 Could not decrypt"
+                    case "partial":
+                        return "⚠ Partly encrypted — not decrypted"
+                    default:
+                        return ""
+                    }
+                }
+                // Clicking the badge opens the key manager on whichever key
+                // this message actually involved — the signer's if it was
+                // signed, otherwise the one it was encrypted to. Underlined on
+                // hover so it reads as something to click rather than a label.
+                font.underline: cryptoHover.hovered && viewer.inspectableKey() !== ""
+                HoverHandler {
+                    id: cryptoHover
+                    cursorShape: viewer.inspectableKey() !== "" ? Qt.PointingHandCursor
+                                                                : Qt.ArrowCursor
+                }
+                TapHandler {
+                    enabled: viewer.inspectableKey() !== ""
+                    onTapped: {
+                        viewerKeyManager.focusKey = viewer.inspectableKey()
+                        viewerKeyManager.open()
+                    }
+                }
+                HoverToolTip {
+                    hover: cryptoHover
+                    text: {
+                        if (!viewer.context)
+                            return ""
+                        const detail = viewer.context.cryptoDetail
+                        return viewer.inspectableKey() === ""
+                            ? detail
+                            : detail + "\n\nClick to inspect the key."
+                    }
+                }
+            }
+
+            // Offered only where it is the actual next step: we have a
+            // signature and no key to check it against. Asks the signer's own
+            // domain (WKD) — never a keyserver without a further, separate
+            // click, which the key manager provides.
+            QQC2.ToolButton {
+                visible: viewer.context
+                         && viewer.context.signatureStatus === "unknownKey"
+                         && Pgp.available && !Pgp.busy
+                text: "Look up signer's key"
+                icon.name: "download"
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                onClicked: Pgp.lookupWkd(viewer.senderAddress())
+                QQC2.ToolTip.text: "Ask the sender's own domain for their public "
+                                   + "key (Web Key Directory), then check the "
+                                   + "signature again"
+                QQC2.ToolTip.visible: hovered
+            }
+
+            // A key attached to the message. Import is a button, never
+            // automatic: the key is a claim by whoever sent the message.
+            QQC2.ToolButton {
+                id: importKeyButton
+                visible: viewer.context && viewer.context.attachedKeyName.length > 0
+                         && Pgp.available
+                text: "Import attached key"
+                icon.name: "application-pgp-keys"
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                onClicked: viewer.context.importAttachedKey()
+                QQC2.ToolTip.text: "Add " + (viewer.context ? viewer.context.attachedKeyName : "")
+                                   + " to your keyring. Check the fingerprint with "
+                                   + "its owner by some other means before you rely on it."
+                QQC2.ToolTip.visible: hovered
+            }
+
+            // Only for mail that was actually decrypted, and only while the
+            // HTML view is what would issue the requests. Remote content in
+            // decrypted mail is how plaintext leaves the machine: the sender
+            // picks the URL, so a fetch of it can carry the decrypted content
+            // to a third party (doc/openpgp.md §5).
+            QQC2.Label {
+                visible: viewer.context && viewer.context.showingDecrypted
+                         && viewer.viewMode === "html"
+                         && viewer.context.remoteContentAllowed
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                font.bold: true
+                color: Kirigami.Theme.neutralTextColor
+                text: "⚠ Remote content is on — requests can carry this "
+                      + "decrypted message to a third party"
+            }
+
+            // --- Sender authentication, on the same line, after encryption ---
+            // Each of these hides itself when empty, and the C++ side leaves
+            // them all empty when authVerification is off.
 
             // What *we* verified, cryptographically. Deliberately separate from
             // the server's say-so next to it: one is a signature checked against
             // a key we fetched, the other is a header we chose to believe.
             QQC2.Label {
                 id: dkimLabel
-                visible: text.length > 0
+                visible: Mail.authVerification && text.length > 0
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 font.bold: viewer.context && viewer.context.dkimStatus === "fail"
                 color: {
@@ -319,6 +575,11 @@ ColumnLayout {
                         return Kirigami.Theme.positiveTextColor
                     if (viewer.context.dkimStatus === "fail")
                         return Kirigami.Theme.negativeTextColor
+                    // Never negative: a body that changed after signing is what
+                    // every mailing list produces. Red here would train the
+                    // reader to ignore the one time it matters.
+                    if (viewer.context.dkimStatus === "modified")
+                        return Kirigami.Theme.neutralTextColor
                     if (viewer.context.dkimStatus === "pass")
                         return Kirigami.Theme.neutralTextColor // valid but unaligned
                     return Kirigami.Theme.textColor // "unverified" reads as neutral
@@ -337,18 +598,37 @@ ColumnLayout {
                         return viewer.context.dkimTrusted
                             ? "✓ DKIM verified" : "⚠ DKIM signed by another domain"
                     case "fail":
-                        // Covers permanent errors too: an obsolete algorithm or
-                        // a revoked key is a signature that cannot be trusted.
+                        // The only accusation this badge ever makes: we fetched
+                        // the key and the signature does not match it.
                         return "✗ DKIM signature invalid"
+                    case "permerror":
+                        // Usually the signer rotated the key out of DNS, which
+                        // is what happens to every archived message eventually.
+                        // The tooltip names the actual reason.
+                        return "⚠ DKIM cannot be checked"
                     case "temperror":
                         return "DKIM not checked"
                     case "unsupported":
                         // Neither verified nor broken: obsolete crypto we will
                         // not lend credibility to by checking it.
                         return "⚠ DKIM uses obsolete crypto"
+                    case "modified":
+                        // The body is not the one that was signed, established
+                        // against octets we know are original. After a mailing
+                        // list or a forwarder that is ordinary, so this states
+                        // what happened rather than accusing anyone. ARC does
+                        // not overrule the signature — an attacker can seal a
+                        // chain of their own — but an intact one names a party
+                        // that saw the message earlier, which is the whole
+                        // reason the protocol exists. The sealer is on the
+                        // badge beside this one, so it is not repeated here.
+                        return viewer.context.arcStatus === "pass"
+                            ? "⚠ Modified after signing, per ARC"
+                            : "⚠ Modified after signing"
                     case "unverified":
-                        // Body hash mismatch. We cannot tell tampering from our
-                        // own copy not being byte-exact, so we do not accuse.
+                        // Body hash mismatch we cannot attribute: the copy we
+                        // hashed came from the cache and may not be byte-exact,
+                        // so we do not even claim the message was modified.
                         return "DKIM not verified"
                     default:
                         return "" // no signature at all — say nothing
@@ -369,7 +649,7 @@ ColumnLayout {
             // so the sealer is always shown rather than reduced to a tick.
             QQC2.Label {
                 id: arcLabel
-                visible: text.length > 0
+                visible: Mail.authVerification && text.length > 0
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 font.bold: viewer.context && viewer.context.arcStatus === "fail"
                 color: {
@@ -389,9 +669,12 @@ ColumnLayout {
                     case "pass":
                         return "ARC intact via " + sealer
                     case "sealsonly":
-                        // Seals held, body could not be checked — say the
-                        // weaker thing, not the stronger one.
-                        return "ARC chain intact via " + sealer
+                        // Seals held, but the sealer's own body hash does not
+                        // match our copy. Spelled out rather than shortened:
+                        // "ARC chain intact" read as *more* than the "pass"
+                        // wording above it, which is the opposite of the truth
+                        // — here nothing confirms the body we are showing.
+                        return "ARC seals valid via " + sealer + ", body unconfirmed"
                     case "fail":
                         return "✗ ARC chain broken"
                     case "error":
@@ -411,7 +694,7 @@ ColumnLayout {
 
             QQC2.Label {
                 id: serverAuthLabel
-                visible: text.length > 0
+                visible: Mail.authVerification && text.length > 0
                 Layout.fillWidth: true
                 elide: Text.ElideRight
                 opacity: 0.8

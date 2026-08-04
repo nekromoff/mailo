@@ -4,6 +4,7 @@
 #pragma once
 
 #include <QAbstractListModel>
+#include <QHash>
 #include <QList>
 #include <QSet>
 
@@ -20,7 +21,9 @@ public:
         LevelRole,
         SelectableRole,
         HasChildrenRole,
-        ExpandedRole
+        ExpandedRole,
+        UnreadRole,
+        HiddenUnreadRole
     };
 
     struct Folder {
@@ -37,6 +40,12 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     void setFolders(QList<Folder> folders);
+
+    /// Unread counts by mailbox path, for the pill on each row. Folders absent
+    /// from \a counts have none. Kept separate from setFolders() because it
+    /// arrives later and far more often: it refreshes on a row change, not a
+    /// model reset, so the sidebar does not blink and the selection holds.
+    void setUnreadCounts(QHash<QString, int> counts);
 
     /// Identifies the account ("user@host") so collapsed state persists per
     /// account across restarts; loads that account's saved state.
@@ -70,11 +79,20 @@ public:
 
 private:
     void rebuildVisible();
+    /// Fills m_hiddenUnread from m_unread and the current visibility. Cheap:
+    /// folder lists run to hundreds of rows, not thousands.
+    void recomputeHiddenUnread();
     bool hasChildren(int allIndex) const;
     void saveCollapsed() const;
 
     QList<Folder> m_all;
     QList<int> m_visible;      ///< indices into m_all, collapsed subtrees hidden
     QSet<QString> m_collapsed; ///< mailBox paths whose children are hidden
+    QHash<QString, int> m_unread; ///< mailBox path -> unread count (absent = 0)
+    /// Per m_all index: unread sitting in descendants that are currently
+    /// hidden inside this row's collapsed subtree. A parent shows it so a
+    /// folded-away subfolder cannot hide new mail, but draws it differently
+    /// from its own — see the delegate.
+    QList<int> m_hiddenUnread;
     QString m_accountKey;
 };

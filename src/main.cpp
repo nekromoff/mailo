@@ -12,6 +12,8 @@
 #include "documenthandler.h"
 #include "mailclient.h"
 #include "messagecontext.h"
+#include "pgpengine.h"
+#include "pgpkeymodel.h"
 #include "viewersecurity.h"
 
 #include <QLoggingCategory>
@@ -98,9 +100,19 @@ int main(int argc, char *argv[])
     MailClient client;
     client.setViewerHandler(viewerHandler);
 
+    // Constructed before the QML engine so PgpEngine::instance() is already
+    // there when QML creates its first PgpKeyModel. Cheap when gpg is absent:
+    // it works out that it is, and every operation then reports why.
+    PgpEngine pgp;
+    client.setPgpEngine(&pgp);
+
     QQmlApplicationEngine engine;
     qmlRegisterSingletonInstance("Mailo.Core", 1, 0, "Mail", &client);
+    qmlRegisterSingletonInstance("Mailo.Core", 1, 0, "Pgp", &pgp);
     qmlRegisterType<DocumentHandler>("Mailo.Core", 1, 0, "DocumentHandler");
+    // Created per view: the key manager and each key picker filter differently
+    // over the one keyring snapshot PgpEngine holds.
+    qmlRegisterType<PgpKeyModel>("Mailo.Core", 1, 0, "PgpKeyModel");
     // Created only by MailClient (reading pane + detached message windows).
     qmlRegisterUncreatableType<MessageContext>(
         "Mailo.Core", 1, 0, "MessageContext",

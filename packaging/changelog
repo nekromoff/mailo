@@ -1,3 +1,32 @@
+mailo (1.5) unstable; urgency=medium
+
+  * Unread counts in the folder pane: a pill on every folder, blue on the
+    inbox, and an outline on a collapsed folder standing in for the unread
+    sitting in subfolders folded away beneath it.
+  * Other accounts are checked for new mail on the refresh schedule — connect,
+    STATUS, disconnect — so their unread counts move without switching to them.
+  * Spam retention (Settings, General): mail sent longer ago than the chosen
+    number of days is removed from the spam folder automatically, going by the
+    date the message carries. "Skip trash for spam" (on by default) deletes it
+    outright rather than filing it in the trash to be cleared out twice.
+  * Folders can be dragged onto another folder to reparent them, or onto the
+    account name to move them to the top level. Imported archives included.
+  * Rename folder in the folder context menu. Where the protocol forbids it —
+    INBOX, and the special-use mailboxes a server recreates — the menu says so
+    in place of the command.
+  * Message context menu, starting with Mark unread. A message marked unread
+    while open stays open and stays unread; it is marked read again the next
+    time it is opened.
+  * A "No label" key that clears any colour label, alongside the five.
+  * Junk is called spam throughout the interface, except where a folder is
+    named otherwise by the server.
+  * Fixes: an account switch no longer carries the previous account's folder
+    delimiter, which could rewrite an imported archive's folder paths; folder
+    trees keep parents directly above their children; folders in the sidebar
+    could not be dragged at all.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Tue, 04 Aug 2026 12:00:00 +0200
+
 mailo (1.1) unstable; urgency=medium
 
   * Compose, Settings and opened messages are tabs in the main window rather

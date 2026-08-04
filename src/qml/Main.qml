@@ -70,6 +70,7 @@ Kirigami.ApplicationWindow {
         // Definable shortcuts (Look settings); QKeySequence strings.
         property string shortcutDelete: "Del"
         property string shortcutJunk: "J"
+        property string shortcutNotSpam: "Shift+J"
         property string shortcutCompose: "C"
         property string shortcutReply: "R"
         property string shortcutForward: "F"
@@ -82,6 +83,9 @@ Kirigami.ApplicationWindow {
         property string shortcutSource: "Ctrl+U"
         // Color scale 1–5: shortcut + color per slot, both "" = undefined.
         // A slot with a shortcut but no color clears the mark instead.
+        // Slot 0 is "no label" — it has no color to define, it only takes the
+        // mark off, and it is the one that comes with a key bound out of the box.
+        property string scaleKey0: "0"
         property string scaleKey1: ""
         property string scaleKey2: ""
         property string scaleKey3: ""
@@ -131,6 +135,23 @@ Kirigami.ApplicationWindow {
     readonly property bool shortcutsLive:
         !textFieldFocused && tabStack.currentIndex === 0
 
+    // The message Reply and Forward should act on: the reading pane while the
+    // mail tab is up front, otherwise the message the open tab is showing.
+    // Without this, opening a message in its own tab silently disabled the very
+    // shortcuts that message is for.
+    readonly property var activeMessageContext: {
+        if (tabStack.currentIndex === 0)
+            return Mail.readingContext
+        const page = root.tabPages[tabStack.currentIndex]
+        return page && page.isMessageTab === true ? page.context : null
+    }
+    // Reply/Forward/Compose work on a message tab too. Delete, Spam, Select and
+    // the colour keys deliberately do not: they act on the list selection,
+    // which a message tab has no say over.
+    readonly property bool messageShortcutsLive:
+        !textFieldFocused && (tabStack.currentIndex === 0
+                              || root.activeMessageContext !== null)
+
     // Window-wide rather than per-view: these used to be handled only by the
     // folder and message lists' Keys.onPressed, so pressing Compose while the
     // reading pane (or anything else) had focus did nothing at all.
@@ -148,18 +169,20 @@ Kirigami.ApplicationWindow {
     }
     Shortcut {
         sequence: uiSettings.shortcutCompose
-        enabled: sequence !== "" && root.shortcutsLive && Mail.hasAccount
+        enabled: sequence !== "" && root.messageShortcutsLive && Mail.hasAccount
         onActivated: composeSheet().openNew()
     }
     Shortcut {
         sequence: uiSettings.shortcutReply
-        enabled: sequence !== "" && root.shortcutsLive && viewer.hasMessage
-        onActivated: composeSheet().openReply(Mail.replyData(false))
+        enabled: sequence !== "" && root.messageShortcutsLive
+                 && root.activeMessageContext && root.activeMessageContext.hasMessage
+        onActivated: composeSheet().openReply(root.activeMessageContext.replyData(false))
     }
     Shortcut {
         sequence: uiSettings.shortcutForward
-        enabled: sequence !== "" && root.shortcutsLive && viewer.hasMessage
-        onActivated: composeSheet().openForward(Mail.forwardData())
+        enabled: sequence !== "" && root.messageShortcutsLive
+                 && root.activeMessageContext && root.activeMessageContext.hasMessage
+        onActivated: composeSheet().openForward(root.activeMessageContext.forwardData())
     }
     Shortcut {
         sequence: uiSettings.shortcutDelete
@@ -172,6 +195,11 @@ Kirigami.ApplicationWindow {
         onActivated: messageList.requestJunk()
     }
     Shortcut {
+        sequence: uiSettings.shortcutNotSpam
+        enabled: sequence !== "" && root.shortcutsLive
+        onActivated: messageList.requestNotSpam()
+    }
+    Shortcut {
         sequence: uiSettings.shortcutSelect
         enabled: sequence !== "" && root.shortcutsLive
         onActivated: messageList.toggleSelectAndAdvance()
@@ -179,14 +207,18 @@ Kirigami.ApplicationWindow {
     // Instantiator, not Repeater: Shortcut is not an Item and has nothing to
     // lay out.
     Instantiator {
-        model: 5
+        // 0 is "no label" — see uiSettings.scaleKey0.
+        model: 6
         delegate: Shortcut {
             required property int index
-            readonly property int slot: index + 1
+            readonly property int slot: index
             sequence: uiSettings["scaleKey" + slot]
             enabled: sequence !== "" && root.shortcutsLive
-            onActivated: Mail.markMessageColor(messageList.selectedIndexes(),
-                                               root.scaleColorOf(slot) !== "" ? slot : 0)
+            // Slot 0, and any slot left without a color, pass 0 — which clears
+            // the mark rather than toggling one on.
+            onActivated: Mail.markMessageColor(
+                messageList.selectedIndexes(),
+                slot > 0 && root.scaleColorOf(slot) !== "" ? slot : 0)
         }
     }
 
@@ -444,6 +476,68 @@ Kirigami.ApplicationWindow {
         return composeWindow
     }
 
+    // Unread-count pill, shared by the live tree and the
+    // cached trees. Sits at the right edge of a row;
+    // absent entirely at zero, so a quiet folder carries
+    // no furniture.
+    component UnreadPill: Rectangle {
+        /// Unread in the folder itself.
+        required property int count
+        /// Unread folded away in subfolders this row is standing in for,
+        /// because it is collapsed. Drawn as an outline rather than a solid,
+        /// so a borrowed number never reads as the folder's own mail.
+        property int hiddenCount: 0
+        /// The inbox. Its pill is blue wherever it is, selected or not — it is
+        /// the folder worth finding at a glance. Every other folder is neutral
+        /// grey.
+        property bool primary: false
+        /// This row is selected, so its background is already the solid
+        /// highlight bar. The pill inverts to light on it: blue on blue, or
+        /// grey on blue, would be lost.
+        property bool onHighlight: false
+
+        readonly property int total: count + hiddenCount
+        readonly property bool ownMail: count > 0
+
+        // Grey at 0.65 rather than paler: the solid form carries background-
+        // coloured text, and anything lighter drops it below 4.5:1.
+        readonly property color accent: onHighlight
+                                        ? Kirigami.Theme.highlightedTextColor
+                                        : (primary ? Kirigami.Theme.highlightColor
+                                                   : Qt.alpha(Kirigami.Theme.textColor, 0.65))
+
+        visible: total > 0
+        implicitWidth: Math.max(height,
+                                pillText.implicitWidth
+                                + Kirigami.Units.smallSpacing * 2)
+        implicitHeight: Math.round(Kirigami.Units.gridUnit * 0.95)
+        radius: height / 2
+        color: ownMail ? accent : "transparent"
+        border.width: ownMail ? 0 : 1
+        border.color: accent
+
+        QQC2.Label {
+            id: pillText
+            anchors.centerIn: parent
+            // Four digits is where a folder stops being
+            // countable and starts being "a lot".
+            text: parent.total > 999 ? "999+" : parent.total
+            // Solid pill: the text sits on the pill, so it takes that fill's
+            // contrasting partner. Outline pill: the text sits on the row, so
+            // it takes the row's own foreground — never the accent, since
+            // highlight blue as text is ~2.4:1 and fails AA.
+            color: parent.ownMail
+                   ? (parent.onHighlight
+                      ? Kirigami.Theme.highlightColor
+                      : (parent.primary ? Kirigami.Theme.highlightedTextColor
+                                        : Kirigami.Theme.backgroundColor))
+                   : (parent.onHighlight ? Kirigami.Theme.highlightedTextColor
+                                         : Kirigami.Theme.textColor)
+            font.pointSize: Kirigami.Theme.smallFont.pointSize
+            font.bold: true
+        }
+    }
+
     // What is currently being dragged, and the pill that follows the cursor.
     // One shared instance — only one drag can be in flight at a time. It lives
     // in the overlay so it draws above both panes and can be positioned in
@@ -514,12 +608,90 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // Right-click menu of a message row. Acts on `rows`, captured when the
+    // menu opens, so a selection change behind it cannot redirect the command.
+    QQC2.Menu {
+        id: messageMenu
+        property var rows: []
+        // Not "count": QQC2.Menu already has a FINAL property of that name
+        // (its item count), and shadowing it fails the whole component load.
+        readonly property int rowCount: rows ? rows.length : 0
+
+        QQC2.MenuItem {
+            text: "Mark unread"
+            icon.name: "mail-mark-unread"
+            onTriggered: Mail.markMessagesUnread(messageMenu.rows)
+        }
+        QQC2.MenuSeparator {}
+        // These go through the list's own handlers rather than calling Mail
+        // directly, so the menu and the keyboard shortcuts cannot drift apart —
+        // and so Delete still asks first when the folder is the trash.
+        QQC2.MenuItem {
+            text: "Mark as spam"
+            icon.name: "mail-mark-junk"
+            onTriggered: messageList.requestJunk()
+        }
+        QQC2.MenuItem {
+            text: "Not spam"
+            icon.name: "mail-mark-notjunk"
+            onTriggered: messageList.requestNotSpam()
+        }
+        QQC2.MenuSeparator {}
+        QQC2.MenuItem {
+            text: messageMenu.rowCount > 1
+                  ? "Delete " + messageMenu.rowCount + " messages" : "Delete"
+            icon.name: "edit-delete"
+            onTriggered: messageList.requestDelete()
+        }
+    }
+
     // Right-click menu of a folder in the sidebar.
     QQC2.Menu {
         id: folderMenu
         property string mailBox: ""
         property string name: ""
+        // Recomputed rather than bound: folderRenameBlockedReason() is a plain
+        // invokable with no change signal, so a live binding would keep
+        // whatever it first saw.
+        property string renameBlocked: ""
+        function refreshRenameBlocked() {
+            renameBlocked = Mail.folderRenameBlockedReason(mailBox)
+        }
+        onAboutToShow: refreshRenameBlocked()
 
+        // Right-clicking a folder in another account switches to it, and the
+        // menu opens before that connection is up — so the first answer is
+        // "needs a connection". Waiting for the connection before showing the
+        // menu would make every right-click feel slow; instead the menu opens
+        // at once and this swaps the note for the real command the moment the
+        // account is ready, while it is still on screen.
+        Connections {
+            target: Mail
+            enabled: folderMenu.opened
+            function onConnectedChanged() { folderMenu.refreshRenameBlocked() }
+        }
+
+        QQC2.MenuItem {
+            visible: folderMenu.renameBlocked === ""
+            height: visible ? implicitHeight : 0
+            text: "Rename folder…"
+            icon.name: "edit-rename"
+            onTriggered: {
+                renameFolderDialog.mailBox = folderMenu.mailBox
+                renameFolderDialog.open()
+            }
+        }
+        // The protocol reason this folder keeps its name, in place of the
+        // command — an entry that is merely greyed out says "not now", and
+        // this is a "not ever".
+        QQC2.MenuItem {
+            visible: folderMenu.renameBlocked !== ""
+            height: visible ? implicitHeight : 0
+            enabled: false
+            icon.name: "documentinfo"
+            text: folderMenu.renameBlocked
+        }
+        QQC2.MenuSeparator {}
         QQC2.MenuItem {
             text: "Move to top level"
             icon.name: "go-up"
@@ -538,6 +710,46 @@ Kirigami.ApplicationWindow {
                     Mail.folderDeleteIsPermanent(folderMenu.mailBox)
                 confirmFolderDelete.open()
             }
+        }
+    }
+
+    QQC2.Dialog {
+        id: renameFolderDialog
+        property string mailBox: ""
+
+        parent: QQC2.Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        title: "Rename folder"
+
+        // Prefilled with the name the sidebar shows, which for a folder inside
+        // a parent is its last step only — the rest of the path is not the
+        // user's to retype, and changing it here would be a move, not a rename.
+        onOpened: {
+            renameFolderField.text = Mail.folderDisplayLeaf(mailBox)
+            renameFolderField.selectAll()
+            renameFolderField.forceActiveFocus()
+        }
+
+        footer: QQC2.DialogButtonBox {
+            QQC2.Button {
+                text: "Rename"
+                icon.name: "edit-rename"
+                enabled: renameFolderField.text.trim() !== ""
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.AcceptRole
+            }
+            QQC2.Button {
+                text: "Cancel"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.RejectRole
+            }
+        }
+        onAccepted: Mail.renameFolder(renameFolderDialog.mailBox,
+                                      renameFolderField.text)
+
+        contentItem: QQC2.TextField {
+            id: renameFolderField
+            implicitWidth: Kirigami.Units.gridUnit * 20
+            onAccepted: renameFolderDialog.accept()
         }
     }
 
@@ -875,6 +1087,15 @@ Kirigami.ApplicationWindow {
                                 if (leaf.includes("draft"))
                                     return "document-edit"
                                 return "folder-mail"
+                            }
+
+                            // The inbox, however the account spells it: a bare
+                            // INBOX, or the last step of an archive path
+                            // ("mail.example.com/Inbox").
+                            function isInbox(mailBox) {
+                                if (mailBox.toUpperCase() === "INBOX")
+                                    return true
+                                return mailBox.split(/[/.]/).pop().toLowerCase() === "inbox"
                             }
 
                             function isCollapsed(name) {
@@ -1232,20 +1453,71 @@ Kirigami.ApplicationWindow {
                                                     required property bool selectable
                                                     required property bool hasChildren
                                                     required property bool expanded
+                                                    required property int unread
+                                                    required property int hiddenUnread
                                                     required property int index
 
                                                     width: folderList.width
                                                     implicitHeight: root.listRowHeight + 2
                                                     topPadding: 1
                                                     bottomPadding: 1
-                                                    text: name
                                                     enabled: selectable || hasChildren
-                                                    leftPadding: Kirigami.Units.largeSpacing + Kirigami.Units.gridUnit
+
+                                                    // The style's own selection bar stops short
+                                                    // of the row's right edge, which left the
+                                                    // pill sitting outside it. This spans the
+                                                    // whole delegate, so the pill is on the bar
+                                                    // rather than past it — the same explicit
+                                                    // background the message rows already use.
+                                                    background: Rectangle {
+                                                        color: folderDelegate.highlighted
+                                                               ? Kirigami.Theme.highlightColor
+                                                               : folderDelegate.hovered
+                                                                 ? Qt.alpha(Kirigami.Theme.highlightColor, 0.2)
+                                                                 : "transparent"
+                                                    }
+                                                    // One gridUnit deeper than the account
+                                                    // header: the account is the parent,
+                                                    // its folders nest visibly under it.
+                                                    leftPadding: Kirigami.Units.largeSpacing + Kirigami.Units.gridUnit * 1.5
                                                                  + level * Kirigami.Units.gridUnit
-                                                    icon.name: folderPane.folderIcon(mailBox)
-                                                    icon.width: Kirigami.Units.iconSizes.small
-                                                    icon.height: Kirigami.Units.iconSizes.small
-                                                    icon.color: Qt.alpha(Kirigami.Theme.textColor, 0.55)
+                                                    rightPadding: Kirigami.Units.smallSpacing
+
+                                                    // Icon, name and pill as the row's own content, not an
+                                                    // overlay anchored over it. Anchoring the pill to the
+                                                    // delegate's right edge kept dropping it outside the
+                                                    // selection bar; laid out here it is inside the row by
+                                                    // construction, and the name elides against it instead of
+                                                    // needing its width reserved by hand.
+                                                    contentItem: RowLayout {
+                                                        spacing: Kirigami.Units.smallSpacing
+
+                                                        Kirigami.Icon {
+                                                            source: folderPane.folderIcon(folderDelegate.mailBox)
+                                                            Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                                            Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                                            color: folderDelegate.highlighted
+                                                                   ? Kirigami.Theme.highlightedTextColor
+                                                                   : Qt.alpha(Kirigami.Theme.textColor, 0.55)
+                                                        }
+                                                        QQC2.Label {
+                                                            Layout.fillWidth: true
+                                                            text: folderDelegate.name
+                                                            elide: Text.ElideRight
+                                                            color: folderDelegate.highlighted
+                                                                   ? Kirigami.Theme.highlightedTextColor
+                                                                   : Kirigami.Theme.textColor
+                                                        }
+                                                        UnreadPill {
+                                                            id: folderUnread
+                                                            count: folderDelegate.unread
+                                                            hiddenCount: folderDelegate.hiddenUnread
+                                                            primary: folderPane.isInbox(folderDelegate.mailBox)
+                                                        onHighlight: folderDelegate.highlighted
+                                                            Layout.preferredWidth: implicitWidth
+                                                            Layout.preferredHeight: implicitHeight
+                                                        }
+                                                    }
                                                     // Follows the folder that is actually
                                                     // open, not the view's cursor. During a
                                                     // model rebuild currentIndex churns
@@ -1354,11 +1626,20 @@ Kirigami.ApplicationWindow {
                                                         // mailbox — an easy accident with
                                                         // the default few pixels.
                                                         drag.threshold: Kirigami.Units.gridUnit
-                                                        // INBOX and the special-use folders
-                                                        // cannot be moved at all, so they
-                                                        // never start a drag.
-                                                        drag.target: Mail.folderProtected(folderDelegate.mailBox)
-                                                                     ? null : dragPayload
+                                                        // Every row can be picked up. Gating
+                                                        // this on folderProtected() left rows
+                                                        // undraggable for good: it is a plain
+                                                        // invokable with no change signal, and
+                                                        // the binding kept the value it got
+                                                        // while the delegate was still being
+                                                        // built — mailBox empty, which
+                                                        // folderProtected() answers true to.
+                                                        // What a folder may do is decided by
+                                                        // the drop targets instead: they ask
+                                                        // canMoveFolder() per hovered row, so a
+                                                        // protected folder finds nothing that
+                                                        // lights up.
+                                                        drag.target: dragPayload
 
                                                         onPressed: mouse => {
                                                             if (mouse.button !== Qt.LeftButton)
@@ -1388,7 +1669,7 @@ Kirigami.ApplicationWindow {
 
                                                     Kirigami.Icon {
                                                         visible: folderDelegate.hasChildren
-                                                        x: Kirigami.Units.smallSpacing
+                                                        x: Kirigami.Units.smallSpacing + Kirigami.Units.gridUnit / 2
                                                            + folderDelegate.level * Kirigami.Units.gridUnit
                                                         anchors.verticalCenter: parent.verticalCenter
                                                         source: folderDelegate.expanded ? "arrow-down" : "arrow-right"
@@ -1430,13 +1711,39 @@ Kirigami.ApplicationWindow {
                                                         implicitHeight: root.listRowHeight + 2
                                                         topPadding: 1
                                                         bottomPadding: 1
-                                                        text: modelData.name
-                                                        leftPadding: Kirigami.Units.largeSpacing + Kirigami.Units.gridUnit
+                                                        // Same account-under-parent indent as
+                                                        // the connected tree above.
+                                                        leftPadding: Kirigami.Units.largeSpacing + Kirigami.Units.gridUnit * 1.5
                                                                      + modelData.level * Kirigami.Units.gridUnit
-                                                        icon.name: folderPane.folderIcon(modelData.mailBox)
-                                                        icon.width: Kirigami.Units.iconSizes.small
-                                                        icon.height: Kirigami.Units.iconSizes.small
-                                                        icon.color: Qt.alpha(Kirigami.Theme.textColor, 0.55)
+                                                        rightPadding: Kirigami.Units.smallSpacing
+
+                                                        // Laid out as row content, same as the connected tree.
+                                                        contentItem: RowLayout {
+                                                            spacing: Kirigami.Units.smallSpacing
+
+                                                            Kirigami.Icon {
+                                                                source: folderPane.folderIcon(cachedFolderDelegate.modelData.mailBox)
+                                                                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                                                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                                                color: Qt.alpha(Kirigami.Theme.textColor, 0.55)
+                                                            }
+                                                            QQC2.Label {
+                                                                Layout.fillWidth: true
+                                                                text: cachedFolderDelegate.modelData.name
+                                                                elide: Text.ElideRight
+                                                                color: Kirigami.Theme.textColor
+                                                            }
+                                                            UnreadPill {
+                                                                count: cachedFolderDelegate.modelData.unread || 0
+                                                                hiddenCount: cachedFolderDelegate.modelData.hiddenUnread || 0
+                                                                primary: folderPane.isInbox(cachedFolderDelegate.modelData.mailBox)
+                                                                // Nothing in a cached tree is the open folder — that
+                                                                // account is not the connected one.
+                                                                onHighlight: false
+                                                                Layout.preferredWidth: implicitWidth
+                                                                Layout.preferredHeight: implicitHeight
+                                                            }
+                                                        }
                                                         onClicked: {
                                                             messageList.currentIndex = -1
                                                             messageList.openedUid = -1
@@ -1446,11 +1753,41 @@ Kirigami.ApplicationWindow {
                                                             messageList.forceActiveFocus()
                                                         }
 
+                                                        // Right-click on another account's tree.
+                                                        // Every folder command runs against the
+                                                        // connected account, so none of them can
+                                                        // act here — but a menu that simply never
+                                                        // appears reads as a broken click, so it
+                                                        // opens and says what is missing.
+                                                        MouseArea {
+                                                            anchors.fill: parent
+                                                            acceptedButtons: Qt.RightButton
+                                                            onClicked: {
+                                                                // Read the row before switching:
+                                                                // the switch repopulates this
+                                                                // Repeater and takes the delegate
+                                                                // with it.
+                                                                const box = cachedFolderDelegate.modelData.mailBox
+                                                                const nm = cachedFolderDelegate.modelData.name
+                                                                // Every folder command acts on the
+                                                                // open account, so open this one.
+                                                                // Right-clicking a folder means
+                                                                // "work on this folder" — being on
+                                                                // the wrong account is not
+                                                                // something to hand back to the
+                                                                // user to fix.
+                                                                Mail.switchAccount(accountSection.index)
+                                                                folderMenu.mailBox = box
+                                                                folderMenu.name = nm
+                                                                folderMenu.popup()
+                                                            }
+                                                        }
+
                                                         // Same expand/collapse arrow as the
                                                         // connected account's tree.
                                                         Kirigami.Icon {
                                                             visible: cachedFolderDelegate.modelData.hasChildren
-                                                            x: Kirigami.Units.smallSpacing
+                                                            x: Kirigami.Units.smallSpacing + Kirigami.Units.gridUnit / 2
                                                                + cachedFolderDelegate.modelData.level * Kirigami.Units.gridUnit
                                                             anchors.verticalCenter: parent.verticalCenter
                                                             source: cachedFolderDelegate.modelData.expanded
@@ -1474,7 +1811,7 @@ Kirigami.ApplicationWindow {
                                                     visible: parent.visible
                                                              && Mail.cachedFolderList(accountSection.index).length === 0
                                                     Layout.fillWidth: true
-                                                    leftPadding: Kirigami.Units.largeSpacing + Kirigami.Units.gridUnit
+                                                    leftPadding: Kirigami.Units.largeSpacing + Kirigami.Units.gridUnit * 1.5
                                                     text: "Not synced yet"
                                                     opacity: 0.8
                                                     elide: Text.ElideRight
@@ -1918,10 +2255,13 @@ Kirigami.ApplicationWindow {
                                     function requestDelete() {
                                         const rows = selectedIndexes()
                                         console.info("mailo: requestDelete rows", JSON.stringify(rows),
-                                                     "isTrash", Mail.isTrashFolder())
+                                                     "permanent", Mail.deleteIsPermanent())
                                         if (rows.length === 0)
                                             return
-                                        if (Mail.isTrashFolder()) {
+                                        // Spam counts as permanent too when
+                                        // Skip Trash is on — the prompt has to
+                                        // say what will actually happen.
+                                        if (Mail.deleteIsPermanent()) {
                                             confirmPermanentDelete.rows = rows
                                             confirmPermanentDelete.open()
                                         } else {
@@ -1934,6 +2274,13 @@ Kirigami.ApplicationWindow {
                                         if (rows.length === 0)
                                             return
                                         Mail.markAsJunk(rows)
+                                        clearSelection()
+                                    }
+                                    function requestNotSpam() {
+                                        const rows = selectedIndexes()
+                                        if (rows.length === 0)
+                                            return
+                                        Mail.markAsNotSpam(rows)
                                         clearSelection()
                                     }
 
@@ -2298,7 +2645,17 @@ Kirigami.ApplicationWindow {
                                         required property bool suspicious
                                         required property bool hasAttachment
                                         required property bool calendarAttachment
+                                        /// PgpMime::StoredKind: 0 none, 1 encrypted, 2 signed,
+                                        /// 3 both. 1 and 3 both draw the lock — what matters at
+                                        /// list level is that it is encrypted.
+                                        required property int crypto
                                         required property string authInfo
+                                        /// Local spam heuristics said so (spamheuristics.h).
+                                        /// Shares the "!" marker with `suspicious`: both mean
+                                        /// "not what it appears to be", and one glyph to learn
+                                        /// beats two that need telling apart.
+                                        required property bool spam
+                                        required property string spamDetail
                                         required property int colorLabel
                                         required property int index
 
@@ -2342,7 +2699,7 @@ Kirigami.ApplicationWindow {
                                         MouseArea {
                                             id: msgMouse
                                             anchors.fill: parent
-                                            acceptedButtons: Qt.LeftButton
+                                            acceptedButtons: Qt.LeftButton | Qt.RightButton
                                             // Past this the press becomes a drag and the
                                             // list stops scrolling under it; short enough
                                             // to feel immediate, long enough that a click
@@ -2374,6 +2731,21 @@ Kirigami.ApplicationWindow {
                                             }
                                             onClicked: mouse => {
                                                 messageList.forceActiveFocus()
+                                                if (mouse.button === Qt.RightButton) {
+                                                    // Right-click acts on the selection when
+                                                    // the row is part of it, and on that row
+                                                    // alone otherwise — the same rule the
+                                                    // drag uses. It never opens the message:
+                                                    // asking what to do with mail is not
+                                                    // reading it.
+                                                    if (!messageList.isSelected(msgDelegate.index)) {
+                                                        messageList.selectSingle(msgDelegate.index)
+                                                        messageList.currentIndex = msgDelegate.index
+                                                    }
+                                                    messageMenu.rows = messageList.selectedIndexes()
+                                                    messageMenu.popup()
+                                                    return
+                                                }
                                                 console.info("mailo: click row", msgDelegate.index,
                                                              "modifiers", mouse.modifiers,
                                                              "anchor", messageList.selectionAnchor)
@@ -2427,27 +2799,53 @@ Kirigami.ApplicationWindow {
                                                     width: messagePane.columnWidth(weight, columnHeader.width)
                                                     height: root.listRowHeight
 
-                                                    Kirigami.Icon { // paperclip / calendar-invite marker
+                                                    // Attachment and encryption share one column:
+                                                    // both are one-glyph facts about the message,
+                                                    // and a message can carry both at once. Driven
+                                                    // by the stored crypto column, so the list pays
+                                                    // no extra query for the lock.
+                                                    Row {
                                                         visible: rowCell.colId === "attach"
-                                                                 && msgDelegate.hasAttachment
                                                         anchors.centerIn: parent
-                                                        source: msgDelegate.calendarAttachment
-                                                                ? "view-calendar" : "mail-attachment"
-                                                        width: Kirigami.Units.iconSizes.small
-                                                        height: width
-                                                        opacity: 0.7
+                                                        spacing: 2
+
+                                                        Kirigami.Icon { // encrypted / signed marker
+                                                            visible: msgDelegate.crypto > 0
+                                                            source: msgDelegate.crypto === 2
+                                                                    ? "mail-signed" : "mail-encrypted"
+                                                            width: Kirigami.Units.iconSizes.small
+                                                            height: width
+                                                            opacity: 0.7
+                                                        }
+                                                        Kirigami.Icon { // paperclip / calendar-invite
+                                                            visible: msgDelegate.hasAttachment
+                                                            source: msgDelegate.calendarAttachment
+                                                                    ? "view-calendar" : "mail-attachment"
+                                                            width: Kirigami.Units.iconSizes.small
+                                                            height: width
+                                                            opacity: 0.7
+                                                        }
                                                     }
-                                                    QQC2.Label { // SPF/DKIM/DMARC failure marker
+                                                    QQC2.Label { // sender-authentication / spam marker
                                                         id: authMark
+                                                        // One glyph for both, because to a reader
+                                                        // they say the same thing. The tooltip is
+                                                        // where they differ: authentication quotes
+                                                        // the server, spam lists the rules that
+                                                        // fired, so "Why?" always has an answer.
+                                                        readonly property bool authFailed:
+                                                            msgDelegate.suspicious && Mail.authVerification
                                                         visible: rowCell.colId === "subject"
-                                                                 && msgDelegate.suspicious
+                                                                 && (authFailed || msgDelegate.spam)
                                                         anchors.left: parent.left
                                                         anchors.verticalCenter: parent.verticalCenter
                                                         text: "!"
                                                         color: Kirigami.Theme.negativeTextColor
                                                         font.bold: true
-                                                        QQC2.ToolTip.text: "Sender authentication failed:\n"
-                                                                           + msgDelegate.authInfo
+                                                        QQC2.ToolTip.text:
+                                                            authMark.authFailed
+                                                            ? "Sender authentication failed:\n" + msgDelegate.authInfo
+                                                            : "Looks like spam:\n" + msgDelegate.spamDetail
                                                         QQC2.ToolTip.visible: authHover.hovered
                                                         HoverHandler { id: authHover }
                                                     }
@@ -2536,6 +2934,10 @@ Kirigami.ApplicationWindow {
                             id: viewer
                             context: Mail.readingContext
                             ui: uiSettings
+                            // Only while the mail tab is up front: a message
+                            // tab has its own viewer, and both answering Find
+                            // or View source makes the shortcut ambiguous.
+                            shortcutsActive: tabStack.currentIndex === 0
                             QQC2.SplitView.fillHeight: true
                             QQC2.SplitView.minimumHeight: 160
                             onReplyRequested: replyAll => composeSheet().openReply(Mail.replyData(replyAll))

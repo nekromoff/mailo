@@ -6,6 +6,7 @@
 #include <QObject>
 #include <QQuickTextDocument>
 #include <QTextCursor>
+#include <QTextListFormat>
 
 /**
  * Formatting backend for the compose editor. QML TextArea has no API for
@@ -45,6 +46,29 @@ public:
     Q_INVOKABLE void toggleBulletList();
     Q_INVOKABLE void toggleOrderedList();
 
+    /// Turns a "-" or "*" written on its own at the start of a block into a
+    /// bulleted list, swallowing the space that triggered it. Returns true when
+    /// it did, so the caller can eat the key press.
+    Q_INVOKABLE bool startBulletList();
+
+    /// Same for a number written at the start of a block, triggered by the
+    /// terminator being typed after it ("." or ")") rather than by a following
+    /// space. The terminator is kept as the list's number suffix.
+    Q_INVOKABLE bool startOrderedList(const QString &terminator);
+
+    /// Leaves the list when Return is pressed on an empty item — the second of
+    /// the two Enters that ends a list. Returns true when it did.
+    Q_INVOKABLE bool leaveEmptyListItem();
+
+    /// Tab and Shift+Tab inside a list: one level in, one level out. False when
+    /// the cursor is not in a list, leaving Tab to move focus as usual.
+    Q_INVOKABLE bool indentListItem();
+    Q_INVOKABLE bool outdentListItem();
+
+    /// Backspace at the start of a list item: out one level, and out of the
+    /// list itself from the outermost one.
+    Q_INVOKABLE bool outdentAtBlockStart();
+
 Q_SIGNALS:
     void documentChanged();
     void cursorPositionChanged();
@@ -54,8 +78,11 @@ Q_SIGNALS:
 
 private:
     QTextCursor textCursor() const;
+    bool atBlockStart(const QTextCursor &cursor) const;
     void mergeFormat(const QTextCharFormat &format);
     void toggleList(int listStyle);
+    void applyMarkerList(QTextCursor &cursor, const QTextListFormat &listFormat);
+    bool changeListIndent(int delta);
 
     QQuickTextDocument *m_document = nullptr;
     int m_cursorPosition = -1;

@@ -6,6 +6,7 @@
 #include <QAtomicInt>
 #include <QByteArray>
 #include <QList>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QString>
 
@@ -63,11 +64,42 @@ public:
     /// Refined attachment kind (MessageListModel::Header::attachKind) learned
     /// from the full body — e.g. "single .ics calendar invite".
     void setAttachKind(const QString &folder, qint64 uid, int kind);
+    /// OpenPGP shape learned from the full body (PgpMime::StoredKind) — the
+    /// head only shows the outer content type, which cannot see inline PGP or
+    /// a signature nested inside an encrypted message.
+    void setCrypto(const QString &folder, qint64 uid, int kind);
+
+    /// Records a spam verdict for one message. \a state follows
+    /// MessageListModel::Header::spamState — 1 headers only, 2 with the body,
+    /// 3 cleared by the user.
+    void setSpamVerdict(const QString &folder, qint64 uid, int score, int state,
+                        const QString &detail);
     /// Marks a cached header as read, so the state survives a restart even
     /// before the next header sync confirms it from the server.
     void setSeen(const QString &folder, qint64 uid);
+    /// UIDs in \a folder whose message date is before \a cutoffSecs, plus any
+    /// with no usable date at all (stored as 0 — the "1970" rows), which count
+    /// as old rather than as new. Indexed by (folder, date).
+    QList<qint64> uidsOlderThan(const QString &folder, qint64 cutoffSecs);
+    /// Clears \Seen on one cached message — the "mark unread" counterpart.
+    void setUnseen(const QString &folder, qint64 uid);
     /// Local-only color-scale mark (0 = none, 1..5), never synced to IMAP.
     void setColorLabel(const QString &folder, qint64 uid, int color);
+
+    /// Our own DKIM/ARC verdict for one message, as recorded when we last had
+    /// a copy worth verifying. \a dkimStatus is empty when the message has
+    /// never been verified — the only value that means "ask again".
+    struct AuthVerdict {
+        QString dkimStatus;
+        QString dkimDetail;
+        bool dkimTrusted = false;
+        QString arcStatus;
+        QString arcSealer;
+        QString arcDetail;
+        bool isEmpty() const { return dkimStatus.isEmpty(); }
+    };
+    AuthVerdict authVerdict(const QString &folder, qint64 uid);
+    void storeAuthVerdict(const QString &folder, qint64 uid, const AuthVerdict &v);
     /// Every cached header of a folder carrying this color mark, newest first
     /// (indexed query — fast even on big folders).
     QList<MessageListModel::Header> headersByColor(const QString &folder, int color,
@@ -92,6 +124,15 @@ public:
     /// The account-scoped storage key for a folder ("account\x1ffolder"), for
     /// the off-thread helpers below which have no access to the account state.
     QString scopedKey(const QString &folder) const { return scoped(folder); }
+
+    /// Cached unread count per mailbox for \a account, keyed by bare folder
+    /// path. Counts what is in the cache, which for a folder still syncing is
+    /// fewer messages than the server holds.
+    ///
+    /// Takes an explicit connection because the first call also builds the
+    /// partial index it relies on, and that is a full pass over `messages`:
+    /// MailClient drives this on a worker, never on the GUI thread.
+    static QHash<QString, int> unreadCountsOn(QSqlDatabase &db, const QString &account);
 
     /// Deletes at most \a limit cached messages (header + body + search rows)
     /// of \a scopedFolder, using \a db. Returns how many were removed; 0 means
@@ -269,6 +310,15 @@ public:
     /// recipient list with every To/Cc address found there. Remembers per
     /// account that it ran, so later calls are no-ops.
     void harvestSentRecipients(const QString &sentFolder);
+
+    /// True when mail has ever been sent to \a address from any account —
+    /// the spam filter's Rule 0. Matches on the address alone, ignoring any
+    /// +tag, and deliberately across accounts: it is a statement about a
+    /// person, not about a mailbox. See SpamHeuristics::score().
+    bool isKnownCorrespondent(const QString &address);
+    /// Batched isKnownCorrespondent() for a whole FETCH worth of senders.
+    /// Returns the subset of \a addresses that are known, normalized.
+    QSet<QString> knownCorrespondents(const QSet<QString> &addresses);
 
     /// Attachment heuristic on a raw RFC-2822 head: top-level multipart/mixed.
     /// Works on the raw bytes because KMime downgrades multipart/* to

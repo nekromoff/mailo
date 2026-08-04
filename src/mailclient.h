@@ -24,6 +24,7 @@
 #include "mailstore.h"
 #include "messagecontext.h"
 #include "messagelistmodel.h"
+#include "pgpengine.h"
 
 class QThread;
 
@@ -35,6 +36,7 @@ class Session;
 class IdleJob;
 class LoginJob;
 class ImapSet;
+struct Message;
 }
 namespace KMime
 {
@@ -42,6 +44,7 @@ class Content;
 class Message;
 }
 class OAuthHelper;
+class PgpEngine;
 class ViewerSchemeHandler;
 
 /**
@@ -62,6 +65,13 @@ class MailClient : public QObject
     Q_PROPERTY(bool accountIsLocal READ accountIsLocal NOTIFY accountChanged)
     Q_PROPERTY(bool connected READ connected NOTIFY connectedChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    Q_PROPERTY(int spamRetentionDays READ spamRetentionDays WRITE setSpamRetentionDays
+                   NOTIFY spamRetentionDaysChanged)
+    /// Deleting spam removes it outright instead of filing it in the trash —
+    /// both when the user deletes it and when the retention sweep does.
+    /// On by default: spam in the trash is still spam to clear out. Persisted.
+    Q_PROPERTY(bool spamSkipTrash READ spamSkipTrash WRITE setSpamSkipTrash
+                   NOTIFY spamSkipTrashChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
     /// True while a cache vacuum is running — the UI disables the button and
     /// shows a spinner, since the database is locked for writes meanwhile.
@@ -109,6 +119,18 @@ class MailClient : public QObject
     Q_PROPERTY(int smtpPort READ smtpPort NOTIFY accountChanged)
     Q_PROPERTY(int smtpSecurity READ smtpSecurity NOTIFY accountChanged)
 
+    /// The active account's OpenPGP settings, for the compose window: which
+    /// key it signs with (empty = none configured) and how it starts out.
+    Q_PROPERTY(QString accountPgpKeyFp READ accountPgpKey NOTIFY accountChanged)
+    Q_PROPERTY(bool accountPgpSignByDefault READ accountPgpSignByDefault
+                   NOTIFY accountChanged)
+    Q_PROPERTY(bool accountPgpEncryptByDefault READ accountPgpEncryptByDefault
+                   NOTIFY accountChanged)
+    /// Whether to ask a recipient's own domain for their key while composing
+    /// (WKD). Never a keyserver — that would tell a third party who is about
+    /// to be written to (doc/openpgp.md §7).
+    Q_PROPERTY(bool accountPgpAutoWkd READ accountPgpAutoWkd NOTIFY accountChanged)
+
     // All configured accounts (display names) and which one is active
     Q_PROPERTY(QStringList accountNames READ accountNames NOTIFY accountsChanged)
     Q_PROPERTY(int currentAccount READ currentAccount NOTIFY accountsChanged)
@@ -123,6 +145,13 @@ class MailClient : public QObject
     /// Largest message body to keep in the offline cache, in MB (0 = no
     /// limit). Bigger ones are still opened on demand, just never stored.
     Q_PROPERTY(int maxBodyMB READ maxBodyMB WRITE setMaxBodyMB NOTIFY maxBodyMBChanged)
+    /// Master switch for sender authentication: our own DKIM and ARC
+    /// verification, and the SPF/DKIM/DMARC verdict our receiving server
+    /// stamped into Authentication-Results. On by default. When off, nothing
+    /// is checked and nothing is shown — no DNS query is emitted, and no
+    /// verdict is stored on a message header. Persisted.
+    Q_PROPERTY(bool authVerification READ authVerification WRITE setAuthVerification
+                   NOTIFY authVerificationChanged)
     /// Writes a running trace of folder/account/sync activity to the console.
     /// Off by default; takes effect immediately. Persisted.
     Q_PROPERTY(bool debugLogging READ debugLogging WRITE setDebugLogging
@@ -148,6 +177,10 @@ public:
 
     /// The scheme handler that serves message bodies to the viewer.
     void setViewerHandler(ViewerSchemeHandler *handler) { m_viewerHandler = handler; }
+    /// Hands the client the OpenPGP backend (main.cpp owns it). Without it —
+    /// or with one that reports unavailable — encrypted mail is shown as
+    /// encrypted and undecryptable, and nothing else changes.
+    void setPgpEngine(PgpEngine *engine);
 
     bool hasAccount() const;
     bool accountIsLocal() const { return m_local; }
@@ -175,8 +208,18 @@ public:
     int currentAccount() const { return m_currentAccount; }
     int cachedFolderRevision() const { return m_cachedFolderRevision; }
     int refreshMinutes() const { return m_refreshMinutes; }
+    int spamRetentionDays() const { return m_spamRetentionDays; }
+    void setSpamRetentionDays(int days);
+    bool spamSkipTrash() const { return m_spamSkipTrash; }
+    void setSpamSkipTrash(bool skip);
+    /// True when deleting from the folder now open destroys the messages
+    /// rather than filing them — already in the trash, or spam with
+    /// spamSkipTrash() on. The confirmation prompt is worded from this.
+    Q_INVOKABLE bool deleteIsPermanent() const;
     int maxBodyMB() const { return m_maxBodyMB; }
     void setMaxBodyMB(int mb);
+    bool authVerification() const { return m_authVerification; }
+    void setAuthVerification(bool on);
     QString selectedFolder() const { return m_selectedFolder; }
     bool debugLogging() const { return m_debugLogging; }
     void setDebugLogging(bool on);
@@ -196,11 +239,31 @@ public:
     /// Config fields of account \a index as {host, port, security, user,
     /// smtpHost, smtpPort, smtpSecurity, authType, clientId, clientSecret};
     /// empty map for an unknown index.
+    /// The account's own OpenPGP fingerprint, or empty when it has none.
+    QString accountPgpKey() const;
+    bool accountPgpSignByDefault() const;
+    bool accountPgpEncryptByDefault() const;
+    bool accountPgpAutoWkd() const;
     Q_INVOKABLE QVariantMap accountDetails(int index) const;
     /// Creates (index -1 or out of range) or updates an account from the same
     /// map shape accountDetails() returns (plus "password"/"savePassword"),
     /// then makes it the active one. An empty password keeps the stored one.
     Q_INVOKABLE void saveAccountDetails(int index, const QVariantMap &details);
+    /// Writes just the keys \a details carries into an existing account, and
+    /// touches nothing else: no wallet write, and above all no reconnect.
+    ///
+    /// This is what the settings page autosaves through. Everything that only
+    /// changes how mail is written or displayed — the display name, the
+    /// organization, the signature, the HTML preference, the OpenPGP settings
+    /// — can be stored while a session is up, whereas saveAccountDetails()
+    /// tears the session down and dials again, which is right for a changed
+    /// server and quite wrong for every keystroke in the signature box.
+    ///
+    /// Server and identity keys ("host", "port", "security", "user", "email",
+    /// "smtpHost", "smtpPort", "smtpSecurity", "authType", "local",
+    /// "cacheKey") are refused here: they decide the account key that names
+    /// the cache and the wallet entry, so they go through the explicit save.
+    Q_INVOKABLE void saveAccountPrefs(int index, const QVariantMap &details);
     Q_INVOKABLE void removeAccount(int index);
     /// Imports a Thunderbird mail directory (mbox files, ".sbd" hierarchy)
     /// into a new local-archive account: browsable from the cache like any
@@ -214,18 +277,27 @@ public:
     /// Disconnects, loads account \a index and reconnects.
     Q_INVOKABLE void switchAccount(int index);
     /// Builds a MIME message and sends it via SMTP. attachments are local file URLs.
+    /// \a sign and \a encrypt are the compose window's toggles; both need the
+    /// account to have an OpenPGP key configured, and encryption additionally
+    /// needs a key for every recipient. A missing key is refused outright
+    /// rather than silently downgraded to plaintext.
     Q_INVOKABLE void sendMail(const QString &to, const QString &cc, const QString &bcc,
                               const QString &subject, const QString &html,
-                              const QList<QUrl> &attachments);
+                              const QList<QUrl> &attachments, bool sign = false,
+                              bool encrypt = false);
     /// APPENDs the same message to the Drafts folder instead of sending it.
     /// Unlike sendMail this accepts an unfinished message — no recipient, or
     /// an address still being typed — because that is the state a draft is
     /// saved from. Emits draftSaved() or sendFailed().
     /// \a replacesUid is the draft being re-saved (-1 for a new one); it is
     /// removed only after the server has accepted the replacement.
+    /// \a encrypt encrypts the draft to the sender's own key before it is
+    /// appended — a draft of an encrypted message must never sit in the clear
+    /// in a server-side folder.
     Q_INVOKABLE void saveDraft(const QString &to, const QString &cc, const QString &bcc,
                                const QString &subject, const QString &html,
-                               const QList<QUrl> &attachments, qint64 replacesUid = -1);
+                               const QList<QUrl> &attachments, qint64 replacesUid = -1,
+                               bool sign = false, bool encrypt = false);
     /// Whether a Drafts folder is known, so the UI can hide the action when
     /// there is nowhere to put one.
     Q_PROPERTY(bool hasDraftsFolder READ hasDraftsFolder NOTIFY draftsFolderChanged)
@@ -295,6 +367,13 @@ public:
     /// No-op when the open folder already is the junk folder.
     Q_INVOKABLE void markAsJunk(const QVariantList &rows);
 
+    /// Clears the local spam mark on the given rows and adds their senders to
+    /// the allowlist, so nothing from them is ever marked again. The counterpart
+    /// to markAsJunk(), and the only way a false positive gets corrected — which
+    /// is why it settles the verdict permanently (state 3) rather than leaving
+    /// the message to be re-scored to the same wrong answer on the next sync.
+    Q_INVOKABLE void markAsNotSpam(const QVariantList &rows);
+
     /// Moves the given model rows into \a targetFolder — the sidebar's
     /// drag-and-drop target. No-op when it is the folder they are already in.
     Q_INVOKABLE void moveMessagesTo(const QVariantList &rows, const QString &targetFolder);
@@ -310,8 +389,21 @@ public:
     Q_INVOKABLE void moveFolder(const QString &mailBox, const QString &newParent);
 
     /// True for the folders that must not be moved or deleted: INBOX and the
-    /// account's special-use mailboxes (sent, trash, junk).
+    /// account's special-use mailboxes (sent, drafts, trash, junk).
     Q_INVOKABLE bool folderProtected(const QString &mailBox) const;
+
+    /// Empty when \a mailBox can be renamed; otherwise one sentence saying why
+    /// not, for the context menu to show in place of the Rename entry. The
+    /// reasons are protocol ones, not policy: INBOX keeps its name by RFC 3501,
+    /// and a RFC 6154 special-use mailbox is recreated under the old name.
+    Q_INVOKABLE QString folderRenameBlockedReason(const QString &mailBox) const;
+    /// The name the sidebar shows for \a mailBox — what the rename dialog
+    /// prefills. Defined with the path helpers further down.
+    Q_INVOKABLE QString folderDisplayLeaf(const QString &mailBox) const;
+    /// Renames \a mailBox in place — \a newName replaces its last path step
+    /// only; reparenting is what dragging a folder does. No-op when the name is
+    /// unchanged, taken, or contains the hierarchy delimiter.
+    Q_INVOKABLE void renameFolder(const QString &mailBox, const QString &newName);
     /// True when deleting \a mailBox removes it from the server for good —
     /// it already lives in the trash (or the account has no trash folder).
     /// The confirmation dialog is worded from this.
@@ -395,6 +487,8 @@ Q_SIGNALS:
     void closeRequested();
     void accountChanged();
     void connectedChanged();
+    void spamRetentionDaysChanged();
+    void spamSkipTrashChanged();
     void busyChanged();
     void statusTextChanged();
     /// Fired when a full message body has been fetched and parsed.
@@ -427,6 +521,7 @@ Q_SIGNALS:
     void importFinished(bool ok, const QString &message);
     void refreshMinutesChanged();
     void maxBodyMBChanged();
+    void authVerificationChanged();
     void debugLoggingChanged();
     void selectedFolderChanged();
     void dateFormatChanged();
@@ -452,6 +547,15 @@ private:
     /// Marks a message read everywhere: visible list, disk cache, and (when
     /// online) the server via STORE \Seen — so the state survives restarts.
     void markMessageRead(int row);
+
+public:
+    /// Clears \Seen on the given model rows, in the model, the cache and (when
+    /// online) on the server. Deliberately does not touch the viewer: a message
+    /// marked unread while open stays open and stays unread, and the ordinary
+    /// rule takes over again — it is marked read the next time it is opened.
+    Q_INVOKABLE void markMessagesUnread(const QVariantList &rows);
+
+private:
     void loadAccount();
     void loadAccountFields();
     void readWalletPassword();
@@ -481,6 +585,30 @@ private:
     /// in response to a [TOO-MANY-SIMULTANEOUS-CONNECTIONS] refusal.
     void shrinkBodyPool();
     void listFolders();
+    /// Checks every other configured account for new mail on the refresh
+    /// timer: connect, STATUS its folders, disconnect. Accounts that are not
+    /// the open one hold no session at all, so this is the only way their
+    /// unread counts ever move. Sequential, one account at a time.
+    void pollOtherAccounts();
+    /// One account's check; \a done is called however it ends, so the queue
+    /// keeps moving even when an account is unreachable.
+    void pollAccount(const QVariantMap &account, const std::function<void()> &done);
+    /// STATUS every cached folder of \a accountKey on an open session, then
+    /// hand the unread counts back and close.
+    void statusFoldersOn(KIMAP::Session *session, const QString &accountKey,
+                         const std::function<void()> &done);
+    /// Permanently removes messages older than spamRetentionDays() from the
+    /// account's spam folder. Runs once per connection, on the background sync
+    /// session so it never disturbs the folder being read.
+    void sweepOldSpam();
+    /// Asks for the sidebar's unread pills to be recomputed. Debounced and
+    /// coalesced: marking a run of messages read fires this once per burst, and
+    /// a request arriving while the worker runs re-runs it once afterwards
+    /// rather than queueing one pass per call.
+    void scheduleUnreadRecount();
+    /// Runs the recount for every account on a worker connection and hands the
+    /// result to the folder model. Never call from the GUI thread's hot path.
+    void startUnreadRecount();
     /// The server's hierarchy delimiter, as reported by LIST. Falls back to
     /// guessing from the known paths before the first listing has arrived.
     QChar folderSeparator() const;
@@ -489,6 +617,13 @@ private:
     /// Everything above the last component ("INBOX/a/b" -> "INBOX/a"; empty
     /// for a top-level folder).
     QString folderParent(const QString &mailBox) const;
+    /// The ancestor \a mailBox visibly hangs under in the sidebar — the deepest
+    /// prefix that is itself a known mailbox, empty for a top-level row. Not the
+    /// same as folderParent() for an imported archive, whose paths carry a
+    /// server-directory root that is not a mailbox of its own.
+    QString folderDisplayParent(const QString &mailBox) const;
+    // folderDisplayLeaf() belongs with these, but is declared public above so
+    // the rename dialog can prefill with it.
     /// \a leaf placed under \a parent ("" = top level), with " (2)", " (3)" …
     /// appended until the path is one no mailbox already uses.
     QString freeChildPath(const QString &parent, const QString &leaf) const;
@@ -501,8 +636,13 @@ private:
     void renameFolderOnServer(const QString &from, const QString &to,
                               const QString &doneStatus);
     /// Moves the cached mail of a renamed subtree onto its new paths, on a
-    /// worker thread (it rewrites body blobs).
-    void renameCachedFolder(const QString &from, const QString &to);
+    /// worker thread (it rewrites body blobs). \a done, if given, runs on the
+    /// GUI thread once the re-key has finished.
+    void renameCachedFolder(const QString &from, const QString &to,
+                            std::function<void()> done = {});
+    /// Folder-model rows built from bare mailbox paths, inferring levels and
+    /// display names the way the cached-folder loader does.
+    static QList<FolderModel::Folder> foldersFromPaths(const QStringList &paths);
     /// Drops the cached mail of folders deleted from the server, on the same
     /// worker (chunked, so the GUI thread never waits for a write lock).
     void purgeCachedFolders(const QStringList &folders);
@@ -599,10 +739,35 @@ private:
         QStringList *toList = nullptr, QStringList *ccList = nullptr,
         QStringList *bccList = nullptr);
     // --- Per-context message presentation (reading pane + detached windows) ---
+    /// Corrects a listed row's OpenPGP mark from the full body — see the
+    /// definition. Runs wherever refineAttachKind does.
+    void refineCrypto(const QString &folder, qint64 uid, KMime::Message *msg);
+    /// Offers a public key attached to the message — see the definition.
+    void findAttachedKey(MessageContext *ctx, KMime::Content *root);
     void collectInlineParts(MessageContext *ctx, KMime::Content *root);
     void collectAttachments(MessageContext *ctx, KMime::Content *root);
     QString attachmentNameFor(const MessageContext *ctx, int index) const;
     bool writeAttachmentFor(const MessageContext *ctx, int index, const QString &path);
+    /// Fills \a ctx's body, preview, inline parts and attachments from \a root.
+    /// Runs a second time, over the decrypted tree, for an encrypted message.
+    void applyBodyParts(MessageContext *ctx, KMime::Message *root, bool junk);
+    /// Handles one PgpEngine::decryptFinished — see the definition.
+    void applyDecryption(quint64 jobId, const QByteArray &plainText,
+                         const QString &error, bool noSecretKey);
+    /// Handles one PgpEngine::verifyFinished.
+    void applyVerification(quint64 jobId, const PgpSignatureInfo &signature);
+    /// Starts detached verification of \a root's RFC 3156 signature, if it has
+    /// one, and records the job against \a ctx. Returns true if a job started.
+    bool startPgpVerification(MessageContext *ctx, KMime::Message *root);
+    /// Wraps \a msg per RFC 3156 and hands the finished wire bytes to
+    /// \a done. Runs \a done immediately with the plain message when neither
+    /// flag is set. On failure \a done is never called and sendFailed() has
+    /// been emitted — a message that could not be encrypted is not a message
+    /// to send in the clear.
+    void applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
+                             const QStringList &recipients, bool sign, bool encrypt,
+                             std::function<void(const QByteArray &)> done);
+
     /// Presents \a message in the reading pane's context.
     void presentMessage(const std::shared_ptr<KMime::Message> &message);
     /// A standalone copy of the reading context for a detached window. Shares
@@ -625,6 +790,17 @@ private:
     /// Records the To/Cc addresses of a message from the Sent folder in the
     /// recipient-autocompletion store.
     void harvestRecipients(const KMime::Message *msg);
+    /// Fills in the spam fields of \a h from its raw \a head. \a knownSenders is
+    /// the pre-resolved allowlist for the batch (see appendScoredHeaders).
+    void scoreHeader(MessageListModel::Header &h, const QByteArray &head,
+                     const QSet<QString> &knownSenders);
+    /// Turns one FETCH delivery into scored list headers and appends them to
+    /// \a out, skipping entries at or below \a minUid. Single place where a
+    /// KIMAP header batch becomes rows, so the allowlist lookup stays batched
+    /// and no fetch path can quietly skip scoring.
+    void appendScoredHeaders(QList<MessageListModel::Header> &out,
+                             const QMap<qint64, KIMAP::Message> &messages,
+                             const QStringList &authDomains, qint64 minUid = 0);
     /// The account's own sending address, bare — no display name. This is the
     /// SMTP envelope sender, and the address excluded from reply-all lists.
     QString ownAddress() const;
@@ -635,6 +811,10 @@ private:
     QString junkFolderName() const;
     /// Junk/spam folders get hostile-content handling in the viewer.
     bool isJunkFolder(const QString &mailBox) const;
+    /// authserv-ids whose Authentication-Results we are willing to believe for
+    /// the account's IMAP host — empty when authVerification is off, which is
+    /// what makes the whole SPF/DKIM/DMARC display collapse to nothing.
+    QStringList trustedAuthDomains() const;
     /// Hands \a ctx's message to the DKIM worker thread. Called only when a
     /// message is actually opened — never during sync or prefetch, so the
     /// mailbox does not turn into a stream of DNS queries to the resolver.
@@ -648,6 +828,16 @@ private:
     bool scheduleDkimRetry(MessageContext *ctx);
     /// Applies a verdict that arrived from the worker thread.
     void applyDkimResult(quint64 requestId, const DkimResult &result);
+    /// A body hash that fails against a *cached* copy usually says our copy is
+    /// stale rather than that the message was altered: bodies written by older
+    /// builds are not the octets that arrived (see doc/roadmap.md). Drops the
+    /// cached body, refetches it once, and re-verifies against what the server
+    /// actually holds. Returns false when healing does not apply, in which
+    /// case the mismatch stands as "not verified".
+    /// Which check found the mismatch — it decides what runs again afterwards,
+    /// and which badge shows "checking" meanwhile.
+    enum class HealReason { DkimBodyHash, OpenPgpSignature };
+    bool healCachedBody(MessageContext *ctx, HealReason reason);
     void purgeDeleted(const QList<qint64> &uids);
     void configureLogin(KIMAP::LoginJob *login) const;
     QString oauthWalletKey() const;
@@ -745,6 +935,7 @@ private:
     int m_missingBodies = -1; ///< -1 = stale, recompute on next use
     QString m_missingBodiesFolder;
     int m_maxBodyMB = 5; ///< bodies above this are not cached (0 = no limit)
+    bool m_authVerification = true; ///< DKIM/ARC/SPF/DMARC checking and display
     bool m_debugLogging = false;
 
     /// Bodies wait here for the writer thread; the mutex guards the queue and
@@ -763,6 +954,12 @@ private:
     QThread *m_purgeThread = nullptr; ///< background removal of that archive
     QThread *m_folderOpThread = nullptr; ///< cache re-key / purge after a folder move
     QAtomicInt m_folderOpCancel;
+    QThread *m_unreadThread = nullptr;   ///< unread-count recount for the sidebar
+    bool m_unreadRecountQueued = false;  ///< a request arrived while one was running
+    QTimer m_unreadDebounce;
+    /// Unread counts per account key, so the pane can show them for accounts
+    /// that are only cached — one worker pass fills them all.
+    QHash<QString, QHash<QString, int>> m_unreadByAccount;
     QThread *m_vacuumThread = nullptr;
     QAtomicInt m_purgeCancel;
     int m_purgedRows = 0;
@@ -780,6 +977,10 @@ private:
     QTimer m_keepAlive;
     QTimer m_pollTimer;      ///< IDLE-less fallback refresh of the open folder
     int m_refreshMinutes = 5;
+    int m_spamRetentionDays = 30; ///< 0 = keep spam forever
+    bool m_spamSkipTrash = true;  ///< delete spam outright, not into the trash
+    bool m_spamSwept = false;     ///< the sweep has run for this connection
+    bool m_accountPollBusy = false; ///< a background account round is in flight
     QString m_dateFormat;    ///< Qt date pattern for list/viewer dates
     qint64 m_oldestFetchedSeq = 0; ///< lowest sequence number fetched so far
     qint64 m_folderMessageCount = 0; ///< total messages in the open folder
@@ -810,6 +1011,20 @@ private:
 
     MessageContext *m_reading = nullptr; ///< the reading pane's message state
 
+    /// OpenPGP backend, set by main.cpp. Null, or unavailable, on a machine
+    /// without gnupg — every path through here checks before using it.
+    QPointer<PgpEngine> m_pgp;
+    /// Decrypt jobs in flight, by the token PgpEngine::decrypt() handed out.
+    /// A list per job, because detaching a window mid-decryption gives the
+    /// same job a second context to answer rather than a second decryption
+    /// (and a second passphrase prompt). A reader who moves on before gpg
+    /// answers leaves entries nothing wants; applyDecryption() drops those.
+    QHash<quint64, QList<QPointer<MessageContext>>> m_pendingDecrypt;
+    /// Verify jobs in flight, same scheme as m_pendingDecrypt. A signature
+    /// found inside an encrypted message reuses that message's decrypt token,
+    /// so an id can appear in both maps.
+    QHash<quint64, QList<QPointer<MessageContext>>> m_pendingVerify;
+
     /// DKIM verification runs off the GUI thread: it is a DNS round trip plus
     /// SHA-256 over the whole message and a public-key operation.
     QThread *m_dkimThread = nullptr;
@@ -829,6 +1044,12 @@ private:
     /// In-flight verifications by request id. QPointer because a detached
     /// window may close while its message is still being checked.
     QHash<quint64, QPointer<MessageContext>> m_dkimPending;
+    /// "folder\nuid" of messages whose cached body has already been refetched
+    /// once because its body hash failed. Session-scoped on purpose: a healed
+    /// body is byte-exact afterwards, so the only messages that could come
+    /// back here are ones that genuinely mismatch, and those must not cost a
+    /// fetch on every open.
+    QSet<QString> m_dkimHealed;
     bool m_detachPending = false; ///< a double-click is waiting for its fetch
     qint64 m_detachUid = -1;      ///< the message that double-click asked for
     QString m_textPreview;

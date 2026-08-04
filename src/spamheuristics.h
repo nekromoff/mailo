@@ -1,0 +1,121 @@
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+#pragma once
+
+#include <QByteArray>
+#include <QDateTime>
+#include <QList>
+#include <QString>
+
+/**
+ * Header and structure based spam scoring.
+ *
+ * Deliberately free of I/O: no database, no network, no DNS. Everything the
+ * scorer cannot read out of the message itself arrives in a Context filled in
+ * by the caller, which is what makes the whole thing checkable offline by
+ * tests/spamtool.cpp against a corpus of real mail. A scorer that queries
+ * things while it scores cannot be measured, and an unmeasurable spam filter
+ * is one whose false-positive rate nobody knows.
+ *
+ * The weights below are not a probability model — they are an ordering. What
+ * matters is that no single weak signal can reach the spam threshold on its
+ * own, so a legitimate message has to trip several independent rules before it
+ * is ever marked. Anything that fires on ordinary bulk mail (newsletters hiding
+ * a preheader with font-size:0, for instance) is either weighted so low it
+ * cannot matter or left out entirely; see the notes in spamheuristics.cpp.
+ */
+namespace SpamHeuristics
+{
+
+/// One rule that fired, with the reason shown in the "Why?" tooltip.
+struct Hit {
+    QString id;      ///< stable identifier, e.g. "known-contact-spoofed"
+    int weight = 0;  ///< positive = spammier, negative = hammier
+    QString detail;  ///< one line of human-readable evidence
+};
+
+/// Three-way, never two-way. "Unsure" is the whole point: a filter forced to
+/// choose between spam and ham on thin evidence gets to be wrong about mail it
+/// had no business judging, so anything short of confident stays unmarked.
+enum class Verdict {
+    Ham,
+    Unsure,
+    Spam,
+};
+
+/// Score at or above this is marked. Chosen so that no two ordinary rules can
+/// reach it together — it takes either one decisive signal (a known contact
+/// whose authentication failed) or an accumulation of three or four.
+inline constexpr int SpamThreshold = 50;
+/// Below this, nothing is shown at all.
+inline constexpr int UnsureThreshold = 25;
+
+/// What the caller knows and the message does not say for itself.
+struct Context {
+    /// The From address appears in the recipients table — mail has been sent to
+    /// this person from one of the user's accounts. See MailStore::isKnownCorrespondent().
+    bool knownCorrespondent = false;
+
+    /// Our own receiving server reported spf/dkim/dmarc = fail, softfail or
+    /// permerror. Only ever set from an Authentication-Results header whose
+    /// authserv-id we trust — a sender's own AR header is worthless here.
+    bool authFailed = false;
+    /// Same provenance, reporting a pass.
+    bool authPassed = false;
+    /// The raw trusted Authentication-Results value, for the detail line.
+    QString authInfo;
+
+    /// PgpMime::StoredKind — 0 none, 1 encrypted, 2 signed, 3 both. Taken as a
+    /// strong ham signal without checking the key: at list-build time no
+    /// signature has been verified yet, and spam that bothers to be OpenPGP
+    /// signed or encrypted to the recipient's key is not a thing that happens.
+    int crypto = 0;
+
+    /// True to skip the known-correspondent short circuit and score the message
+    /// anyway. Only for spamtool, which needs to see what a message would have
+    /// scored without the exemption masking it.
+    bool alwaysScore = false;
+};
+
+struct Score {
+    int total = 0;
+    Verdict verdict = Verdict::Ham;
+    QList<Hit> hits;
+
+    /// Set when Rule 0 applied and scoring was skipped entirely.
+    bool exempt = false;
+    QString exemptReason;
+
+    /// Multi-line "Why?" text: one line per rule that fired. Empty when nothing
+    /// fired, so the UI can use emptiness to mean "nothing to explain".
+    QString explanation() const;
+};
+
+/// The parts of a message the scorer looks at. \a html and \a text are
+/// optional: at list-build time only the head is available, and every rule that
+/// needs a body simply does not fire. That is why the same message can score
+/// higher once its body arrives, and why the stored score is refined rather
+/// than treated as final.
+struct Message {
+    QByteArray head;
+    QString html;
+    QString text;
+};
+
+Score score(const Message &msg, const Context &ctx);
+
+/// The bare addr-spec of a From/Reply-To style header value, lowercased and
+/// with any +tag stripped. Empty when the value carries no address.
+QString addressOf(const QString &headerValue);
+/// The address with its +tag removed, lowercased. Used for allowlist lookups so
+/// that mail to you+shopping@ still recognises you@.
+QString normalizeAddress(const QString &address);
+/// Display name of a mailbox header value, unquoted, without the address part.
+QString displayNameOf(const QString &headerValue);
+/// Registrable domain of an address, via the Public Suffix List. Falls back to
+/// the full domain when the list has not loaded, which can only ever make two
+/// domains look *less* related — the safe direction.
+QString organizationalDomainOf(const QString &address);
+
+} // namespace SpamHeuristics

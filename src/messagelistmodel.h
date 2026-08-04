@@ -26,7 +26,17 @@ public:
         AuthInfoRole,
         AttachmentRole,
         CalendarRole,
-        ColorLabelRole
+        ColorLabelRole,
+        /// PgpMime::StoredKind — 0 none, 1 encrypted, 2 signed, 3 both. Comes
+        /// from the messages.crypto column, so the list costs no extra query.
+        CryptoRole,
+        /// True when the local spam score reached SpamHeuristics::SpamThreshold.
+        /// Shares the "!" marker with SuspiciousRole: to a reader both mean
+        /// "this message is not what it appears to be", and two different
+        /// warning glyphs in one row would be two things to learn instead of one.
+        SpamRole,
+        /// Multi-line "Why?" text — one line per rule that fired.
+        SpamDetailRole
     };
 
     /// Attachment kinds carried in Header::attachKind.
@@ -42,6 +52,14 @@ public:
         QString authInfo;        ///< raw Authentication-Results header
         int attachKind = NoAttachment; ///< 1 = multipart/mixed head, 2 = all-.ics attachments
         int colorLabel = 0;      ///< local color-scale mark (0 = none, 1..5)
+        int crypto = 0;          ///< PgpMime::StoredKind, see CryptoRole
+        /// Local spam heuristics (spamheuristics.h). The score is kept rather
+        /// than a boolean so a threshold change re-judges cached mail.
+        int spamScore = 0;
+        /// 0 never scored, 1 scored from headers, 2 scored with the body,
+        /// 3 exempt under Rule 0 (a known correspondent).
+        int spamState = 0;
+        QString spamDetail;      ///< one line per rule that fired
         /// RFC 5322 Message-ID with the angle brackets stripped. Stable across
         /// folders and UIDVALIDITY resets, unlike uid.
         QString msgid;
@@ -80,8 +98,16 @@ public:
     Q_INVOKABLE int rowForUid(qint64 uid) const;
     bool seenAt(int row) const;
     void markSeen(int row);
+    void markUnseen(int row);
     /// Refines a message's attachment kind in place (body-derived knowledge).
     void setAttachKind(qint64 uid, int kind);
+    /// PgpMime::StoredKind for a listed row, refined from the full body.
+    void setCrypto(qint64 uid, int kind);
+    /// Raw From header of a visible row, display name included.
+    QString fromAt(int row) const;
+    /// Drops a row's spam mark and settles the verdict (state 3) so a later
+    /// re-score cannot bring it back.
+    void clearSpam(qint64 uid);
     int colorLabelAt(int row) const;
     void setColorLabel(qint64 uid, int color);
     /// Drops the given uids from the model (visible and hidden lists).
