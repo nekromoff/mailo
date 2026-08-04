@@ -33,12 +33,14 @@ Security-minded KDE-only IMAP mail client, blazing fast.
 - **Imported mail** — a Thunderbird directory imports as an offline account. Add servers later to promote it to a live one, archive intact.
 
 ## Screenshots
-<img width="1920" height="1024" alt="0" src="https://github.com/user-attachments/assets/638d2514-dd1b-41fd-901a-850f130fe2cc" />
-<img width="997" height="681" alt="compose" src="https://github.com/user-attachments/assets/4c14c43f-62d2-4bb0-a039-cc86447e5294" />
-<img width="899" height="575" alt="2" src="https://github.com/user-attachments/assets/bd762b0c-f9e0-43be-8bb8-c3a9b6d04f08" />
-<img width="1198" height="748" alt="1" src="https://github.com/user-attachments/assets/e4fef71e-93d8-4291-b69d-ee0845f24e5b" />
-<img width="900" height="573" alt="3" src="https://github.com/user-attachments/assets/386c741a-f78e-420e-9820-8cb2d27acaa7" />
-<img width="901" height="576" alt="4" src="https://github.com/user-attachments/assets/980494f3-a786-4da6-aba1-0aadd4540cb5" />
+<img width="1002" height="688" alt="10-compose-cc" src="https://github.com/user-attachments/assets/fbc35fc8-4e8d-4552-9d8b-3b0a5fee1123" />
+<img width="1002" height="688" alt="09-compose" src="https://github.com/user-attachments/assets/7eb166ee-1755-4f44-bd3e-3d009547e1dd" />
+<img width="1920" height="1038" alt="06-settings-about" src="https://github.com/user-attachments/assets/04a7e082-22ab-4ac6-b89c-42ca946de011" />
+<img width="1920" height="1038" alt="05-settings-shortcuts" src="https://github.com/user-attachments/assets/bcd26a5d-7d62-4bd8-9763-4d23832cb777" />
+<img width="1920" height="1038" alt="04-settings-look" src="https://github.com/user-attachments/assets/5bd60db6-470e-43d7-97d0-ef9683eaf847" />
+<img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/7d78bf03-1efd-4435-be42-1607affc89f2" />
+<img width="1920" height="1038" alt="01-main" src="https://github.com/user-attachments/assets/e837b967-0f7f-485e-b003-3a0c1497dc1d" />
+
 
 ## Installation
 
