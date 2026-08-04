@@ -33,14 +33,13 @@ Security-minded KDE-only IMAP mail client, blazing fast.
 - **Imported mail** — a Thunderbird directory imports as an offline account. Add servers later to promote it to a live one, archive intact.
 
 ## Screenshots
-<img width="1002" height="688" alt="10-compose-cc" src="https://github.com/user-attachments/assets/fbc35fc8-4e8d-4552-9d8b-3b0a5fee1123" />
-<img width="1002" height="688" alt="09-compose" src="https://github.com/user-attachments/assets/7eb166ee-1755-4f44-bd3e-3d009547e1dd" />
-<img width="1920" height="1038" alt="06-settings-about" src="https://github.com/user-attachments/assets/04a7e082-22ab-4ac6-b89c-42ca946de011" />
-<img width="1920" height="1038" alt="05-settings-shortcuts" src="https://github.com/user-attachments/assets/bcd26a5d-7d62-4bd8-9763-4d23832cb777" />
-<img width="1920" height="1038" alt="04-settings-look" src="https://github.com/user-attachments/assets/5bd60db6-470e-43d7-97d0-ef9683eaf847" />
-<img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/7d78bf03-1efd-4435-be42-1607affc89f2" />
-<img width="1920" height="1038" alt="01-main" src="https://github.com/user-attachments/assets/e837b967-0f7f-485e-b003-3a0c1497dc1d" />
-
+<img width="1920" height="1038" alt="01-main" src="https://github.com/user-attachments/assets/9d316cd3-1aac-4912-b299-10be19a4bcb2" />
+<img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/0e3ca0fe-2c70-4315-bc28-970329edd4f0" />
+<img width="1920" height="1038" alt="04-settings-look" src="https://github.com/user-attachments/assets/48307c05-f72c-490e-936f-714272bcd628" />
+<img width="1920" height="1038" alt="05-settings-shortcuts" src="https://github.com/user-attachments/assets/7ffb32bf-7e74-485f-8472-1955072284e6" />
+<img width="1920" height="1038" alt="06-settings-about" src="https://github.com/user-attachments/assets/a7429f33-54b4-462d-8fe8-b7837cfadb64" />
+<img width="1002" height="688" alt="09-compose" src="https://github.com/user-attachments/assets/6e256ce0-680d-436d-8422-3c5160bacaf4" />
+<img width="1002" height="688" alt="10-compose-cc" src="https://github.com/user-attachments/assets/f1d80745-abe3-4374-8523-7272ee9b3fef" />
 
 ## Installation
 
