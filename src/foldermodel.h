@@ -60,6 +60,11 @@ public:
 
     /// Every known mailbox path, including ones hidden by collapsed parents.
     QStringList allMailBoxes() const;
+    /// The subset of allMailBoxes() that can actually be opened. A \Noselect
+    /// container ("[Gmail]" and friends) is a node in the tree with no mail
+    /// behind it, and SELECT on one is an error, not an empty mailbox — so
+    /// anything that syncs folders in bulk wants this list, not the other.
+    QStringList selectableMailBoxes() const;
 
     Q_INVOKABLE void toggleExpanded(int row);
     /// Reveals a row's children if they are hidden. A no-op when the row has

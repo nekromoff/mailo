@@ -654,8 +654,12 @@ Kirigami.ApplicationWindow {
         // invokable with no change signal, so a live binding would keep
         // whatever it first saw.
         property string renameBlocked: ""
+        // Same reason: folderHasUnread() is a plain invokable, and the count it
+        // answers from is refreshed by a background recount.
+        property bool hasUnread: false
         function refreshRenameBlocked() {
             renameBlocked = Mail.folderRenameBlockedReason(mailBox)
+            hasUnread = Mail.folderHasUnread(mailBox)
         }
         onAboutToShow: refreshRenameBlocked()
 
@@ -671,6 +675,17 @@ Kirigami.ApplicationWindow {
             function onConnectedChanged() { folderMenu.refreshRenameBlocked() }
         }
 
+        // First, and the only entry that acts on the mail rather than on the
+        // folder itself — it is what a right-click on a folder with a pill is
+        // usually after. Recomputed on open for the same reason renameBlocked
+        // is: folderHasUnread() has no change signal of its own.
+        QQC2.MenuItem {
+            text: "Mark all read"
+            icon.name: "mail-mark-read"
+            enabled: folderMenu.hasUnread
+            onTriggered: Mail.markFolderRead(folderMenu.mailBox)
+        }
+        QQC2.MenuSeparator {}
         QQC2.MenuItem {
             visible: folderMenu.renameBlocked === ""
             height: visible ? implicitHeight : 0
@@ -1770,13 +1785,20 @@ Kirigami.ApplicationWindow {
                                                                 const box = cachedFolderDelegate.modelData.mailBox
                                                                 const nm = cachedFolderDelegate.modelData.name
                                                                 // Every folder command acts on the
-                                                                // open account, so open this one.
-                                                                // Right-clicking a folder means
-                                                                // "work on this folder" — being on
-                                                                // the wrong account is not
-                                                                // something to hand back to the
-                                                                // user to fix.
-                                                                Mail.switchAccount(accountSection.index)
+                                                                // open folder of the open account,
+                                                                // so open this one — the folder
+                                                                // that was right-clicked, not the
+                                                                // account's inbox, which is what
+                                                                // switchAccount() lands on and
+                                                                // what left the menu acting on
+                                                                // INBOX. Same call the left-click
+                                                                // above makes, and the list is
+                                                                // reset the same way.
+                                                                messageList.currentIndex = -1
+                                                                messageList.openedUid = -1
+                                                                messageList.clearSelection()
+                                                                Mail.openFolderInAccount(
+                                                                    accountSection.index, box)
                                                                 folderMenu.mailBox = box
                                                                 folderMenu.name = nm
                                                                 folderMenu.popup()

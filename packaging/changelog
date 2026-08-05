@@ -1,3 +1,33 @@
+mailo (2.0) unstable; urgency=medium
+
+  * JMAP support (RFC 8620/8621). An account now chooses its protocol: IMAP
+    as before, or JMAP, which discovers its own endpoints from the address
+    and authenticates with an API token or a password. Both kinds of account
+    can be configured at once.
+  * Mail protocols sit behind one interface, so which mailbox is the trash,
+    when to backfill and what a header means are answered the same way
+    whichever protocol replied. Push arrives as IMAP IDLE or JMAP
+    EventSource and is handled identically.
+  * Fixed: migrating an account from a pre-1.0 install silently reset its
+    IMAP port to 993, its security to SSL/TLS and lost its SMTP settings.
+    The values were read from the wrong settings scope.
+  * Fixed: after the wallet lookup finished, a connection requested while it
+    was still in flight was never resumed, so the client could sit offline
+    with a perfectly good account configured.
+  * Fixed: a DKIM or OpenPGP verdict on a message rebuilt from the cache
+    could be attributed to whichever message was on screen when a delayed
+    retry landed, reporting cache staleness as tampering.
+  * Quieter status bar: breadcrumbs that only repeated what the window
+    already showed (an empty folder, a link opening in the browser) are gone
+    from the status line and kept in the debug log.
+  * Internals: the mail controller is split into an account store, a sync
+    engine, a cache-maintenance scheduler, a message presenter and a
+    signature verifier, each testable on its own. The test suite grew to
+    twelve binaries covering the cache, account storage and the attachment
+    split/restore pair.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Wed, 05 Aug 2026 12:00:00 +0200
+
 mailo (1.5) unstable; urgency=medium
 
   * Unread counts in the folder pane: a pill on every folder, blue on the

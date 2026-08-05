@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailo VERSION 1.5 LANGUAGES CXX)
+project(mailo VERSION 2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +52,18 @@ qt_add_executable(mailo
     src/main.cpp
     src/mailclient.cpp
     src/mailclient.h
+    src/accountstore.cpp
+    src/accountstore.h
+    src/mimeutils.cpp
+    src/mimeutils.h
+    src/maintenancescheduler.cpp
+    src/maintenancescheduler.h
+    src/messagepresenter.cpp
+    src/messagepresenter.h
+    src/messageverifier.cpp
+    src/messageverifier.h
+    src/syncengine.cpp
+    src/syncengine.h
     src/dkimverifier.cpp
     src/dkimverifier.h
     src/publicsuffixlist.cpp
@@ -66,6 +78,15 @@ qt_add_executable(mailo
     src/messagelistmodel.h
     src/mailstore.cpp
     src/mailstore.h
+    src/mailbackend.h
+    src/imapbackend.cpp
+    src/imapbackend.h
+    src/jmapsession.cpp
+    src/jmapsession.h
+    src/jmaprequest.cpp
+    src/jmaprequest.h
+    src/jmapbackend.cpp
+    src/jmapbackend.h
     src/attachmentstore.cpp
     src/attachmentstore.h
     src/documenthandler.cpp
@@ -205,7 +226,7 @@ set(CPACK_PACKAGE_VENDOR "Daniel Duris")
 set(CPACK_PACKAGE_CONTACT "Daniel Duris <dusoft@staznosti.sk>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "The fast KDE email client")
 set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/nekromoff/mailo")
-set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Mailo is an IMAP mail client focused on speed and safe message viewing.
+set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Mailo is an IMAP and JMAP mail client focused on speed and safe message viewing.
 It caches headers, bodies and the folder tree in SQLite for instant,
 offline-capable browsing and full-text search, and renders HTML mail in a
 sandboxed QtWebEngine view that blocks all remote content until you opt in. Built for KDE.
@@ -281,14 +302,87 @@ target_link_libraries(fidelitytool PRIVATE
 qt_add_executable(spamtool tests/spamtool.cpp
     src/spamheuristics.cpp src/spamheuristics.h
     src/publicsuffixlist.cpp src/publicsuffixlist.h)
-target_link_libraries(spamtool PRIVATE Qt6::Core Qt6::Network KPim6::Mime)
+target_link_libraries(spamtool PRIVATE Qt6::Core Qt6::Network Qt6::Sql KPim6::Mime)
+
+# Checks the backend-neutral message identity the JMAP work needs (remote_id,
+# per-folder sync_state) against a throwaway database of its own — never the
+# real mail cache. Exit 0 = every check passed.
+qt_add_executable(storetest tests/storetest.cpp
+    src/mailstore.cpp src/mailstore.h
+    src/messagelistmodel.cpp src/messagelistmodel.h
+    src/attachmentstore.cpp src/attachmentstore.h
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+target_include_directories(storetest PRIVATE src)
+target_link_libraries(storetest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD)
+
+# Checks JMAP session discovery (RFC 8620 §2) against recorded session objects,
+# with no server involved — see the file's own comment for why that is the
+# right boundary. Exit 0 = every check passed.
+qt_add_executable(jmapsessiontest tests/jmapsessiontest.cpp
+    src/jmapsession.cpp src/jmapsession.h
+    src/mailbackend.h)
+target_include_directories(jmapsessiontest PRIVATE src)
+target_compile_definitions(jmapsessiontest PRIVATE
+    JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+target_link_libraries(jmapsessiontest PRIVATE Qt6::Core Qt6::Network)
+
+# Checks the JMAP method-call batch: back-references, the server's call limit,
+# and reading a response — including the error responses JMAP delivers inside a
+# successful POST. Exit 0 = every check passed.
+qt_add_executable(jmaprequesttest tests/jmaprequesttest.cpp
+    src/jmaprequest.cpp src/jmaprequest.h
+    src/jmapsession.cpp src/jmapsession.h
+    src/mailbackend.h)
+target_include_directories(jmaprequesttest PRIVATE src)
+target_compile_definitions(jmaprequesttest PRIVATE
+    JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+target_link_libraries(jmaprequesttest PRIVATE Qt6::Core Qt6::Network)
+
+# Checks the JMAP-to-MailBackend translations, above all that the header block
+# rebuilt from Email/get is byte-identical to the message's own blob — the
+# claim the DKIM and spam paths rest on. Exit 0 = every check passed.
+qt_add_executable(jmapbackendtest tests/jmapbackendtest.cpp
+    src/jmapbackend.cpp src/jmapbackend.h
+    src/jmaprequest.cpp src/jmaprequest.h
+    src/jmapsession.cpp src/jmapsession.h
+    src/mailbackend.h)
+target_include_directories(jmapbackendtest PRIVATE src)
+target_compile_definitions(jmapbackendtest PRIVATE
+    JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+target_link_libraries(jmapbackendtest PRIVATE Qt6::Core Qt6::Network KPim6::Mime)
 
 set(_mailo_tests attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest
-                 fidelitytool pgpmimetest securewipetest spamtool)
+                 fidelitytool pgpmimetest securewipetest spamtool storetest
+                 jmapsessiontest jmaprequesttest jmapbackendtest)
 
 # Checks what SecureWipe guarantees, and pins the one thing it deliberately
 # refuses to do (overwrite a shared buffer, which would wipe a private copy and
 # look like protection). Also checks that core-dump suppression is reversible.
+# How accounts are stored, migrated and re-read. Links Qt6Keychain because
+# AccountStore writes secrets; the test itself never starts a wallet job.
+qt_add_executable(accountstoretest tests/accountstoretest.cpp
+    src/accountstore.cpp src/accountstore.h
+    src/mailbackend.h)
+target_include_directories(accountstoretest PRIVATE src)
+target_link_libraries(accountstoretest PRIVATE
+    Qt6::Core Qt6::Network Qt6Keychain::Qt6Keychain KPim6::Mime)
+set_target_properties(accountstoretest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
+# The attachment split/restore pair the offline cache is built on. Needs
+# MailStore only for PartRef, and that pulls in the models it is declared with.
+qt_add_executable(mimeutilstest tests/mimeutilstest.cpp
+    src/mimeutils.cpp src/mimeutils.h
+    src/mailstore.cpp src/mailstore.h
+    src/messagelistmodel.cpp src/messagelistmodel.h
+    src/attachmentstore.cpp src/attachmentstore.h
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+target_include_directories(mimeutilstest PRIVATE src)
+target_link_libraries(mimeutilstest PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql KPim6::Mime PkgConfig::ZSTD)
+set_target_properties(mimeutilstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
 qt_add_executable(securewipetest tests/securewipetest.cpp
     src/securewipe.cpp src/securewipe.h)
 target_include_directories(securewipetest PRIVATE src)

@@ -1,0 +1,77 @@
+{
+  "methodResponses": [
+    [
+      "Email/query",
+      {
+        "queryState": "24:0",
+        "canCalculateChanges": true,
+        "position": 0,
+        "ids": [
+          "M9b47a140143f9a9d7d8e121e"
+        ],
+        "collapseThreads": false,
+        "accountId": "cassandane"
+      },
+      "c0"
+    ],
+    [
+      "Email/get",
+      {
+        "state": "24",
+        "list": [
+          {
+            "id": "M9b47a140143f9a9d7d8e121e",
+            "blobId": "G9b47a140143f9a9d7d8e121ef1c65b5ca00c1436",
+            "size": 545,
+            "headers": [
+              {
+                "name": "Return-Path",
+                "value": " <cyrus@41056d026c5f>"
+              },
+              {
+                "name": "Received",
+                "value": " from deliver ([unix socket])\r\n\t (authenticated user=cassandane bits=0)\r\n\t by 41056d026c5f (Cyrus 3.8.1) with LMTPA;\r\n\t Tue, 04 Aug 2026 22:19:44 +0000"
+              },
+              {
+                "name": "X-Cyrus-Session-Id",
+                "value": " cyrus-1785881984-767-3-6746845236438949222"
+              },
+              {
+                "name": "X-Sieve",
+                "value": " CMU Sieve 3.0"
+              },
+              {
+                "name": "From",
+                "value": " Alice Example <alice@example.com>"
+              },
+              {
+                "name": "To",
+                "value": " cassandane <cassandane@localhost>"
+              },
+              {
+                "name": "Subject",
+                "value": " First test message"
+              },
+              {
+                "name": "Date",
+                "value": " Tue, 04 Aug 2026 12:00:00 +0000"
+              },
+              {
+                "name": "Message-ID",
+                "value": " <test-one@example.com>"
+              },
+              {
+                "name": "Content-Type",
+                "value": " text/plain; charset=utf-8"
+              }
+            ]
+          }
+        ],
+        "notFound": [],
+        "accountId": "cassandane"
+      },
+      "c1"
+    ]
+  ],
+  "sessionState": "0"
+}

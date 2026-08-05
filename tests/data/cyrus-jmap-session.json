@@ -1,0 +1,191 @@
+{
+  "username": "cassandane",
+  "apiUrl": "/jmap/",
+  "downloadUrl": "/jmap/download/{accountId}/{blobId}/{name}?accept={type}",
+  "uploadUrl": "/jmap/upload/{accountId}/",
+  "eventSourceUrl": "/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}",
+  "state": "0",
+  "capabilities": {
+    "urn:ietf:params:jmap:core": {
+      "maxSizeUpload": 1073741824,
+      "maxConcurrentUpload": 5,
+      "maxSizeRequest": 10485760,
+      "maxConcurrentRequests": 5,
+      "maxCallsInRequest": 50,
+      "maxObjectsInGet": 4096,
+      "maxObjectsInSet": 4096,
+      "collationAlgorithms": []
+    },
+    "https://cyrusimap.org/ns/jmap/quota": {},
+    "https://cyrusimap.org/ns/jmap/performance": {},
+    "https://cyrusimap.org/ns/jmap/debug": {},
+    "https://cyrusimap.org/ns/jmap/blob": {
+      "maxSizeBlobSet": 4096,
+      "maxCatenateItems": 100,
+      "supportedTypeNames": [
+        "Mailbox",
+        "Thread",
+        "Email"
+      ],
+      "supportedDigestAlgorithms": [
+        "md5",
+        "sha",
+        "sha-256"
+      ]
+    },
+    "https://cyrusimap.org/ns/jmap/usercounters": {},
+    "urn:ietf:params:jmap:mail": {},
+    "https://cyrusimap.org/ns/jmap/mail": {},
+    "urn:ietf:params:jmap:submission": {},
+    "urn:ietf:params:jmap:vacationresponse": {},
+    "urn:ietf:params:jmap:mdn": {},
+    "https://cyrusimap.org/ns/jmap/contacts": {},
+    "urn:ietf:params:jmap:calendars": {},
+    "urn:ietf:params:jmap:principals": {},
+    "urn:ietf:params:jmap:calendars:preferences": {},
+    "https://cyrusimap.org/ns/jmap/calendars": {
+      "isRFC": true
+    },
+    "https://cyrusimap.org/ns/jmap/backup": {},
+    "https://cyrusimap.org/ns/jmap/sieve": {},
+    "https://cyrusimap.org/ns/jmap/admin": {}
+  },
+  "accounts": {
+    "cassandane": {
+      "name": "cassandane",
+      "isPrimary": true,
+      "isPersonal": true,
+      "isReadOnly": false,
+      "accountCapabilities": {
+        "urn:ietf:params:jmap:core": {},
+        "https://cyrusimap.org/ns/jmap/quota": {},
+        "https://cyrusimap.org/ns/jmap/performance": {},
+        "https://cyrusimap.org/ns/jmap/debug": {},
+        "https://cyrusimap.org/ns/jmap/blob": {},
+        "https://cyrusimap.org/ns/jmap/usercounters": {},
+        "urn:ietf:params:jmap:mail": {
+          "maxMailboxesPerEmail": 20,
+          "maxKeywordsPerEmail": 100,
+          "maxSizeAttachmentsPerEmail": 10485760,
+          "emailsListSortOptions": [
+            "receivedAt",
+            "sentAt",
+            "from",
+            "id",
+            "emailstate",
+            "size",
+            "subject",
+            "to",
+            "hasKeyword",
+            "someInThreadHaveKeyword",
+            "addedDates",
+            "threadSize",
+            "spamScore",
+            "snoozedUntil"
+          ],
+          "mayCreateTopLevelMailbox": true
+        },
+        "https://cyrusimap.org/ns/jmap/mail": {},
+        "urn:ietf:params:jmap:submission": {
+          "maxDelayedSend": 44236800,
+          "submissionExtensions": {
+            "size": [
+              "52428800"
+            ]
+          }
+        },
+        "urn:ietf:params:jmap:mdn": {},
+        "https://cyrusimap.org/ns/jmap/contacts": {},
+        "urn:ietf:params:jmap:calendars": {
+          "minDateTime": "1901-12-13T20:45:53Z",
+          "maxDateTime": "2038-01-19T03:14:06Z",
+          "maxExpandedQueryDuration": "P365D",
+          "maxParticipantsPerEvent": null,
+          "mayCreateCalendar": true,
+          "shareesActAs": "self",
+          "maxCalendarsPerEvent": 1
+        },
+        "https://cyrusimap.org/ns/jmap/calendars": {},
+        "urn:ietf:params:jmap:principals": {
+          "currentUserPrincipalId": "cassandane",
+          "urn:ietf:params:jmap:calendars": {
+            "accountId": "cassandane",
+            "account": null,
+            "mayGetAvailability": true,
+            "sendTo": {
+              "imip": "mailto:cassandane@localhost"
+            }
+          }
+        },
+        "urn:ietf:params:jmap:principals:owner": {
+          "accountIdForPrincipal": "cassandane",
+          "principalId": "cassandane"
+        },
+        "urn:ietf:params:jmap:calendars:preferences": {},
+        "https://cyrusimap.org/ns/jmap/backup": {},
+        "https://cyrusimap.org/ns/jmap/sieve": {
+          "supportsTest": true,
+          "maxRedirects": null,
+          "maxNumberScripts": 5,
+          "maxSizeScript": 32768,
+          "sieveExtensions": [
+            "encoded-character",
+            "comparator-i;ascii-numeric",
+            "fileinto",
+            "reject",
+            "ereject",
+            "vacation",
+            "vacation-seconds",
+            "notify",
+            "enotify",
+            "include",
+            "editheader",
+            "vnd.cyrus.snooze",
+            "vnd.cyrus.imip",
+            "envelope",
+            "environment",
+            "body",
+            "imap4flags",
+            "date",
+            "ihave",
+            "mailbox",
+            "mboxmetadata",
+            "servermetadata",
+            "duplicate",
+            "vnd.cyrus.jmapquery",
+            "relational",
+            "regex",
+            "extlists",
+            "subaddress",
+            "copy",
+            "index",
+            "variables",
+            "redirect-deliverby",
+            "redirect-dsn",
+            "special-use",
+            "fcc",
+            "mailboxid"
+          ],
+          "notificationMethods": [
+            "mailto"
+          ],
+          "externalLists": [
+            "urn:ietf:params:sieve:addrbook"
+          ]
+        },
+        "urn:ietf:params:jmap:vacationresponse": {}
+      }
+    }
+  },
+  "primaryAccounts": {
+    "urn:ietf:params:jmap:mail": "cassandane",
+    "urn:ietf:params:jmap:submission": "cassandane",
+    "urn:ietf:params:jmap:vacationresponse": "cassandane",
+    "urn:ietf:params:jmap:calendars": "cassandane",
+    "https://cyrusimap.org/ns/jmap/contacts": "cassandane",
+    "https://cyrusimap.org/ns/jmap/calendars": "cassandane",
+    "https://cyrusimap.org/ns/jmap/backup": "cassandane",
+    "https://cyrusimap.org/ns/jmap/sieve": "cassandane",
+    "urn:ietf:params:jmap:principals": "cassandane"
+  }
+}

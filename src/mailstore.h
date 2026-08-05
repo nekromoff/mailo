@@ -61,8 +61,9 @@ public:
                                const QList<MessageListModel::Header> &headers,
                                bool ftsAvailable);
     void removeMessages(const QString &folder, const QList<qint64> &uids);
-    /// Refined attachment kind (MessageListModel::Header::attachKind) learned
-    /// from the full body — e.g. "single .ics calendar invite".
+    /// Refined attachment kind (MessageListModel::AttachKind) learned from the
+    /// full body — "single .ics calendar invite", or "no attachment after all"
+    /// for a multipart/mixed that wraps nothing but the message text.
     void setAttachKind(const QString &folder, qint64 uid, int kind);
     /// OpenPGP shape learned from the full body (PgpMime::StoredKind) — the
     /// head only shows the outer content type, which cannot see inline PGP or
@@ -77,12 +78,27 @@ public:
     /// Marks a cached header as read, so the state survives a restart even
     /// before the next header sync confirms it from the server.
     void setSeen(const QString &folder, qint64 uid);
-    /// UIDs in \a folder whose message date is before \a cutoffSecs, plus any
-    /// with no usable date at all (stored as 0 — the "1970" rows), which count
-    /// as old rather than as new. Indexed by (folder, date).
-    QList<qint64> uidsOlderThan(const QString &folder, qint64 cutoffSecs);
+    /// One cached message named both ways at once: the local key the cache and
+    /// the list model use, and the id a MailBackend operation takes.
+    struct AgedMessage {
+        qint64 uid = -1;
+        QString remoteId;
+    };
+    /// Messages in \a folder whose date is before \a cutoffSecs, plus any with
+    /// no usable date at all (stored as 0 — the "1970" rows), which count as
+    /// old rather than as new. Indexed by (folder, date). Both names come back
+    /// in one pass because the caller deletes them on the server by remote id
+    /// and forgets them locally by uid.
+    QList<AgedMessage> messagesOlderThan(const QString &folder, qint64 cutoffSecs);
     /// Clears \Seen on one cached message — the "mark unread" counterpart.
     void setUnseen(const QString &folder, qint64 uid);
+    /// Every unread cached message in \a folder, named both ways — what
+    /// "mark all read" has to tell the server about. Seeks (folder, uid), the
+    /// primary key, so it visits this folder's rows only.
+    QList<AgedMessage> unseenMessages(const QString &folder);
+    /// Marks every cached message in \a folder read, in one statement. Same
+    /// key seek as above; the rows already read are left alone.
+    void setFolderSeen(const QString &folder);
     /// Local-only color-scale mark (0 = none, 1..5), never synced to IMAP.
     void setColorLabel(const QString &folder, qint64 uid, int color);
 
@@ -105,9 +121,21 @@ public:
     QList<MessageListModel::Header> headersByColor(const QString &folder, int color,
                                                    int limit = 1000);
 
-    /// Cached UIDVALIDITY for a folder (0 = unknown).
+    /// Cached UIDVALIDITY for a folder (0 = unknown). IMAP-specific and now
+    /// write-only: syncState() is what every reader asks for, and an IMAP
+    /// backend simply puts its UIDVALIDITY in that token. Kept because it is
+    /// what caches written before the token existed hold.
     qint64 uidValidity(const QString &folder);
     void setUidValidity(const QString &folder, qint64 validity);
+    /// Opaque per-folder sync position, written and read only by the backend
+    /// that owns the account — an IMAP UIDVALIDITY or a JMAP `Email/changes`
+    /// state string. Empty means "no delta position known", i.e. sync from
+    /// scratch. The store never parses it, with one exception: a folder cached
+    /// before this column existed has its recorded UIDVALIDITY returned as the
+    /// token, so the upgrade does not read as "never synced" and lose the one
+    /// mailbox-regenerated check that spans it.
+    QString syncState(const QString &folder);
+    void setSyncState(const QString &folder, const QString &state);
     /// Wipes every cached header/body/FTS row of a folder (UIDVALIDITY change).
     void clearFolder(const QString &folder);
 
@@ -173,6 +201,13 @@ public:
     int unskipBodiesUpTo(qint64 maxSize);
 
     QByteArray cachedBody(const QString &folder, qint64 uid);
+    /// The backend's own id for one cached message — what a MailBackend
+    /// operation names it by. Falls back to the uid in decimal, which is what
+    /// an IMAP backend expects and what rows cached before the remote_id
+    /// column existed hold implicitly. Empty when the row is unknown. A point
+    /// lookup on the (folder, uid) primary key, for callers that hold a
+    /// message rather than a model row.
+    QString remoteIdFor(const QString &folder, qint64 uid);
     /// Drops just the cached body (and its part references) of one message,
     /// keeping the header. Used when a stub turns out to reference a payload
     /// that is no longer on disk, so the next open re-fetches it cleanly.

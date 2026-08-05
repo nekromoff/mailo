@@ -33,6 +33,41 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.0" date="2026-08-05" type="stable">
+      <description>
+        <ul>
+          <li>JMAP support. An account chooses its protocol — IMAP as before,
+              or JMAP, which discovers its own endpoints from the address and
+              authenticates with an API token or a password.</li>
+          <li>Both kinds of account can be configured at once, and push
+              arrives as IMAP IDLE or JMAP EventSource either way.</li>
+          <li>Fixed: migrating an account from a pre-1.0 install reset its
+              IMAP port and lost its SMTP settings.</li>
+          <li>Fixed: a connection requested while the wallet lookup was still
+              in flight was never resumed, leaving the client offline.</li>
+          <li>Fixed: a DKIM or OpenPGP verdict on a cached message could be
+              attributed to whichever message was on screen when a delayed
+              retry landed.</li>
+          <li>Quieter status bar: breadcrumbs that only repeated what the
+              window already showed are kept in the debug log instead.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.5" date="2026-08-04" type="stable">
+      <description>
+        <ul>
+          <li>OpenPGP: read and send signed and encrypted mail through GnuPG,
+              with a key manager and WKD discovery.</li>
+          <li>Spam handling with local heuristics, an allowlist, and automatic
+              retention of the spam folder.</li>
+          <li>Unread counts on every folder, including what is folded away in
+              collapsed subfolders.</li>
+          <li>Folders can be dragged to reparent them, and renamed from the
+              context menu.</li>
+          <li>Thunderbird mail directories import as offline accounts.</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1" date="2026-08-02" type="stable">
       <description>
         <ul>

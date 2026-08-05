@@ -39,8 +39,25 @@ public:
         SpamDetailRole
     };
 
-    /// Attachment kinds carried in Header::attachKind.
-    enum AttachKind { NoAttachment = 0, GenericAttachment = 1, CalendarAttachment = 2 };
+    /// Attachment kinds carried in Header::attachKind. The values are ordered:
+    /// anything above GenericAttachment was learned from the body and outranks
+    /// the head-only guess, both in the model's merge and in the cache's
+    /// `attach` column, so a header refresh cannot undo it.
+    enum AttachKind {
+        NoAttachment = 0,
+        GenericAttachment = 1,   ///< head-only guess: top-level multipart/mixed
+        CalendarAttachment = 2,  ///< body: every attachment is an .ics invite
+        /// Body: no attachment parts at all. Distinct from NoAttachment so a
+        /// multipart/mixed head that wraps nothing but the message text — what
+        /// Mailo itself used to send — stops showing a paperclip.
+        ConfirmedNoAttachment = 3,
+    };
+
+    /// Whether \a kind (an AttachKind) means "show the paperclip".
+    static constexpr bool kindHasAttachment(int kind)
+    {
+        return kind == GenericAttachment || kind == CalendarAttachment;
+    }
 
     struct Header {
         qint64 uid = -1;
@@ -50,7 +67,7 @@ public:
         bool seen = false;
         bool suspicious = false; ///< SPF/DKIM/DMARC failure reported by our server
         QString authInfo;        ///< raw Authentication-Results header
-        int attachKind = NoAttachment; ///< 1 = multipart/mixed head, 2 = all-.ics attachments
+        int attachKind = NoAttachment; ///< AttachKind
         int colorLabel = 0;      ///< local color-scale mark (0 = none, 1..5)
         int crypto = 0;          ///< PgpMime::StoredKind, see CryptoRole
         /// Local spam heuristics (spamheuristics.h). The score is kept rather
@@ -63,6 +80,14 @@ public:
         /// RFC 5322 Message-ID with the angle brackets stripped. Stable across
         /// folders and UIDVALIDITY resets, unlike uid.
         QString msgid;
+        /// The backend's own id for this message, as the protocol states it.
+        /// IMAP writes the uid in decimal here, JMAP its opaque Email id — so
+        /// the cache can key a message the way its server names it without the
+        /// rest of the code caring which protocol produced it. `uid` stays the
+        /// local primary key either way (a JMAP row gets a synthetic one).
+        /// Empty means "not recorded", which for an IMAP row reads back as the
+        /// uid: rows cached before this column existed are not rewritten.
+        QString remoteId;
 
         // Sort keys, derived from the fields above by primeKeys() when the
         // header enters the model. Producers do not fill them. They exist so a
@@ -93,12 +118,22 @@ public:
     int appendHeaders(const QList<Header> &headers);
     void clear();
     Q_INVOKABLE qint64 uidAt(int row) const;
+    /// The backend's own id for the message at \a row — what MailBackend
+    /// operations name a message by. Falls back to the uid in decimal, which
+    /// is exactly what an IMAP backend expects and what rows cached before the
+    /// remote_id column existed hold implicitly. Empty when there is no such
+    /// row.
+    QString remoteIdAt(int row) const;
     /// Visible row showing \a uid, or -1 when it is not in the model. Lets the
     /// view re-find the message the user picked after a reset renumbers rows.
     Q_INVOKABLE int rowForUid(qint64 uid) const;
     bool seenAt(int row) const;
     void markSeen(int row);
     void markUnseen(int row);
+    /// Marks every listed message read at once — the model side of a folder's
+    /// "mark all read". Rows hidden by an active filter are marked too: the
+    /// command is about the folder, not about what is on screen.
+    void markAllSeen();
     /// Refines a message's attachment kind in place (body-derived knowledge).
     void setAttachKind(qint64 uid, int kind);
     /// PgpMime::StoredKind for a listed row, refined from the full body.

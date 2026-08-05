@@ -3,6 +3,8 @@
 
 #include "documenthandler.h"
 
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QQuickTextDocument>
 #include <QTextBlock>
 #include <QTextDocument>
@@ -347,4 +349,29 @@ bool DocumentHandler::outdentAtBlockStart()
     if (cursor.isNull() || !atBlockStart(cursor) || !cursor.currentList())
         return false;
     return changeListIndent(-1);
+}
+
+bool DocumentHandler::pastePlainText()
+{
+    const QClipboard *clipboard = QGuiApplication::clipboard();
+    if (!clipboard)
+        return false;
+    // text() rather than the mime data: whatever the source offered, this is
+    // the paste that deliberately takes none of its markup.
+    const QString text = clipboard->text();
+    if (text.isEmpty())
+        return false;
+    QTextCursor cursor = textCursor();
+    if (cursor.isNull())
+        return false;
+    // One undo step for the whole thing, replacement included.
+    cursor.beginEditBlock();
+    if (cursor.hasSelection())
+        cursor.removeSelectedText();
+    // insertText() without a format of its own uses the cursor's, so the text
+    // arrives looking like the paragraph it was dropped into; line feeds in it
+    // become paragraph breaks.
+    cursor.insertText(text);
+    cursor.endEditBlock();
+    return true;
 }

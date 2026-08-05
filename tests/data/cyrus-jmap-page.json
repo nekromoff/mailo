@@ -1,0 +1,109 @@
+{
+  "methodResponses": [
+    [
+      "Mailbox/get",
+      {
+        "state": "24",
+        "list": [
+          {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "name": "Inbox",
+            "parentId": null,
+            "myRights": {
+              "mayReadItems": true,
+              "mayAddItems": true,
+              "mayRemoveItems": true,
+              "mayCreateChild": true,
+              "mayDelete": false,
+              "maySubmit": true,
+              "maySetSeen": true,
+              "maySetKeywords": true,
+              "mayAdmin": true,
+              "mayRename": false
+            },
+            "role": "inbox",
+            "totalEmails": 2,
+            "unreadEmails": 2,
+            "totalThreads": 2,
+            "unreadThreads": 2,
+            "sortOrder": 1,
+            "isSubscribed": false
+          }
+        ],
+        "notFound": [],
+        "accountId": "cassandane"
+      },
+      "c0"
+    ],
+    [
+      "Email/query",
+      {
+        "sort": [
+          {
+            "property": "receivedAt",
+            "isAscending": false
+          }
+        ],
+        "queryState": "24:0",
+        "canCalculateChanges": true,
+        "position": 0,
+        "total": 2,
+        "ids": [
+          "M9b47a140143f9a9d7d8e121e",
+          "M1c2578e9c323740b000b1603"
+        ],
+        "collapseThreads": false,
+        "accountId": "cassandane"
+      },
+      "c1"
+    ],
+    [
+      "Email/get",
+      {
+        "state": "24",
+        "list": [
+          {
+            "id": "M9b47a140143f9a9d7d8e121e",
+            "blobId": "G9b47a140143f9a9d7d8e121ef1c65b5ca00c1436",
+            "threadId": "T0ab478a11f56918f",
+            "mailboxIds": {
+              "11111111-2222-3333-4444-555555555555": true
+            },
+            "keywords": {},
+            "size": 545,
+            "receivedAt": "2026-08-04T22:19:44Z",
+            "from": [
+              {
+                "name": "Alice Example",
+                "email": "alice@example.com"
+              }
+            ],
+            "subject": "First test message"
+          },
+          {
+            "id": "M1c2578e9c323740b000b1603",
+            "blobId": "G1c2578e9c323740b000b1603b953876e0fdfd31b",
+            "threadId": "T8dd6a108c84a7f19",
+            "mailboxIds": {
+              "11111111-2222-3333-4444-555555555555": true
+            },
+            "keywords": {},
+            "size": 569,
+            "receivedAt": "2026-08-04T22:19:44Z",
+            "from": [
+              {
+                "name": "Bob Example",
+                "email": "bob@example.com"
+              }
+            ],
+            "subject": "Second test message, with an attachment name"
+          }
+        ],
+        "notFound": [],
+        "accountId": "cassandane"
+      },
+      "c2"
+    ]
+  ],
+  "sessionState": "0"
+}

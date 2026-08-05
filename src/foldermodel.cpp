@@ -105,6 +105,17 @@ QStringList FolderModel::allMailBoxes() const
     return out;
 }
 
+QStringList FolderModel::selectableMailBoxes() const
+{
+    QStringList out;
+    out.reserve(m_all.size());
+    for (const Folder &f : m_all) {
+        if (f.selectable)
+            out.append(f.mailBox);
+    }
+    return out;
+}
+
 QSet<QString> FolderModel::savedCollapsed(const QString &accountKey)
 {
     if (accountKey.isEmpty())

@@ -20,7 +20,7 @@ Window {
     /// Emitted once the window is really gone, so Main.qml can drop its handle.
     signal finished()
 
-    title: sheet.title
+    title: sheet.windowTitle
     flags: Qt.Window
     transientParent: null // own taskbar entry
 

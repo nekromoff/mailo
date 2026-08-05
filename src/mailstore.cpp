@@ -209,6 +209,17 @@ bool MailStore::open()
     // The allowlist asks "have I ever written to this address", across every
     // account and ignoring any +tag. Neither half of the (account, address)
     // primary key can answer that, hence a normalized column of its own.
+    // The backend's own name for a message (see Header::remoteId). Nullable
+    // and deliberately never backfilled: for the IMAP rows already on disk the
+    // uid *is* the remote id, so a sweep over `messages` would rewrite every
+    // row in a multi-gigabyte cache to say what the primary key already says.
+    // The read path substitutes the uid when this is NULL instead.
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN remote_id TEXT"));
+    // Opaque per-folder sync position, whatever the backend needs to resume a
+    // delta sync: IMAP has uidvalidity (its own column, kept as-is so existing
+    // caches keep working), JMAP stores its Email/changes state string here.
+    // The store never interprets it.
+    q.exec(QStringLiteral("ALTER TABLE account_folders ADD COLUMN sync_state TEXT DEFAULT ''"));
     q.exec(QStringLiteral("ALTER TABLE recipients ADD COLUMN addr_norm TEXT DEFAULT ''"));
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_recipients_norm"
                           " ON recipients(addr_norm)"));
@@ -479,6 +490,7 @@ static QList<MessageListModel::Header> readHeaderRows(QSqlQuery &q)
         h.spamScore = q.value(10).toInt();
         h.spamState = q.value(11).toInt();
         h.spamDetail = q.value(12).toString();
+        h.remoteId = q.value(13).toString();
         out.append(h);
     }
     return out;
@@ -491,7 +503,8 @@ QList<MessageListModel::Header> MailStore::cachedHeaders(const QString &folder, 
     SlowGuard guard("cachedHeaders");
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
-                             " color, crypto, spam_score, spam_state, spam_detail"
+                             " color, crypto, spam_score, spam_state, spam_detail,"
+                             " IFNULL(remote_id, CAST(uid AS TEXT))"
                              " FROM messages WHERE folder = ?"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
@@ -507,7 +520,8 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
         return {};
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
-                             " color, crypto, spam_score, spam_state, spam_detail"
+                             " color, crypto, spam_score, spam_state, spam_detail,"
+                             " IFNULL(remote_id, CAST(uid AS TEXT))"
                              " FROM messages WHERE folder = ?"
                              " AND (date < ? OR (date = ? AND uid < ?))"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
@@ -526,7 +540,8 @@ QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder,
         return {};
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
-                             " color, crypto, spam_score, spam_state, spam_detail"
+                             " color, crypto, spam_score, spam_state, spam_detail,"
+                             " IFNULL(remote_id, CAST(uid AS TEXT))"
                              " FROM messages WHERE folder = ? AND color = ?"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
@@ -574,12 +589,13 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
     const QString key = scopedFolder;
     QSqlQuery q(db);
     // Header refreshes only know "has attachment or not" (attach 0/1); a
-    // refined kind (2 = calendar invite) learned from the full body survives.
+    // refined kind learned from the full body (2 = calendar invite, 3 = the
+    // body has no attachment despite the head) survives.
     q.prepare(QStringLiteral(
         "INSERT INTO messages"
         " (folder, uid, subject, sender, date, seen, suspicious, auth, attach, msgid,"
-        " crypto, spam_score, spam_state, spam_detail)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " crypto, spam_score, spam_state, spam_detail, remote_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(folder, uid) DO UPDATE SET"
         " subject = excluded.subject, sender = excluded.sender, date = excluded.date,"
         // Never overwrite a known Message-ID with an unknown one: a header
@@ -602,7 +618,11 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         " THEN messages.spam_score ELSE excluded.spam_score END,"
         " spam_detail = CASE WHEN messages.spam_state > excluded.spam_state"
         " THEN messages.spam_detail ELSE excluded.spam_detail END,"
-        " spam_state = MAX(messages.spam_state, excluded.spam_state)"));
+        " spam_state = MAX(messages.spam_state, excluded.spam_state),"
+        // Same COALESCE rule as msgid: a producer that does not know the
+        // backend id (the Thunderbird importer, an older cached row being
+        // refreshed) must not erase one that is already recorded.
+        " remote_id = COALESCE(excluded.remote_id, messages.remote_id)"));
     QSqlQuery ins(db);
     if (ftsAvailable) {
         // Keyed by messages.rowid — an O(1) lookup. Never filter fts by its
@@ -628,6 +648,8 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         q.addBindValue(h.spamScore);
         q.addBindValue(h.spamState);
         q.addBindValue(h.spamDetail);
+        q.addBindValue(h.remoteId.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
+                                            : h.remoteId);
         q.exec();
         if (ftsAvailable) {
             ins.addBindValue(h.subject);
@@ -735,9 +757,10 @@ void MailStore::storeAuthVerdict(const QString &folder, qint64 uid, const AuthVe
     q.exec();
 }
 
-QList<qint64> MailStore::uidsOlderThan(const QString &folder, qint64 cutoffSecs)
+QList<MailStore::AgedMessage> MailStore::messagesOlderThan(const QString &folder,
+                                                           qint64 cutoffSecs)
 {
-    QList<qint64> out;
+    QList<AgedMessage> out;
     if (!m_db.isOpen() || folder.isEmpty())
         return out;
     QSqlQuery q(m_db);
@@ -745,14 +768,18 @@ QList<qint64> MailStore::uidsOlderThan(const QString &folder, qint64 cutoffSecs)
     // the rows that show as 1970. Treated as old: a message that cannot say
     // when it was sent should not be able to sit in spam forever by saying
     // nothing.
-    q.prepare(QStringLiteral("SELECT uid FROM messages"
+    //
+    // The remote id falls back to the uid in decimal, exactly as remoteIdFor()
+    // does: that is what an IMAP backend expects, and what rows cached before
+    // the remote_id column existed hold implicitly.
+    q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)) FROM messages"
                              " WHERE folder = ? AND (date < ? OR date <= 0)"));
     q.addBindValue(scoped(folder));
     q.addBindValue(cutoffSecs);
     if (!q.exec())
         return out;
     while (q.next())
-        out.append(q.value(0).toLongLong());
+        out.append({q.value(0).toLongLong(), q.value(1).toString()});
     return out;
 }
 
@@ -764,6 +791,35 @@ void MailStore::setUnseen(const QString &folder, qint64 uid)
     q.prepare(QStringLiteral("UPDATE messages SET seen = 0 WHERE folder = ? AND uid = ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
+    q.exec();
+}
+
+QList<MailStore::AgedMessage> MailStore::unseenMessages(const QString &folder)
+{
+    QList<AgedMessage> out;
+    if (!m_db.isOpen())
+        return out;
+    QSqlQuery q(m_db);
+    // Same remote-id fallback as remoteIdFor(): rows cached before the
+    // remote_id column existed carry the uid in decimal implicitly.
+    q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)) FROM messages"
+                             " WHERE folder = ? AND seen = 0"));
+    q.addBindValue(scoped(folder));
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out.append({q.value(0).toLongLong(), q.value(1).toString()});
+    return out;
+}
+
+void MailStore::setFolderSeen(const QString &folder)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET seen = 1"
+                             " WHERE folder = ? AND seen = 0"));
+    q.addBindValue(scoped(folder));
     q.exec();
 }
 
@@ -841,6 +897,20 @@ int MailStore::unskipBodiesUpTo(qint64 maxSize)
         q.exec();
     }
     return q.numRowsAffected();
+}
+
+QString MailStore::remoteIdFor(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen())
+        return {};
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT IFNULL(remote_id, CAST(uid AS TEXT)) FROM messages"
+                             " WHERE folder = ? AND uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    if (q.exec() && q.next())
+        return q.value(0).toString();
+    return {};
 }
 
 QByteArray MailStore::cachedBody(const QString &folder, qint64 uid)
@@ -1353,6 +1423,37 @@ void MailStore::setUidValidity(const QString &folder, qint64 validity)
     q.prepare(QStringLiteral(
         "UPDATE account_folders SET uidvalidity = ? WHERE account = ? AND mailbox = ?"));
     q.addBindValue(validity);
+    q.addBindValue(m_accountKey);
+    q.addBindValue(folder);
+    q.exec();
+}
+
+QString MailStore::syncState(const QString &folder)
+{
+    if (!m_db.isOpen())
+        return {};
+    QSqlQuery q(m_db);
+    // The UIDVALIDITY fallback: rows written before sync_state existed hold
+    // their resume point in the older column, and an IMAP backend's token is
+    // that number spelled as text — so the two are the same value and reading
+    // one for the other is exact, not an approximation. NULLIF keeps a folder
+    // that never recorded either (uidvalidity 0) reading as "no position".
+    q.prepare(QStringLiteral(
+        "SELECT IFNULL(NULLIF(sync_state, ''), NULLIF(CAST(uidvalidity AS TEXT), '0'))"
+        " FROM account_folders WHERE account = ? AND mailbox = ?"));
+    q.addBindValue(m_accountKey);
+    q.addBindValue(folder);
+    return (q.exec() && q.next()) ? q.value(0).toString() : QString();
+}
+
+void MailStore::setSyncState(const QString &folder, const QString &state)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE account_folders SET sync_state = ? WHERE account = ? AND mailbox = ?"));
+    q.addBindValue(state);
     q.addBindValue(m_accountKey);
     q.addBindValue(folder);
     q.exec();

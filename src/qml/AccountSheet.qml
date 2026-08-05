@@ -76,13 +76,40 @@ Item {
     /// to connect to. It is a choice in the account-type list rather than a
     /// flag on the side, because everything else on this page — servers,
     /// password, how mail is composed — only means something for an account
-    /// that talks to a server. Switching the type to Standard (IMAP) is the
+    /// that talks to a server. Switching the type to IMAP is the
     /// deliberate upgrade path from archive to live account.
-    readonly property bool localAccount: authBox.currentIndex === 3
+    readonly property bool localAccount: authBox.currentIndex === 4
 
     /// OAuth providers supply their own servers, so only the address matters.
     readonly property bool oauthAccount:
-        authBox.currentIndex === 1 || authBox.currentIndex === 2
+        authBox.currentIndex === 2 || authBox.currentIndex === 3
+
+    /// True when this account speaks JMAP. The OAuth entries are Gmail and
+    /// Microsoft, both IMAP here, and an archive speaks nothing at all.
+    readonly property bool jmapAccount: authBox.currentIndex === 1
+
+    /// True when the account has a plain IMAP server to configure — the rows
+    /// only IMAP has (port, encryption, SMTP) hang off this.
+    readonly property bool imapServerAccount: authBox.currentIndex === 0
+
+    /// True for the two types that sign in with a server and a password, which
+    /// is what the server, username and password rows are for. JMAP shares
+    /// them; what it does not share is everything IMAP-shaped below them.
+    readonly property bool passwordAccount:
+        authBox.currentIndex === 0 || authBox.currentIndex === 1
+
+    /// True when the secret below is an API token to be sent as a Bearer
+    /// header rather than a password. Only JMAP offers the choice — IMAP has
+    /// no request to hang such a header on.
+    readonly property bool bearerAuth:
+        jmapAccount && jmapAuthBox.currentIndex === 0
+
+    /// The account type as *stored*: MailBackend::Credentials::authType, whose
+    /// values are the on-disk format (0 password, 1 Gmail, 2 Microsoft) and
+    /// bear no relation to this list's order. An archive stores 0 — imported
+    /// is not an authentication method, it is the absence of one.
+    readonly property int authTypeValue:
+        authBox.currentIndex === 2 ? 1 : authBox.currentIndex === 3 ? 2 : 0
 
     /// What the account still needs before it can be saved, or "" when ready.
     /// Saving a half-filled account produced one that could never connect and
@@ -92,14 +119,18 @@ Item {
         if (emailField.text.trim() === "")
             return "an e-mail address"
         if (!oauthAccount && !localAccount) {
-            if (hostField.text.trim() === "")
+            // A JMAP server is discovered from the address when the field is
+            // left blank (RFC 8620 .well-known), so it is the one server row
+            // that is genuinely optional. Sending is part of the protocol, so
+            // there is no SMTP server to ask for either.
+            if (!jmapAccount && hostField.text.trim() === "")
                 return "an IMAP server"
-            if (smtpHostField.text.trim() === "")
+            if (!jmapAccount && smtpHostField.text.trim() === "")
                 return "an SMTP server for sending"
             // Only for a new account: editing an existing one leaves the field
             // blank on purpose, and the saved password stays as it is.
             if (editIndex < 0 && passwordField.text === "")
-                return "a password"
+                return bearerAuth ? "an API token" : "a password"
         }
         return ""
     }
@@ -305,10 +336,20 @@ Item {
                                             : derivedSmtpHost(hostField.text)
         smtpPortField.value = d.smtpPort ?? 587
         smtpSecurityBox.currentIndex = d.smtpSecurity ?? 1
-        // An archive is its own account type here, so it takes the slot after
-        // the OAuth providers rather than showing as "Standard (IMAP)" with
-        // every server field mysteriously blank.
-        authBox.currentIndex = (d.local ?? false) ? 3 : (d.authType ?? 0)
+        // The inverse of authTypeValue/jmapAccount: an archive takes the slot
+        // after the OAuth providers rather than showing as "IMAP"
+        // with every server field mysteriously blank, and a JMAP account is
+        // its own entry rather than a standard one with the wrong servers.
+        authBox.currentIndex = (d.local ?? false)
+            ? 4
+            : (d.protocol ?? 0) === 1
+            ? 1
+            : (d.authType ?? 0) === 1 ? 2 : (d.authType ?? 0) === 2 ? 3 : 0
+        // A JMAP account saved before this choice existed sent Basic, so an
+        // absent key means Password — anything else would change how an
+        // already-working account signs in. A brand-new account has no such
+        // history and starts on the answer that is right far more often.
+        jmapAuthBox.currentIndex = (d.bearerAuth ?? (editIndex < 0)) ? 0 : 1
         signatureEdit.text = d.signature ?? ""
         htmlMailBox.checked = d.htmlMail ?? true
         pgpKeyFp = d.pgpKeyFp ?? ""
@@ -330,6 +371,7 @@ Item {
     /// entry and costs a reconnect.
     function currentConnection() {
         return {
+            protocol: sheet.jmapAccount ? 1 : 0,
             host: hostField.text.trim(),
             port: portField.value,
             security: securityBox.currentIndex,
@@ -338,7 +380,8 @@ Item {
             smtpHost: smtpHostField.text.trim(),
             smtpPort: smtpPortField.value,
             smtpSecurity: smtpSecurityBox.currentIndex,
-            authType: authBox.currentIndex,
+            authType: sheet.authTypeValue,
+            bearerAuth: sheet.bearerAuth,
             savePassword: savePasswordBox.checked,
             password: passwordField.text
         }
@@ -474,16 +517,24 @@ Item {
         const presets = sheet.localAccount
             ? {host: "", port: 993, security: 0,
                smtpHost: "", smtpPort: 587, smtpSecurity: 1}
-            : authBox.currentIndex === 1
+            : authBox.currentIndex === 2
             ? {host: "imap.gmail.com", port: 993, security: 0,
                smtpHost: "smtp.gmail.com", smtpPort: 587, smtpSecurity: 1}
-            : authBox.currentIndex === 2
+            : authBox.currentIndex === 3
             ? {host: "outlook.office365.com", port: 993, security: 0,
                smtpHost: "smtp.office365.com", smtpPort: 587, smtpSecurity: 1}
+            : sheet.jmapAccount
+            // JMAP discovers its own endpoints from the session object, so
+            // there is nothing to store but the server itself — and blank even
+            // for that means "ask the address's domain". Storing IMAP's port
+            // and encryption alongside would be storing a guess nothing reads.
+            ? {host: hostField.text, port: 0, security: 0,
+               smtpHost: "", smtpPort: 0, smtpSecurity: 0}
             : {host: hostField.text, port: portField.value,
                security: securityBox.currentIndex, smtpHost: smtpHostField.text,
                smtpPort: smtpPortField.value, smtpSecurity: smtpSecurityBox.currentIndex}
         Mail.saveAccountDetails(editIndex, {
+            protocol: sheet.jmapAccount ? 1 : 0,
             host: presets.host,
             port: presets.port,
             security: presets.security,
@@ -500,9 +551,8 @@ Item {
             smtpHost: presets.smtpHost,
             smtpPort: presets.smtpPort,
             smtpSecurity: presets.smtpSecurity,
-            // Imported is not an authentication method — it is the absence of
-            // a server to authenticate to, so it stores as the plain type.
-            authType: sheet.localAccount ? 0 : authBox.currentIndex,
+            authType: sheet.authTypeValue,
+            bearerAuth: sheet.bearerAuth,
             local: sheet.localAccount,
             signature: signatureEdit.text,
             htmlMail: htmlMailBox.checked,
@@ -858,11 +908,20 @@ Item {
                     ? "New account" : "Account: " + (Mail.accountNames[sheet.editIndex] ?? "")
                 Kirigami.FormData.isSection: true
             }
-            // Account type on top: standard IMAP or an OAuth provider.
+            // Account type on top — the one choice everything else on this
+            // page hangs off. Which protocol an account speaks belongs here
+            // rather than in a picker of its own: it decides the same things
+            // the other entries do (which servers there are to configure, what
+            // sending means), and asking it twice would let the two disagree.
+            //
+            // The order is presentation only. What is stored is an authType
+            // and a protocol, mapped below, because those are the on-disk
+            // format and reordering this list must never rewrite accounts.
             QQC2.ComboBox {
                 id: authBox
                 Kirigami.FormData.label: "Account type:"
-                model: ["Standard (IMAP)", "Gmail", "Microsoft 365",
+                model: ["IMAP", "JMAP (experimental)",
+                        "Gmail / Google Workspace", "Microsoft / 365",
                         "Imported account"]
             }
             // Both optional, and both about how the account presents itself,
@@ -921,6 +980,11 @@ Item {
                     const domain = text.split("@").pop().trim()
                     if (domain.length === 0 || domain.indexOf(".") < 0)
                         return
+                    // JMAP discovers its server from the address's own domain
+                    // (.well-known/jmap), so a guessed "imap.<domain>" here
+                    // would be a wrong answer replacing the right blank.
+                    if (sheet.jmapAccount)
+                        return
                     if (!sheet.hostPinned)
                         hostField.text = "imap." + domain
                     if (!sheet.smtpHostPinned)
@@ -959,14 +1023,27 @@ Item {
                 opacity: 0.7
                 text: "Imported mail, kept on disk. There is no server to "
                       + "configure and nothing is sent or synced. To turn this "
-                      + "into a live account, change the type to Standard (IMAP) "
+                      + "into a live account, change the type to IMAP "
                       + "and fill in its servers."
+            }
+            QQC2.Label {
+                visible: sheet.jmapAccount
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                text: "Experimental: a JMAP account can list folders and read "
+                      + "mail, but marking read, moving, deleting and sending "
+                      + "are not implemented yet and will report an error. "
+                      + "Use it to try a JMAP server, not as your only account."
             }
             QQC2.TextField {
                 id: hostField
-                visible: authBox.currentIndex === 0
-                Kirigami.FormData.label: "Server:"
-                placeholderText: "imap.example.com"
+                visible: sheet.passwordAccount
+                Kirigami.FormData.label: sheet.jmapAccount ? "JMAP server:" : "Server:"
+                placeholderText: sheet.jmapAccount
+                    ? "Discovered from your address if left blank"
+                    : "imap.example.com"
                 // Follow along while setting up a new account, so the SMTP row
                 // is filled in by the time it is reached. onTextEdited, not
                 // onTextChanged: loading an account must not overwrite what it
@@ -979,7 +1056,7 @@ Item {
             }
             QQC2.SpinBox {
                 id: portField
-                visible: authBox.currentIndex === 0
+                visible: sheet.imapServerAccount
                 Kirigami.FormData.label: "Port:"
                 from: 1
                 to: 65535
@@ -988,34 +1065,62 @@ Item {
             }
             QQC2.ComboBox {
                 id: securityBox
-                visible: authBox.currentIndex === 0
+                visible: sheet.imapServerAccount
                 Kirigami.FormData.label: "Security:"
                 model: ["SSL/TLS", "STARTTLS", "None"]
                 onActivated: portField.value = currentIndex === 0 ? 993 : 143
             }
+            // JMAP servers mostly do not take a password at all: Fastmail
+            // issues API tokens, and the Cyrus test server accepts a JWT and
+            // nothing else. Which of the two the secret below is decides the
+            // header it is sent in, and there is no way to detect it — so it
+            // is asked, rather than guessed and failed on.
+            QQC2.ComboBox {
+                id: jmapAuthBox
+                visible: sheet.jmapAccount
+                Kirigami.FormData.label: "Sign in with:"
+                model: ["API token (Bearer)", "Password"]
+                currentIndex: 0
+            }
             QQC2.TextField {
                 id: passwordField
-                visible: authBox.currentIndex === 0
-                Kirigami.FormData.label: "Password:"
+                visible: sheet.passwordAccount
+                Kirigami.FormData.label: sheet.bearerAuth ? "API token:" : "Password:"
                 echoMode: TextInput.Password
                 placeholderText: sheet.editIndex >= 0 ? "(unchanged)" : ""
             }
+            QQC2.Label {
+                visible: sheet.bearerAuth
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                text: "The token is sent as an Authorization: Bearer header. "
+                      + "Most JMAP servers issue one from their own settings "
+                      + "page — check with your provider. Mailo cannot obtain "
+                      + "one for you: its OAuth sign-in is only for Gmail and "
+                      + "Microsoft, both of which it talks to over IMAP."
+            }
             QQC2.CheckBox {
                 id: savePasswordBox
-                visible: authBox.currentIndex === 0
+                visible: sheet.passwordAccount
                 Kirigami.FormData.label: ""
-                text: "Remember password (stored in KWallet / system keyring)"
+                text: sheet.bearerAuth
+                    ? "Remember token (stored in KWallet / system keyring)"
+                    : "Remember password (stored in KWallet / system keyring)"
                 checked: true
             }
 
+            // JMAP submits over its own API, so an account that speaks it has
+            // no sending leg to configure at all.
             Kirigami.Separator {
-                visible: authBox.currentIndex === 0
+                visible: sheet.imapServerAccount
                 Kirigami.FormData.label: "Sending (SMTP)"
                 Kirigami.FormData.isSection: true
             }
             QQC2.TextField {
                 id: smtpHostField
-                visible: authBox.currentIndex === 0
+                visible: sheet.imapServerAccount
                 Kirigami.FormData.label: "SMTP server:"
                 placeholderText: "smtp.example.com"
                 // Typing here settles the question: stop mirroring the IMAP
@@ -1024,7 +1129,7 @@ Item {
             }
             QQC2.SpinBox {
                 id: smtpPortField
-                visible: authBox.currentIndex === 0
+                visible: sheet.imapServerAccount
                 Kirigami.FormData.label: "SMTP port:"
                 from: 1
                 to: 65535
@@ -1033,7 +1138,7 @@ Item {
             }
             QQC2.ComboBox {
                 id: smtpSecurityBox
-                visible: authBox.currentIndex === 0
+                visible: sheet.imapServerAccount
                 Kirigami.FormData.label: "SMTP security:"
                 model: ["SSL/TLS", "STARTTLS", "None"]
                 currentIndex: 1
@@ -1309,6 +1414,31 @@ Item {
             width: generalScroll.availableWidth
 
             Kirigami.Separator {
+                Kirigami.FormData.label: "Date format"
+                Kirigami.FormData.isSection: true
+            }
+            QQC2.ComboBox {
+                id: dateFormatBox
+                Kirigami.FormData.label: "Show dates as:"
+                // Display labels ↔ Qt format strings, index-matched.
+                model: ["DD/MM/YYYY", "DD.MM.YYYY", "DD-MM-YYYY",
+                        "MM/DD/YYYY", "YYYY-MM-DD"]
+                readonly property var formats: ["dd/MM/yyyy", "dd.MM.yyyy", "dd-MM-yyyy",
+                                                "MM/dd/yyyy", "yyyy-MM-dd"]
+                currentIndex: Math.max(0, formats.indexOf(Mail.dateFormat))
+                onActivated: sheet.setMail("dateFormat", formats[currentIndex])
+            }
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: "Used for message dates in the list and the reading pane. "
+                      + "Messages from today show only their time."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+
+            Kirigami.Separator {
                 Kirigami.FormData.label: "Mail checking"
                 Kirigami.FormData.isSection: true
             }
@@ -1363,31 +1493,6 @@ Item {
                       + "forever. With Skip trash on, deleting spam — by hand or "
                       + "on this schedule — destroys it outright instead of "
                       + "filing it in the trash to be cleared out twice."
-                wrapMode: Text.Wrap
-                opacity: 0.8
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
-            }
-
-            Kirigami.Separator {
-                Kirigami.FormData.label: "Dates"
-                Kirigami.FormData.isSection: true
-            }
-            QQC2.ComboBox {
-                id: dateFormatBox
-                Kirigami.FormData.label: "Date format:"
-                // Display labels ↔ Qt format strings, index-matched.
-                model: ["DD/MM/YYYY", "DD.MM.YYYY", "DD-MM-YYYY",
-                        "MM/DD/YYYY", "YYYY-MM-DD"]
-                readonly property var formats: ["dd/MM/yyyy", "dd.MM.yyyy", "dd-MM-yyyy",
-                                                "MM/dd/yyyy", "yyyy-MM-dd"]
-                currentIndex: Math.max(0, formats.indexOf(Mail.dateFormat))
-                onActivated: sheet.setMail("dateFormat", formats[currentIndex])
-            }
-            QQC2.Label {
-                Kirigami.FormData.label: ""
-                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Used for message dates in the list and the reading pane. "
-                      + "Messages from today show only their time."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize

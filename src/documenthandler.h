@@ -69,6 +69,12 @@ public:
     /// list itself from the outermost one.
     Q_INVOKABLE bool outdentAtBlockStart();
 
+    /// Ctrl+Shift+V: inserts the clipboard as unformatted text, taking the
+    /// formatting of the text it lands in rather than dragging the source
+    /// document's fonts and colors into the message. False when the clipboard
+    /// holds no text, so the caller can leave the key press alone.
+    Q_INVOKABLE bool pastePlainText();
+
 Q_SIGNALS:
     void documentChanged();
     void cursorPositionChanged();

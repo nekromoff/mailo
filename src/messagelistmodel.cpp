@@ -47,7 +47,7 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
     case AuthInfoRole:
         return h.authInfo;
     case AttachmentRole:
-        return h.attachKind != NoAttachment;
+        return kindHasAttachment(h.attachKind);
     case CalendarRole:
         return h.attachKind == CalendarAttachment;
     case ColorLabelRole:
@@ -226,7 +226,7 @@ bool MessageListModel::lessThan(const Header &a, const Header &b) const
         break;
     case SortColumn::Attachment:
         // Ties fall back to date so the groups stay chronological.
-        c = int(a.attachKind != NoAttachment) - int(b.attachKind != NoAttachment);
+        c = int(kindHasAttachment(a.attachKind)) - int(kindHasAttachment(b.attachKind));
         if (c == 0)
             c = a.dateSecs < b.dateSecs ? 1 : (b.dateSecs < a.dateSecs ? -1 : 0);
         break;
@@ -356,6 +356,14 @@ void MessageListModel::resortVisible()
 qint64 MessageListModel::uidAt(int row) const
 {
     return (row >= 0 && row < m_rows.size()) ? m_all.at(m_rows.at(row)).uid : -1;
+}
+
+QString MessageListModel::remoteIdAt(int row) const
+{
+    if (row < 0 || row >= m_rows.size())
+        return {};
+    const Header &header = m_all.at(m_rows.at(row));
+    return header.remoteId.isEmpty() ? QString::number(header.uid) : header.remoteId;
 }
 
 int MessageListModel::rowForUid(qint64 uid) const
@@ -496,6 +504,19 @@ void MessageListModel::markSeen(int row)
     m_all[m_rows.at(row)].seen = true;
     const QModelIndex idx = index(row);
     Q_EMIT dataChanged(idx, idx, {SeenRole});
+}
+
+void MessageListModel::markAllSeen()
+{
+    if (m_all.isEmpty())
+        return;
+    for (Header &h : m_all)
+        h.seen = true;
+    if (m_rows.isEmpty())
+        return;
+    // One span rather than a signal per row: nothing here reorders or filters
+    // on \Seen, so every visible row simply repaints.
+    Q_EMIT dataChanged(index(0), index(m_rows.size() - 1), {SeenRole});
 }
 
 QList<qint64> MessageListModel::allUids() const

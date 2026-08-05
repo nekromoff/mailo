@@ -574,6 +574,25 @@ int main(int argc, char *argv[])
              "and this is the body of the note\r\n",
              false},
             {"a single paragraph is not", "just one line of text\r\n", false},
+            // What actually separates an entity from prose is which headers
+            // are present, not whether the lines parse as headers: "Note:" is
+            // as valid a field name as "Content-Type:".
+            {"prose whose first line parses as a header is not",
+             "Subject: the meeting\r\n"
+             "\r\n"
+             "was moved to Thursday\r\n",
+             false},
+            {"MIME-Version alone is enough",
+             "MIME-Version: 1.0\r\n"
+             "\r\n"
+             "body\r\n",
+             true},
+            {"a content header below other headers still counts",
+             "Subject: signed note\r\n"
+             "Content-Type: text/plain\r\n"
+             "\r\n"
+             "body\r\n",
+             true},
         };
         for (const auto &c : cases) {
             const bool got = PgpMime::looksLikeMimeEntity(c.data);

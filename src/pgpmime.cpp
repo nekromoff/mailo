@@ -414,12 +414,12 @@ bool looksLikeMimeEntity(const QByteArray &data)
     // of one. One line of prose that happens to contain a colon is not enough
     // to treat a paragraph as a message.
     const QList<QByteArray> lines = flat.left(blank).split('\n');
-    bool sawHeader = false;
+    bool sawMimeHeader = false;
     for (const QByteArray &line : lines) {
         if (line.isEmpty())
             return false;
         if (line.startsWith(' ') || line.startsWith('\t')) {
-            if (!sawHeader)
+            if (!sawMimeHeader)
                 return false; // a continuation with nothing to continue
             continue;
         }
@@ -429,9 +429,17 @@ bool looksLikeMimeEntity(const QByteArray &data)
         // A header name is a token — no spaces in it.
         if (line.left(colon).contains(' '))
             return false;
-        sawHeader = true;
+        if (isContentHeader(line) || isMimeVersion(line))
+            sawMimeHeader = true;
     }
-    return sawHeader;
+    // Syntax alone cannot settle this: "Note:" is as valid a field name as
+    // "Content-Type:", so a paragraph opening with one would parse as a header
+    // block and a decrypted note would be rendered as an empty MIME entity.
+    // What actually separates the two is *which* headers are there — a MIME
+    // entity carries at least one Content-* or MIME-Version, and prose does
+    // not. Requiring one costs nothing real: an entity without any of them
+    // describes no body, so there would be nothing to render either way.
+    return sawMimeHeader;
 }
 
 OutgoingParts splitForCrypto(const QByteArray &assembled)

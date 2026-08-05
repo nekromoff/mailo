@@ -1,0 +1,15 @@
+Return-Path: <cyrus@41056d026c5f>
+Received: from deliver ([unix socket])
+	 (authenticated user=cassandane bits=0)
+	 by 41056d026c5f (Cyrus 3.8.1) with LMTPA;
+	 Tue, 04 Aug 2026 22:19:44 +0000
+X-Cyrus-Session-Id: cyrus-1785881984-767-3-6746845236438949222
+X-Sieve: CMU Sieve 3.0
+From: Alice Example <alice@example.com>
+To: cassandane <cassandane@localhost>
+Subject: First test message
+Date: Tue, 04 Aug 2026 12:00:00 +0000
+Message-ID: <test-one@example.com>
+Content-Type: text/plain; charset=utf-8
+
+Body of the first test message.

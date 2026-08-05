@@ -29,7 +29,8 @@ class ViewerSchemeHandler;
  * keep serving inline images, attachments, Reply/Forward — no matter what
  * the main list moves on to.
  *
- * The state is populated by MailClient (friend); the Q_INVOKABLEs delegate
+ * The state is populated by MailClient and its presentation collaborators
+ * (friends); the Q_INVOKABLEs delegate
  * back into MailClient, where the composition and attachment logic lives.
  */
 class MessageContext : public QObject
@@ -188,6 +189,11 @@ Q_SIGNALS:
 
 private:
     friend class MailClient;
+    // Fills the presentation fields below from a MIME tree, and reads
+    // them back to render the viewer and save attachments.
+    friend class MessagePresenter;
+    // Owns the DKIM/OpenPGP verdict fields and the jobs behind them.
+    friend class MessageVerifier;
 
     /// The scheme-handler slot, allocated on first use.
     quint64 viewerContext();

@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Always latest published major version (e.g. 1.x).
+Always latest published major version (e.g. 2.x).
 
 ## Reporting a Vulnerability
 

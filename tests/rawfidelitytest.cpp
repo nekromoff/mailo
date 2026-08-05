@@ -1,5 +1,21 @@
-// Which KMime accessor, if any, returns the message's original octets after
-// the parse that KIMAP has already performed?
+// SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+/// Which KMime accessor returns a message's original octets after the parse
+/// KIMAP has already performed — and, above all, that encodedContent() still
+/// does.
+///
+/// That one is load-bearing: DKIM verifies the bytes as they travelled, and
+/// MessageVerifier hands it LFtoCRLF(ctx->m_raw), which is encodedContent()
+/// of the parsed message. If a KMime upgrade ever stops round-tripping there,
+/// every signature silently starts failing its body hash and mailo reports
+/// perfectly good mail as unverified. This asserts it so that lands here
+/// instead of in the badge.
+///
+/// The other two accessors are reported, not asserted — they are known to
+/// diverge, and why is documented at each call below.
+///
+/// Exit 0 = the round-trip invariant holds.
 #include <KMime/Message>
 #include <QByteArray>
 #include <QCryptographicHash>
@@ -48,7 +64,9 @@ static QByteArray realistic()
     return m;
 }
 
-static void report(const char *label, const QByteArray &got, const QByteArray &want)
+static int failures = 0;
+
+static bool report(const char *label, const QByteArray &got, const QByteArray &want)
 {
     // The digest is printed so a variant can be matched against bytes this
     // program never sees — in particular the bodies.raw of a real cache.
@@ -63,6 +81,7 @@ static void report(const char *label, const QByteArray &got, const QByteArray &w
         printf("     original: %s\n", want.mid(i, 60).replace("\r\n", "\\r\\n").constData());
         printf("     got     : %s\n", got.mid(i, 60).replace("\r\n", "\\r\\n").constData());
     }
+    return got == want;
 }
 
 int main(int argc, char **argv)
@@ -79,7 +98,16 @@ int main(int argc, char **argv)
     if (msg->contents().isEmpty())
         msg->parse();
 
-    report("encodedContent()", KMime::LFtoCRLF(msg->encodedContent()), original);
+    // The invariant mailo depends on. Asserted.
+    if (!report("encodedContent()", KMime::LFtoCRLF(msg->encodedContent()), original)) {
+        printf("FAIL: encodedContent() no longer round-trips — DKIM body hashes\n"
+               "      will fail against every freshly fetched message.\n");
+        ++failures;
+    }
+
+    // Reported only: head() stops at the end of the headers, so the MIME
+    // preamble between them and the first boundary is not part of either
+    // accessor. Expected to differ, and nothing reads it this way.
     report("head() + body()",
            KMime::LFtoCRLF(msg->head() + QByteArrayLiteral("\n") + msg->body()), original);
 
@@ -88,7 +116,14 @@ int main(int argc, char **argv)
     // using KMime's own quoted-printable choices rather than the sender's.
     // Nothing above this line reproduces that, which is why a test that only
     // exercised setContent()+parse() cleared KMime by mistake.
+    //
+    // Reported only, and deliberately not a failure: this is upstream
+    // behaviour we cannot fix from here, and it is why nothing on the
+    // verification path may call assemble() before hashing.
     msg->assemble();
     report("assemble() + encodedContent()", KMime::LFtoCRLF(msg->encodedContent()), original);
-    return 0;
+
+    if (failures == 0)
+        printf("all fidelity invariants hold\n");
+    return failures == 0 ? 0 : 1;
 }

@@ -6,10 +6,11 @@ The fast KDE-only email client.
 
 ## What it does
 
-Security-minded KDE-only IMAP mail client, blazing fast.
+Security-minded KDE-only mail client, blazing fast. Speaks IMAP and JMAP.
 
 ### General
-- **IMAP connection** — any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365. Several accounts at once, reorderable by dragging.
+- **IMAP or JMAP** — pick the protocol per account. IMAP against any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365; JMAP (RFC 8620/8621) discovers its own endpoints from the address and authenticates with an API token or a password. Several accounts at once, mixing both, reorderable by dragging.
+- **Push, or polling where there is none** — IMAP IDLE and JMAP EventSource both land as "something changed there"; what changed is then fetched the ordinary way. A timed refresh covers servers offering neither.
 - **Local cache with full-text search** — headers, read bodies and folders in SQLite: folders open instantly, offline included. IMAP SEARCH → FTS5 (accent-folding) → regex; `/pattern/` is a case-insensitive regex.
 
 ### UI
@@ -52,9 +53,9 @@ Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailo/r
 |---|---|
 | Language / toolkit | C++20, Qt 6.11 (QML/Quick) |
 | UI framework | KDE Kirigami 6 + Kirigami Addons |
-| IMAP | KPim6 KIMAP (async KJobs, no Akonadi) |
+| Mail protocols | pluggable `MailBackend`: KPim6 KIMAP (async KJobs, no Akonadi) or JMAP over Qt Network |
 | MIME parsing/building | KPim6 KMime |
-| SMTP | KPim6 KSMTP |
+| SMTP | KPim6 KSMTP (IMAP accounts; JMAP submits over its own session) |
 | HTML viewer | QtWebEngine (Quick), custom `mailo:` URL scheme + request interceptor |
 | Storage | SQLite via Qt SQL (WAL), FTS5 for full-text indexing |
 | Attachment store | content-addressed files, zstd-compressed and deduplicated |
@@ -82,11 +83,23 @@ it, and without gnupg at runtime the Encryption settings say so and no gpg
 process is ever spawned. `cmake -B build -DMAILO_OPENPGP=OFF` leaves it out
 outright.
 
-`build/viewertest` is a headless end-to-end test of the sandboxed viewer pipeline (scheme registration, handler, render).
+Test binaries land in `build/tests/`. They are plain executables — exit 0 means
+every check passed — and none of them need a network, a keyring or a real
+mailbox:
+
+```bash
+for t in build/tests/*test; do "$t" >/dev/null || echo "FAIL $t"; done
+```
+
+`viewertest` is a headless end-to-end run of the sandboxed viewer pipeline
+(scheme registration, handler, render); `storetest`, `accountstoretest` and
+`mimeutilstest` cover the cache, the account settings and the attachment
+split/restore pair against test-only storage locations.
 
 ## Data locations
 
 - Message cache: `~/.local/share/mailo/mailo/mailo.db`
+- Attachment payloads: `~/.local/share/mailo/mailo/attachments/` (content-addressed, zstd)
 - Settings: `~/.config/mailo/mailo.conf` (no secrets)
 - Passwords and OAuth refresh tokens: KWallet, service `mailo`
 

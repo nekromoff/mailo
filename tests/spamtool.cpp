@@ -11,6 +11,15 @@
 //   ./spamtool --auth-pass msg.eml          ...or passed
 //   ./spamtool --crypto 2 msg.eml           score as OpenPGP signed (1 enc, 2 sig, 3 both)
 //   ./spamtool --quiet ...                  totals only, no per-message lines
+//   ./spamtool --msgid '<abc@host>'         score a message straight from the cache
+//   ./spamtool --db PATH                    ...from a cache other than the default
+//
+// --msgid saves exporting an .eml by hand: it looks the message up in mailo's
+// own cache by Message-ID (an indexed lookup, idx_messages_msgid) and scores
+// the stored bytes. The cache is opened strictly read-only and no migration is
+// run, so pointing this at the database a running mailo is using cannot alter
+// it. The same Message-ID may be cached in several folders or accounts; every
+// copy is scored and located in the output.
 //
 // Bodies are used when the file has them, so the same message can score
 // differently here and in the message list, which only ever sees headers.
@@ -23,6 +32,10 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QStandardPaths>
 #include <cstdio>
 
 namespace
@@ -78,17 +91,12 @@ struct Totals {
 };
 
 /// Scores one file. Returns false when it could not be read.
-bool scoreFile(const QString &path, const QSet<QString> &known, bool alwaysScore,
-               bool authFailed, bool authPassed, int crypto, bool quiet, Totals *totals)
+/// Scores one message that is already in memory. \a label names it in the
+/// output — a file name, or a cache location for --msgid.
+bool scoreRaw(const QByteArray &raw, const QString &label, const QSet<QString> &known,
+              bool alwaysScore, bool authFailed, bool authPassed, int crypto, bool quiet,
+              Totals *totals)
 {
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        std::fprintf(stderr, "cannot open %s\n", qPrintable(path));
-        return false;
-    }
-    const QByteArray raw = f.readAll();
-    f.close();
-
     KMime::Message msg;
     msg.setContent(KMime::CRLFtoLF(raw));
     msg.parse();
@@ -119,8 +127,8 @@ bool scoreFile(const QString &path, const QSet<QString> &known, bool alwaysScore
     if (quiet)
         return true;
 
-    std::printf("%-40s %-7s %4d  %s\n", qPrintable(QFileInfo(path).fileName()),
-                verdictName(s.verdict), s.total, qPrintable(addr));
+    std::printf("%-40s %-7s %4d  %s\n", qPrintable(label), verdictName(s.verdict),
+                s.total, qPrintable(addr));
     if (s.exempt) {
         std::printf("      exempt: %s\n", qPrintable(s.exemptReason));
         return true;
@@ -132,6 +140,18 @@ bool scoreFile(const QString &path, const QSet<QString> &known, bool alwaysScore
     return true;
 }
 
+bool scoreFile(const QString &path, const QSet<QString> &known, bool alwaysScore,
+               bool authFailed, bool authPassed, int crypto, bool quiet, Totals *totals)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        std::fprintf(stderr, "cannot open %s\n", qPrintable(path));
+        return false;
+    }
+    return scoreRaw(f.readAll(), QFileInfo(path).fileName(), known, alwaysScore, authFailed,
+                    authPassed, crypto, quiet, totals);
+}
+
 QStringList emlsUnder(const QString &dir)
 {
     QStringList out;
@@ -141,6 +161,88 @@ QStringList emlsUnder(const QString &dir)
         out.append(it.next());
     out.sort();
     return out;
+}
+
+/// mailo's own cache, opened read-only. Deliberately not via MailStore: open()
+/// there runs the schema migrations, and a diagnostic must not be able to write
+/// to the database the running client is using.
+QSqlDatabase openCacheReadOnly(const QString &explicitPath)
+{
+    QString path = explicitPath;
+    if (path.isEmpty()) {
+        path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+            + QStringLiteral("/mailo.db");
+    }
+    if (!QFile::exists(path)) {
+        std::fprintf(stderr, "no cache at %s\n", qPrintable(path));
+        return {};
+    }
+    QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+                                                QStringLiteral("spamtool"));
+    db.setDatabaseName(path);
+    // QSQLITE_OPEN_READONLY is the guarantee, not a convention: mailo may well
+    // be running against this file, and its WAL is shared.
+    db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    if (!db.open()) {
+        std::fprintf(stderr, "cannot open %s: %s\n", qPrintable(path),
+                     qPrintable(db.lastError().text()));
+        return {};
+    }
+    return db;
+}
+
+/// Every cached copy of \a msgid, scored. Returns how many were found.
+int scoreByMessageId(QSqlDatabase &db, const QString &rawMsgid, const QSet<QString> &known,
+                     bool alwaysScore, bool authFailed, bool authPassed, int crypto,
+                     bool quiet, Totals *totals)
+{
+    // Stored with the angle brackets stripped (MessageListModel::Header::msgid),
+    // but people paste them in, so accept either form.
+    QString msgid = rawMsgid.trimmed();
+    if (msgid.startsWith(QLatin1Char('<')) && msgid.endsWith(QLatin1Char('>')))
+        msgid = msgid.mid(1, msgid.size() - 2);
+
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("SELECT folder, uid FROM messages WHERE msgid = ?"));
+    q.addBindValue(msgid);
+    if (!q.exec()) {
+        std::fprintf(stderr, "lookup failed: %s\n", qPrintable(q.lastError().text()));
+        return 0;
+    }
+    QList<QPair<QString, qint64>> hits;
+    while (q.next())
+        hits.append({q.value(0).toString(), q.value(1).toLongLong()});
+
+    if (hits.isEmpty()) {
+        std::fprintf(stderr, "no cached message with Message-ID %s\n", qPrintable(msgid));
+        return 0;
+    }
+
+    int scored = 0;
+    for (const auto &hit : std::as_const(hits)) {
+        QSqlQuery b(db);
+        b.prepare(QStringLiteral("SELECT raw FROM bodies WHERE folder = ? AND uid = ?"));
+        b.addBindValue(hit.first);
+        b.addBindValue(hit.second);
+        // The folder key is "account\x1ffolder"; show it the way a person reads it.
+        QString where = hit.first;
+        where.replace(QChar(0x1f), QLatin1String(" / "));
+        where += QStringLiteral(":%1").arg(hit.second);
+
+        if (!b.exec() || !b.next() || b.value(0).toByteArray().isEmpty()) {
+            std::fprintf(stderr, "%s: header cached but no body yet — open it once "
+                                 "in mailo, or export it\n", qPrintable(where));
+            continue;
+        }
+        // A cached body whose large attachments were lifted into the file store
+        // is a stub. The text and HTML parts stay inline, so scoring sees what
+        // it needs; only rules about attachment payloads would be affected, and
+        // there are none.
+        scoreRaw(b.value(0).toByteArray(), where, known, alwaysScore, authFailed,
+                 authPassed, crypto, quiet, totals);
+        ++scored;
+    }
+    return scored;
 }
 
 void printTotals(const char *label, const Totals &t)
@@ -156,6 +258,11 @@ void printTotals(const char *label, const Totals &t)
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+    // The same identity src/main.cpp gives the client, so QStandardPaths lands
+    // on mailo's own data directory. Both the cached Public Suffix List and the
+    // message cache live there, so this has to come before either is looked up.
+    QCoreApplication::setOrganizationName(QStringLiteral("mailo"));
+    QCoreApplication::setApplicationName(QStringLiteral("mailo"));
     // Loads the cached Public Suffix List and refreshes it if stale. Without it
     // organizationalDomainOf() falls back to the full domain, which only makes
     // the alignment rules fire less often — the tool still runs, it just
@@ -171,6 +278,8 @@ int main(int argc, char **argv)
     bool authPassed = false;
     int crypto = 0;
     bool quiet = false;
+    QStringList msgids;
+    QString dbPath;
 
     for (int i = 1; i < argc; ++i) {
         const QString arg = QString::fromLocal8Bit(argv[i]);
@@ -193,6 +302,10 @@ int main(int argc, char **argv)
             authPassed = true;
         else if (arg == QLatin1String("--crypto"))
             crypto = next().toInt();
+        else if (arg == QLatin1String("--msgid"))
+            msgids.append(next());
+        else if (arg == QLatin1String("--db"))
+            dbPath = next();
         else if (arg == QLatin1String("--quiet"))
             quiet = true;
         else if (arg.startsWith(QLatin1String("--"))) {
@@ -203,10 +316,11 @@ int main(int argc, char **argv)
         }
     }
 
-    if (files.isEmpty() && hamDirs.isEmpty() && spamDirs.isEmpty()) {
+    if (files.isEmpty() && hamDirs.isEmpty() && spamDirs.isEmpty() && msgids.isEmpty()) {
         std::fprintf(stderr,
                      "usage: spamtool [--quiet] [--always-score] [--known ADDR]...\n"
                      "                [--auth-fail|--auth-pass] [--crypto 0|1|2|3]\n"
+                     "                [--msgid MESSAGE-ID]... [--db PATH]\n"
                      "                [--dir DIR] [--ham DIR] [--spam DIR] [FILE...]\n");
         return 2;
     }
@@ -218,6 +332,16 @@ int main(int argc, char **argv)
     Totals plain;
     for (const QString &f : std::as_const(files))
         scoreFile(f, known, alwaysScore, authFailed, authPassed, crypto, quiet, &plain);
+
+    if (!msgids.isEmpty()) {
+        QSqlDatabase db = openCacheReadOnly(dbPath);
+        if (!db.isOpen())
+            return 2;
+        for (const QString &id : std::as_const(msgids)) {
+            scoreByMessageId(db, id, known, alwaysScore, authFailed, authPassed, crypto,
+                             quiet, &plain);
+        }
+    }
 
     Totals hamTotals;
     for (const QString &d : std::as_const(hamDirs)) {

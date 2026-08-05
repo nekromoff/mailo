@@ -19,10 +19,16 @@
 #include <functional>
 #include <memory>
 
+#include "accountstore.h"
 #include "dkimverifier.h"
 #include "foldermodel.h"
+#include "mailbackend.h"
+#include "maintenancescheduler.h"
 #include "mailstore.h"
+#include "syncengine.h"
 #include "messagecontext.h"
+#include "messagepresenter.h"
+#include "messageverifier.h"
 #include "messagelistmodel.h"
 #include "pgpengine.h"
 
@@ -30,14 +36,6 @@ class QThread;
 
 class QThread;
 
-namespace KIMAP
-{
-class Session;
-class IdleJob;
-class LoginJob;
-class ImapSet;
-struct Message;
-}
 namespace KMime
 {
 class Content;
@@ -48,13 +46,18 @@ class PgpEngine;
 class ViewerSchemeHandler;
 
 /**
- * Central IMAP controller exposed to QML as the "Mail" singleton.
+ * Central mail controller exposed to QML as the "Mail" singleton.
  *
- * All jobs are async KJobs on the event loop; no extra threads are involved.
- * KIMAP runs jobs on one connection strictly in order, so interactive work
- * (main session), IDLE push, and background sync (header backfill + body
- * prefetch) each get their own connection — user actions never queue behind
- * a long background transfer.
+ * Everything above the wire: the folder and message models, the reading pane,
+ * compose, the offline cache, spam scoring and sender authentication. What
+ * happens *on* the wire belongs to MailBackend (ImapBackend or JmapBackend),
+ * and this class names no protocol — which mailbox is the trash, when to
+ * backfill, what a header means are the same questions whichever one answered.
+ *
+ * All work is asynchronous on the event loop; the only threads are the DKIM
+ * verifier, the search indexer and the unread recount, none of which touch the
+ * network. How many connections a protocol needs, and which one a request goes
+ * out on, is the backend's business alone.
  */
 class MailClient : public QObject
 {
@@ -112,6 +115,11 @@ class MailClient : public QObject
     Q_PROPERTY(int accountPort READ accountPort NOTIFY accountChanged)
     Q_PROPERTY(QString accountUser READ accountUser NOTIFY accountChanged)
     Q_PROPERTY(QString accountEmail READ accountEmail NOTIFY accountChanged)
+    /// The address mail actually goes out as — accountEmail when the account
+    /// sets one, the derived fallback when it does not. The settings editor
+    /// wants accountEmail (the stored field, blank until saved); anything
+    /// *showing* the identity in use wants this.
+    Q_PROPERTY(QString accountSendAddress READ ownAddress NOTIFY accountChanged)
     Q_PROPERTY(QString accountDisplayName READ accountDisplayName NOTIFY accountChanged)
     Q_PROPERTY(QString accountOrganization READ accountOrganization NOTIFY accountChanged)
     Q_PROPERTY(int accountSecurity READ accountSecurity NOTIFY accountChanged)
@@ -176,15 +184,15 @@ public:
     ~MailClient() override;
 
     /// The scheme handler that serves message bodies to the viewer.
-    void setViewerHandler(ViewerSchemeHandler *handler) { m_viewerHandler = handler; }
+    void setViewerHandler(ViewerSchemeHandler *handler);
     /// Hands the client the OpenPGP backend (main.cpp owns it). Without it —
     /// or with one that reports unavailable — encrypted mail is shown as
     /// encrypted and undecryptable, and nothing else changes.
     void setPgpEngine(PgpEngine *engine);
 
     bool hasAccount() const;
-    bool accountIsLocal() const { return m_local; }
-    bool connected() const { return m_connected; }
+    bool accountIsLocal() const { return m_acct.local; }
+    bool connected() const { return m_backend->isConnected(); }
     bool busy() const { return m_busy; }
     QString statusText() const { return m_statusText; }
     QString aboutText() const;
@@ -192,20 +200,20 @@ public:
     MessageListModel *messageModel() { return &m_messageModel; }
     MessageContext *readingContext() { return m_reading; }
 
-    QString accountHost() const { return m_host; }
-    int accountPort() const { return m_port; }
-    QString accountUser() const { return m_user; }
-    QString accountEmail() const { return m_email; }
-    QString accountDisplayName() const { return m_displayName; }
-    QString accountOrganization() const { return m_organization; }
-    int accountSecurity() const { return m_security; }
+    QString accountHost() const { return m_acct.host; }
+    int accountPort() const { return m_acct.port; }
+    QString accountUser() const { return m_acct.user; }
+    QString accountEmail() const { return m_acct.email; }
+    QString accountDisplayName() const { return m_acct.displayName; }
+    QString accountOrganization() const { return m_acct.organization; }
+    int accountSecurity() const { return m_acct.security; }
 
-    QString smtpHost() const { return m_smtpHost; }
-    int smtpPort() const { return m_smtpPort; }
-    int smtpSecurity() const { return m_smtpSecurity; }
+    QString smtpHost() const { return m_acct.smtpHost; }
+    int smtpPort() const { return m_acct.smtpPort; }
+    int smtpSecurity() const { return m_acct.smtpSecurity; }
 
     QStringList accountNames() const;
-    int currentAccount() const { return m_currentAccount; }
+    int currentAccount() const { return m_accounts.currentIndex(); }
     int cachedFolderRevision() const { return m_cachedFolderRevision; }
     int refreshMinutes() const { return m_refreshMinutes; }
     int spamRetentionDays() const { return m_spamRetentionDays; }
@@ -469,11 +477,11 @@ public:
     /// Whether a rebuild would actually hand anything back. False right after
     /// one has run, so the UI can stop offering a multi-minute no-op.
     Q_INVOKABLE bool reclaimWorthwhile();
-    bool reclaiming() const { return m_reclaiming; }
-    bool indexRebuilding() const { return m_indexRebuilding; }
+    bool reclaiming() const;
+    bool indexRebuilding() const;
     bool searching() const { return m_searching; }
     int searchFound() const { return m_searchFound; }
-    int indexRebuildPercent() const { return m_indexPercent; }
+    int indexRebuildPercent() const;
     /// Asks to quit as soon as the rebuild finishes; the window is closed for
     /// the user rather than leaving them to try again.
     Q_INVOKABLE void quitWhenIndexRebuildDone() { m_quitAfterIndex = true; }
@@ -529,16 +537,8 @@ Q_SIGNALS:
 private:
     friend class MessageContext; // thin QML front for the *For methods below
 
-    /// Storage identity: the wallet entry and the on-disk message cache are
-    /// filed under this. Deliberately keyed on the login, not the e-mail
-    /// address — rebasing it would orphan every cached folder and stored
-    /// password on existing installs. Imported archives carry an explicit
-    /// cacheKey instead, so filling in server details later (which changes
-    /// user/host) does not orphan the imported mail.
-    QString accountKey() const
-    {
-        return m_cacheKey.isEmpty() ? m_user + QLatin1Char('@') + m_host : m_cacheKey;
-    }
+    /// Storage identity of the active account — see AccountConfig::accountKey().
+    QString accountKey() const { return m_acct.accountKey(); }
     /// Fills the folder model from the disk cache (instant sidebar).
     void loadCachedFolderModel();
     /// Records a body-derived attachment kind (e.g. calendar invite) in the
@@ -554,18 +554,34 @@ public:
     /// marked unread while open stays open and stays unread, and the ordinary
     /// rule takes over again — it is marked read the next time it is opened.
     Q_INVOKABLE void markMessagesUnread(const QVariantList &rows);
+    /// Marks every message of \a mailBox read — in the cache, in the list when
+    /// that folder is the open one, and (when online) on the server. Acts on
+    /// the whole folder, not on the page of headers the list happens to hold.
+    Q_INVOKABLE void markFolderRead(const QString &mailBox);
+    /// True when \a mailBox has cached unread mail, so the menu can grey out
+    /// "Mark all read" instead of offering a command with nothing to do.
+    Q_INVOKABLE bool folderHasUnread(const QString &mailBox);
 
 private:
+    /// STOREs \Seen on \a ids of \a mailBox, best effort — what a folder's
+    /// "mark all read" comes down to on the wire.
+    void sendSeenStore(const QString &mailBox, const QStringList &ids);
+    /// Sends the \Seen stores that markFolderRead() could not send offline.
+    void flushPendingSeen();
+
+    /// Sets the folder on screen and keeps every collaborator that cares in
+    /// step. The single assignment point: SyncEngine reads it on every fetch
+    /// reply, and a stale copy there files a folder's mail under another's.
+    void setSelectedFolder(const QString &folder);
+    /// Same, for "search results are showing in place of the folder".
+    void setSearchActive(bool active);
     void loadAccount();
     void loadAccountFields();
-    void readWalletPassword();
     /// Switches to account \a index. \a targetFolder is the folder to land
     /// on — its cached contents are shown immediately, and it is what the
     /// connection opens once the folder list arrives. Empty means INBOX.
     void switchAccountInternal(int index, const QString &sessionPassword,
                                const QString &targetFolder = {});
-    QString walletKey() const;
-    void writeSecretToWallet();
     void setBusy(bool busy);
     void setStatus(const QString &text);
     /// Composed background-sync status for the open folder: the header-sync
@@ -581,10 +597,28 @@ private:
     /// and on (re)connect or folder change, so a healthy server resumes at
     /// full pace.
     void resetBackfillBackoff();
-    /// Drop one background body-fetch connection and stop growing the pool,
-    /// in response to a [TOO-MANY-SIMULTANEOUS-CONNECTIONS] refusal.
-    void shrinkBodyPool();
     void listFolders();
+    /// Turns a folder listing into the sidebar tree, the cached folder list and
+    /// the choice of which folder to open. Everything the listing means to the
+    /// application; the protocol only supplies the mailboxes and their roles.
+    void applyFolderListing(const QList<MailBackend::FolderInfo> &folders, QChar separator);
+    /// Records a folder's size and sync token once the backend has opened it,
+    /// and hands the result to whichever of the two openers asked for it.
+    void applyFolderOpened(const QString &folder, qint64 messageCount,
+                           const QString &syncToken);
+    /// Stores \a folder's new sync position, and reads nothing into it. What a
+    /// changed token means is the protocol's business — for IMAP a regenerated
+    /// mailbox, for JMAP simply that something happened — so a backend that
+    /// finds the cache void says so with folderInvalidated() instead.
+    void applySyncToken(const QString &folder, const QString &syncToken);
+    /// Throws away everything cached for \a folder, and re-reads it when it is
+    /// the one on screen. The backend's word that the cache cannot be merged
+    /// into any more.
+    void applyFolderInvalidated(const QString &folder);
+    /// Drops messages the backend reports gone from \a folder — deleted or
+    /// moved away by another client. Only a protocol with a change log can say
+    /// this, so silence is never a promise that nothing vanished.
+    void applyMessagesVanished(const QString &folder, const QStringList &remoteIds);
     /// Checks every other configured account for new mail on the refresh
     /// timer: connect, STATUS its folders, disconnect. Accounts that are not
     /// the open one hold no session at all, so this is the only way their
@@ -593,10 +627,6 @@ private:
     /// One account's check; \a done is called however it ends, so the queue
     /// keeps moving even when an account is unreachable.
     void pollAccount(const QVariantMap &account, const std::function<void()> &done);
-    /// STATUS every cached folder of \a accountKey on an open session, then
-    /// hand the unread counts back and close.
-    void statusFoldersOn(KIMAP::Session *session, const QString &accountKey,
-                         const std::function<void()> &done);
     /// Permanently removes messages older than spamRetentionDays() from the
     /// account's spam folder. Runs once per connection, on the background sync
     /// session so it never disturbs the folder being read.
@@ -606,9 +636,13 @@ private:
     /// a request arriving while the worker runs re-runs it once afterwards
     /// rather than queueing one pass per call.
     void scheduleUnreadRecount();
-    /// Runs the recount for every account on a worker connection and hands the
-    /// result to the folder model. Never call from the GUI thread's hot path.
-    void startUnreadRecount();
+    /// Debounced request for this account's unread counts from the server.
+    /// Raised by MailBackend::accountChanged(), so in practice JMAP only.
+    void scheduleAccountCountRefresh();
+    /// Asks the live backend what every cached folder's unread count is now.
+    /// Unlike startUnreadRecount(), which counts the local cache, this learns
+    /// about mail in folders that have never been opened.
+    void refreshAccountUnreadCounts();
     /// The server's hierarchy delimiter, as reported by LIST. Falls back to
     /// guessing from the known paths before the first listing has arrived.
     QChar folderSeparator() const;
@@ -646,66 +680,15 @@ private:
     /// Drops the cached mail of folders deleted from the server, on the same
     /// worker (chunked, so the GUI thread never waits for a write lock).
     void purgeCachedFolders(const QStringList &folders);
-    /// Joins the folder-maintenance worker, if one is running.
-    void stopFolderOps();
     /// True for a mailbox that duplicates every other one (Gmail's All Mail).
     static bool isAllMailName(const QString &mailBox);
-    /// Queues a fetched body for the writer thread, and starts it if needed.
-    void queueBodyWrite(MailStore::BodyWrite &&write);
-    /// Writer-thread loop: drains m_bodyWriteQueue into batched transactions.
-    void runBodyWriter();
-    /// Stops and joins the writer thread after flushing its queue. It restarts
-    /// on the next queueBodyWrite().
-    void stopBodyWriter();
-    /// True once every background writer has stopped (see reclaimDiskSpace).
-    bool writersIdle() const;
-    /// Polls for that, then starts the vacuum thread. Polling rather than
-    /// joining: the GUI thread must keep serving the event loop meanwhile.
-    void startVacuumWhenWritersIdle();
 
     /// Cached missingBodyCount() for one folder — see the .cpp for why.
     int missingBodiesIn(const QString &folder);
     void noteBodyStored(const QString &folder);
     void invalidateMissingBodies();
 
-    /// Moves attachments of already-cached messages into the file store, a
-    /// chunk at a time on a worker thread. Resumes after a restart.
-    void startAttachmentMigration();
-    void stopAttachmentMigration();
-    /// Cancels the index rebuild between slices and joins its thread.
-    void stopIndexRebuild();
 
-    /// Starts the background removal of the excluded archive's cached rows.
-    void startAllMailPurge();
-    /// Cancels it and waits for the worker to finish.
-    void stopAllMailPurge();
-    void fetchHeaders(qint64 fromSeq, qint64 toSeq, bool append);
-    /// The actual header FETCH on \a session. \a background jobs never touch
-    /// busy state, and any result for a folder the user has left goes to the
-    /// cache only — never into the visible list.
-    void fetchHeadersOn(KIMAP::Session *session, const QString &folder,
-                        qint64 fromSeq, qint64 toSeq, bool append, bool background);
-    /// Opens the dedicated background-sync connection (best-effort).
-    void startSyncSession();
-    /// Runs \a fn with the sync session once \a folder is selected on it;
-    /// falls back to the main session when no sync connection exists, and
-    /// passes nullptr when neither can serve the folder.
-    void withSyncSession(const QString &folder,
-                         const std::function<void(KIMAP::Session *)> &fn);
-    /// Fetches everything the server has above the cached block (by UID),
-    /// then resumes the backfill cursor below the block — old mail never
-    /// changes, so the cached middle needs no refetch.
-    void fetchNewerThanCache(qint64 maxCachedUid, int cachedCount);
-    /// Fetches the next older header window from the server (backfill step).
-    void fetchOlderFromServer();
-    /// Idle-time body caching: queues \a folder's next few headers that have
-    /// no cached body yet. Runs only after the header backfill has finished,
-    /// so a fresh account always shows the full list first. Returns false
-    /// when the folder has no missing bodies (nothing was queued).
-    bool backfillBodies(const QString &folder);
-    /// Once the open folder is fully synced, walks the account's remaining
-    /// folders (headers, then bodies) so every mailbox gets cached.
-    void continueFolderBackfill();
     /// Remembers the oldest (date, uid) shown from the disk cache, so
     /// loadMoreMessages() can page the next cached chunk in from there.
     void updatePageAnchor(const QList<MessageListModel::Header> &page);
@@ -744,18 +727,9 @@ private:
     void refineCrypto(const QString &folder, qint64 uid, KMime::Message *msg);
     /// Offers a public key attached to the message — see the definition.
     void findAttachedKey(MessageContext *ctx, KMime::Content *root);
-    void collectInlineParts(MessageContext *ctx, KMime::Content *root);
-    void collectAttachments(MessageContext *ctx, KMime::Content *root);
-    QString attachmentNameFor(const MessageContext *ctx, int index) const;
-    bool writeAttachmentFor(const MessageContext *ctx, int index, const QString &path);
     /// Fills \a ctx's body, preview, inline parts and attachments from \a root.
     /// Runs a second time, over the decrypted tree, for an encrypted message.
     void applyBodyParts(MessageContext *ctx, KMime::Message *root, bool junk);
-    /// Handles one PgpEngine::decryptFinished — see the definition.
-    void applyDecryption(quint64 jobId, const QByteArray &plainText,
-                         const QString &error, bool noSecretKey);
-    /// Handles one PgpEngine::verifyFinished.
-    void applyVerification(quint64 jobId, const PgpSignatureInfo &signature);
     /// Starts detached verification of \a root's RFC 3156 signature, if it has
     /// one, and records the job against \a ctx. Returns true if a job started.
     bool startPgpVerification(MessageContext *ctx, KMime::Message *root);
@@ -794,13 +768,13 @@ private:
     /// the pre-resolved allowlist for the batch (see appendScoredHeaders).
     void scoreHeader(MessageListModel::Header &h, const QByteArray &head,
                      const QSet<QString> &knownSenders);
-    /// Turns one FETCH delivery into scored list headers and appends them to
-    /// \a out, skipping entries at or below \a minUid. Single place where a
-    /// KIMAP header batch becomes rows, so the allowlist lookup stays batched
-    /// and no fetch path can quietly skip scoring.
+    /// Turns one header delivery into scored list rows and appends them to
+    /// \a out. Single place where a backend's header batch becomes rows, so
+    /// the allowlist lookup stays batched and no fetch path can quietly skip
+    /// scoring.
     void appendScoredHeaders(QList<MessageListModel::Header> &out,
-                             const QMap<qint64, KIMAP::Message> &messages,
-                             const QStringList &authDomains, qint64 minUid = 0);
+                             const QList<MailBackend::HeaderInfo> &infos,
+                             const QStringList &authDomains);
     /// The account's own sending address, bare — no display name. This is the
     /// SMTP envelope sender, and the address excluded from reply-all lists.
     QString ownAddress() const;
@@ -819,33 +793,30 @@ private:
     /// message is actually opened — never during sync or prefetch, so the
     /// mailbox does not turn into a stream of DNS queries to the resolver.
     void startDkimVerification(MessageContext *ctx);
-    /// Hands the current message to the worker without resetting the retry
-    /// count — the retry path re-enters here.
-    void submitDkimVerification(MessageContext *ctx);
-    /// DNS was unreachable rather than authoritative, so the key may well
-    /// exist. Backs off and tries again a few times before giving up.
-    /// Returns false when the attempts are exhausted.
-    bool scheduleDkimRetry(MessageContext *ctx);
-    /// Applies a verdict that arrived from the worker thread.
-    void applyDkimResult(quint64 requestId, const DkimResult &result);
-    /// A body hash that fails against a *cached* copy usually says our copy is
-    /// stale rather than that the message was altered: bodies written by older
-    /// builds are not the octets that arrived (see doc/roadmap.md). Drops the
-    /// cached body, refetches it once, and re-verifies against what the server
-    /// actually holds. Returns false when healing does not apply, in which
-    /// case the mismatch stands as "not verified".
-    /// Which check found the mismatch — it decides what runs again afterwards,
-    /// and which badge shows "checking" meanwhile.
-    enum class HealReason { DkimBodyHash, OpenPgpSignature };
-    bool healCachedBody(MessageContext *ctx, HealReason reason);
+    /// Fetches \a folder/\a uid's body from the server for a re-check of a
+    /// signature that failed against the cached copy, and hands the result to
+    /// \a done. Returns false when there is nothing to ask — offline, or the
+    /// message is not cached — in which case \a done is never called.
+    /// \a isRetry marks the second attempt, which is what stops a backend that
+    /// declined the first one (bulk transfers all busy) from being asked
+    /// forever.
+    bool refetchBodyForVerification(const QString &folder, qint64 uid, bool isRetry,
+                                    MessageVerifier::BodyReady done);
     void purgeDeleted(const QList<qint64> &uids);
-    void configureLogin(KIMAP::LoginJob *login) const;
     QString oauthWalletKey() const;
     /// Obtains a fresh access token (refresh grant or browser sign-in), then
     /// re-enters connectAccount().
     void acquireTokenAndConnect();
-    void startIdle();
-    void stopIdle();
+    /// The account's server settings and secrets, as the backend wants them.
+    MailBackend::Credentials backendCredentials() const;
+    /// The network half of fetchMessage(): asks the backend for one body and
+    /// presents it. \a isRetry marks the second attempt, which is what stops a
+    /// backend that declined the first one (bulk transfers all busy) from
+    /// being asked forever.
+    void requestMessageBody(int row, const QString &remoteId, bool isRetry);
+    /// Reacts to the backend losing a connection that had been up: remembers
+    /// the open folder and dials again shortly.
+    void handleConnectionLost();
     /// Merges any new server messages into the open folder without clearing it.
     void refreshCurrentFolder();
     /// Arms the idle-time fetch of the next older header window.
@@ -855,126 +826,75 @@ private:
     /// attachment kind; recipient harvesting for the Sent folder).
     void storeFetchedBody(const QString &folder, qint64 uid,
                           const std::shared_ptr<KMime::Message> &message);
-    /// One extra IMAP connection of the parallel body-caching pool.
-    struct BodyConn {
-        QPointer<KIMAP::Session> session;
-        QString folder;    ///< mailbox currently selected on it
-        bool ready = false;
-        bool busy = false; ///< a body batch is streaming on it
-    };
-    /// Opens the missing pool connections (best effort, once per connect).
-    void ensureBodyPool();
-    /// Takes the next same-folder batch off the prefetch queue and streams
-    /// it on \a conn, selecting the folder there first when needed.
-    void dispatchBodyBatch(const std::shared_ptr<BodyConn> &conn);
-    /// The streaming multi-UID body FETCH itself; \a release frees the
-    /// issuing connection and is called exactly once.
-    void startBodyFetchJob(KIMAP::Session *session, const QString &folder,
-                           const KIMAP::ImapSet &set,
-                           const std::function<void()> &release);
-    /// True while any connection (pool or fallback) streams a body batch.
-    bool bodyFetchActive() const;
     void teardownSession();
-    /// One tiny batch of search-index repair (bodies queued in fts_pending):
-    /// parses the raw message and writes its text into the FTS index. Timer-
-    /// driven so the GUI thread never does more than a few ms at a time.
-    void reindexPendingBodies();
 
-    QString m_host;
-    int m_port = 993;
-    int m_security = SslTls;
-    QString m_user;
-    /// The address mail is sent from. Separate from m_user because a login
-    /// name need not be an address (and need not share its domain). Empty on
-    /// accounts saved before this was a field; ownAddress() then falls back to
-    /// the old guess rather than forcing everyone through the account dialog.
-    QString m_email;
-    /// The name recipients see in From, e.g. "Jane Roe" <jane@example.com>.
-    /// Optional: empty sends a bare address, which is what every account did
-    /// before this field existed.
-    QString m_displayName;
-    /// Optional Organization: header. Empty sends no such header at all.
-    QString m_organization;
-    QString m_password;
-    QString m_smtpHost;
-    int m_smtpPort = 587;
-    int m_smtpSecurity = 1; // Session::EncryptionMode-ish: 0 TLS, 1 STARTTLS, 2 none
-    int m_authType = 0;     // 0 password, 1 Gmail OAuth2, 2 Microsoft OAuth2
-    QString m_clientId;
-    QString m_clientSecret;
-    QString m_signature; ///< per-account signature (HTML, may be a full doc)
-    bool m_htmlMail = true; ///< send multipart text+HTML; false = plain text only
-    bool m_local = false;   ///< local archive: never connect, never sync
-    QString m_cacheKey;     ///< fixed storage key of an imported archive ("" = user@host)
-    QString m_refreshToken;
-    QString m_accessToken;
-    QDateTime m_accessTokenExpiry;
+    /// The active account's stored configuration. Refilled wholesale by every
+    /// account load or switch, so no field can outlive the account it names.
+    AccountConfig m_acct;
+    /// Where accounts and their secrets live on disk. Owns the current-account
+    /// index too, since that is the one thing about "which account" that is
+    /// itself persisted.
+    AccountStore m_accounts;
     OAuthHelper *m_oauth = nullptr;
-    bool m_secretReady = false;      ///< wallet lookup finished (or not needed)
-    bool m_connectWhenReady = false; ///< connect was requested before that
-    int m_currentAccount = 0;
+    bool m_connectWhenReady = false; ///< connect was requested before the secret arrived
     int m_cachedFolderRevision = 0; ///< see cachedFolderRevision property
-    int m_walletGen = 0; ///< invalidates in-flight wallet reads on account switch
 
+    /// Keeps the cache and the visible list in step with the server.
+    SyncEngine *m_sync = nullptr;
     ViewerSchemeHandler *m_viewerHandler = nullptr;
-    QPointer<KIMAP::Session> m_session;
-    QPointer<KIMAP::Session> m_idleSession; ///< dedicated connection for IMAP IDLE push
-    QPointer<KIMAP::IdleJob> m_idleJob;
-    QPointer<KIMAP::Session> m_syncSession; ///< dedicated connection for background sync
-    bool m_syncReady = false; ///< the sync connection is logged in
-    QString m_syncFolder;     ///< mailbox currently selected on the sync connection
+    /// Renders a message into a MessageContext: bodies, inline parts,
+    /// attachments and the three view URLs.
+    MessagePresenter *m_presenter = nullptr;
+    /// The protocol side of the account: owns the connections and every
+    /// operation run over them. Never null, and never named more precisely
+    /// than this — nothing here knows which protocol answered.
+    MailBackend *m_backend = nullptr;
+    /// Replaces m_backend with one that speaks \a protocol, rewiring its
+    /// signals. A no-op when the current one already does.
+    void setBackendProtocol(MailBackend::Protocol protocol);
+    /// Wires one backend's signals to this client. Called for every backend
+    /// that becomes m_backend, so the set is stated once.
+    void connectBackend(MailBackend *backend);
     QString m_selectedFolder;
-    bool m_folderReadWrite = false; ///< current SELECT is read-write (not EXAMINE)
     QString m_pendingFolder; ///< folder to reopen after (re)connect
     QString m_sentFolder;    ///< where sent mail gets APPENDed
     QString m_draftsFolder;  ///< where "Save as draft" APPENDs
+    /// Trash and Junk as the *server* named them (FolderInfo::role). Empty
+    /// when it named neither, which is when trashFolderName()/isJunkFolder()
+    /// fall back to guessing from folder names. All of these are refilled from
+    /// scratch by every folder listing, so none can outlive its account.
+    QString m_trashFolder;
+    QString m_junkFolder;
     /// Gmail's \All archive: excluded from the folder list and the backfill
     /// because it re-stores every message already held under INBOX and labels.
     QString m_allMailFolder;
     QChar m_folderSeparator; ///< hierarchy delimiter reported by LIST
-    int m_missingBodies = -1; ///< -1 = stale, recompute on next use
-    QString m_missingBodiesFolder;
     int m_maxBodyMB = 5; ///< bodies above this are not cached (0 = no limit)
     bool m_authVerification = true; ///< DKIM/ARC/SPF/DMARC checking and display
     bool m_debugLogging = false;
 
-    /// Bodies wait here for the writer thread; the mutex guards the queue and
-    /// pairs with m_bodyWriteWake.
-    QList<MailStore::BodyWrite> m_bodyWriteQueue;
-    QMutex m_bodyWriteMutex;
-    QWaitCondition m_bodyWriteWake;
-    QThread *m_bodyWriterThread = nullptr;
-    QAtomicInt m_bodyWriterStop;
+    /// Every cache worker thread and the rules between them.
+    MaintenanceScheduler *m_jobs = nullptr;
+    /// Builds it and wires what it reports back. Called first thing in the
+    /// constructor: nothing may queue a body write before it exists.
+    void setUpMaintenance();
 
-    QThread *m_migrateThread = nullptr; ///< attachment externalisation of old mail
-    QAtomicInt m_migrateCancel;
-    QThread *m_reindexThread = nullptr; ///< off-thread body text extraction
     QThread *m_importThread = nullptr;  ///< Thunderbird mbox import worker
     QAtomicInt m_importStop;            ///< asks the importer to stop mid-file
-    QThread *m_purgeThread = nullptr; ///< background removal of that archive
-    QThread *m_folderOpThread = nullptr; ///< cache re-key / purge after a folder move
-    QAtomicInt m_folderOpCancel;
-    QThread *m_unreadThread = nullptr;   ///< unread-count recount for the sidebar
-    bool m_unreadRecountQueued = false;  ///< a request arrived while one was running
-    QTimer m_unreadDebounce;
+    QTimer m_accountCountDebounce;
     /// Unread counts per account key, so the pane can show them for accounts
     /// that are only cached — one worker pass fills them all.
     QHash<QString, QHash<QString, int>> m_unreadByAccount;
-    QThread *m_vacuumThread = nullptr;
-    QAtomicInt m_purgeCancel;
-    int m_purgedRows = 0;
-    bool m_reclaiming = false; ///< a VACUUM is running on a worker thread
-    QThread *m_indexThread = nullptr; ///< diacritics rebuild of the FTS index
-    QAtomicInt m_indexCancel;
-    /// Read by the body-writer thread, so it knows to queue what it indexes
-    /// for repair after the swap.
-    QAtomicInt m_indexRebuildActive;
-    bool m_indexRebuilding = false;
+    /// "Mark all read" asked while offline: folder -> the remote ids to STORE
+    /// \Seen on once the connection is up. Right-clicking a folder of another
+    /// account opens that account first, so the command routinely lands before
+    /// its connection does — without this the next header sync would read the
+    /// server's untouched flags back and undo it. Dropped on an account
+    /// switch: the ids name messages of the account it was asked on.
+    QHash<QString, QStringList> m_pendingSeen;
     bool m_searching = false;   ///< a search is in flight (server or local)
     int m_searchFound = 0;      ///< hits delivered by it so far
-    int m_indexPercent = 0;
     bool m_quitAfterIndex = false; ///< close was attempted mid-rebuild
-    QTimer m_keepAlive;
     QTimer m_pollTimer;      ///< IDLE-less fallback refresh of the open folder
     int m_refreshMinutes = 5;
     int m_spamRetentionDays = 30; ///< 0 = keep spam forever
@@ -982,19 +902,6 @@ private:
     bool m_spamSwept = false;     ///< the sweep has run for this connection
     bool m_accountPollBusy = false; ///< a background account round is in flight
     QString m_dateFormat;    ///< Qt date pattern for list/viewer dates
-    qint64 m_oldestFetchedSeq = 0; ///< lowest sequence number fetched so far
-    qint64 m_folderMessageCount = 0; ///< total messages in the open folder
-    QTimer m_reindexTimer;   ///< drip-feed repair of the body search index
-    QTimer m_backfillTimer;  ///< idle-time fetch of older header windows
-    bool m_backfill = false; ///< the running header fetch is a backfill one
-    int m_backfillAttempt = 0; ///< consecutive throttle hits (0 while healthy)
-    bool m_syncPaused = false; ///< backfill suspended after too many throttles
-    QStringList m_folderBackfillQueue; ///< folders still to background-sync
-    QString m_backfillFolder;   ///< non-open folder currently background-syncing
-    qint64 m_backfillOldestSeq = 0; ///< its header cursor (0 = size unknown yet)
-    bool m_folderBackfillPassDone = false; ///< all folders visited this connect
-    bool m_headerFetch = false; ///< a header FETCH is in flight (any session)
-    bool m_bodyBackfill = false; ///< the idle body-caching phase is running
     bool m_searchActive = false; ///< showing search results, not the folder
     /// Bumped for every local search started or abandoned. The worker carries
     /// the value it was started with and stops as soon as it no longer
@@ -1006,30 +913,19 @@ private:
     /// from the old query's results into the new one's instead of being
     /// cleared up front, which flashed blank on every keystroke.
     QSet<qint64> m_searchSeen;
-    qint64 m_pageDate = 0;   ///< disk-cache paging anchor: oldest shown date
-    qint64 m_pageUid = 0;    ///< …and its uid (keyset pagination tiebreaker)
+    /// Ids the backend's last server search returned, held between the
+    /// searchResults signal and the request's completion callback.
+    QStringList m_pendingSearchIds;
 
     MessageContext *m_reading = nullptr; ///< the reading pane's message state
 
     /// OpenPGP backend, set by main.cpp. Null, or unavailable, on a machine
-    /// without gnupg — every path through here checks before using it.
+    /// without gnupg — every path through here checks before using it. Held
+    /// here only so presentMessage() can start a decryption; the jobs and
+    /// verdicts belong to m_verifier.
     QPointer<PgpEngine> m_pgp;
-    /// Decrypt jobs in flight, by the token PgpEngine::decrypt() handed out.
-    /// A list per job, because detaching a window mid-decryption gives the
-    /// same job a second context to answer rather than a second decryption
-    /// (and a second passphrase prompt). A reader who moves on before gpg
-    /// answers leaves entries nothing wants; applyDecryption() drops those.
-    QHash<quint64, QList<QPointer<MessageContext>>> m_pendingDecrypt;
-    /// Verify jobs in flight, same scheme as m_pendingDecrypt. A signature
-    /// found inside an encrypted message reuses that message's decrypt token,
-    /// so an id can appear in both maps.
-    QHash<quint64, QList<QPointer<MessageContext>>> m_pendingVerify;
-
-    /// DKIM verification runs off the GUI thread: it is a DNS round trip plus
-    /// SHA-256 over the whole message and a public-key operation.
-    QThread *m_dkimThread = nullptr;
-    DkimVerifier *m_dkimVerifier = nullptr;
-    quint64 m_dkimNextRequest = 0;
+    /// DKIM/ARC and OpenPGP verdicts, and the cache-healing rule they share.
+    MessageVerifier *m_verifier = nullptr;
 
     /// Fills in Message-IDs for rows cached before the column existed. Small
     /// chunks on a slow timer: the work is one-time and must never be felt.
@@ -1041,23 +937,9 @@ private:
     /// assumed byte-identical to what arrived. Logged next to the DKIM verdict
     /// so the two paths can be told apart — see doc/roadmap.md.
     bool m_presentingFromCache = false;
-    /// In-flight verifications by request id. QPointer because a detached
-    /// window may close while its message is still being checked.
-    QHash<quint64, QPointer<MessageContext>> m_dkimPending;
-    /// "folder\nuid" of messages whose cached body has already been refetched
-    /// once because its body hash failed. Session-scoped on purpose: a healed
-    /// body is byte-exact afterwards, so the only messages that could come
-    /// back here are ones that genuinely mismatch, and those must not cost a
-    /// fetch on every open.
-    QSet<QString> m_dkimHealed;
     bool m_detachPending = false; ///< a double-click is waiting for its fetch
     qint64 m_detachUid = -1;      ///< the message that double-click asked for
     QString m_textPreview;
-    QList<QPair<QString, qint64>> m_prefetchQueue; ///< (folder, uid) waiting for a background body fetch
-    bool m_prefetching = false;
-    QList<std::shared_ptr<BodyConn>> m_bodyPool; ///< parallel body-fetch connections
-    bool m_bodyPoolBroken = false; ///< server refused extra connections — stop trying
-    bool m_connected = false;
     bool m_busy = false;
     QString m_statusText;        ///< breadcrumb shown in the UI (newest first)
     QStringList m_statusTrail;   ///< recent raw messages, newest first (max 3)

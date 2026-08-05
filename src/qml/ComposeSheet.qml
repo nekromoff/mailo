@@ -27,6 +27,17 @@ Item {
         const named = first.match(/^\s*"?([^"<]*[^"<\s])"?\s*</)
         return titleBase + " to: " + (named ? named[1] : first)
     }
+    /// The same, plus the identity the message will be sent as. Only the
+    /// window placement uses it: a title bar has room to say which account is
+    /// writing, and with several composers open across accounts that is the
+    /// one thing the recipient alone does not tell you. The tab strip keeps
+    /// the short title — its labels are already elided at ~14 grid units.
+    /// indexOf, not a plain emptiness test: with neither an address nor a
+    /// login configured the fallback derives a bare "@", which is worse than
+    /// saying nothing.
+    readonly property string windowTitle: Mail.accountSendAddress.indexOf("@") > 0
+        ? title + " (" + Mail.accountSendAddress + ")"
+        : title
     signal presentRequested()
     signal closeRequested()
 
@@ -1007,6 +1018,13 @@ Item {
                             event.accepted = true
                         } else if (event.key === Qt.Key_I) {
                             docHandler.italic = !docHandler.italic
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_V
+                                   && (event.modifiers & Qt.ShiftModifier)) {
+                            // Paste without formatting. Accepted either way
+                            // (an empty clipboard included) so the plain paste
+                            // never falls through to the formatted one.
+                            docHandler.pastePlainText()
                             event.accepted = true
                         }
                         // The list pair is a Shortcut below rather than a key
