@@ -33,7 +33,6 @@ Security-minded KDE-only IMAP mail client, blazing fast.
 ### Imports from Thunderbird
 - **Imported mail** — a Thunderbird directory imports as an offline account. Add servers later to promote it to a live one, archive intact.
 
-
 ## Screenshots
 <img width="1920" height="1038" alt="01-main" src="https://github.com/user-attachments/assets/9d316cd3-1aac-4912-b299-10be19a4bcb2" />
 <img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/0e3ca0fe-2c70-4315-bc28-970329edd4f0" />
