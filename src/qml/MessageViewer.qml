@@ -582,6 +582,8 @@ ColumnLayout {
                         return Kirigami.Theme.neutralTextColor
                     if (viewer.context.dkimStatus === "pass")
                         return Kirigami.Theme.neutralTextColor // valid but unaligned
+                    if (viewer.context.dkimStatus === "partial")
+                        return Kirigami.Theme.neutralTextColor // valid over part of the body
                     return Kirigami.Theme.textColor // "unverified" reads as neutral
                 }
                 opacity: viewer.context && viewer.context.dkimChecking ? 0.6 : 1
@@ -597,6 +599,12 @@ ColumnLayout {
                         // exactly what a forgery looks like.
                         return viewer.context.dkimTrusted
                             ? "✓ DKIM verified" : "⚠ DKIM signed by another domain"
+                    case "partial":
+                        // A valid signature over a stated length of the body
+                        // (l=), which leaves everything after it unsigned and
+                        // appendable by anyone who handled the message. The
+                        // tooltip gives the length.
+                        return "⚠ DKIM covers only part of this message"
                     case "fail":
                         // The only accusation this badge ever makes: we fetched
                         // the key and the signature does not match it.

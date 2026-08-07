@@ -84,13 +84,17 @@ struct DkimResult {
     QString domain;   ///< d= of the signature this result describes
     QString selector; ///< s= of that signature
     bool aligned = false;
+    /// l= cut the signature short of the whole body (RFC 6376 §3.5). Everything
+    /// past the stated length is unsigned and can be appended by anyone who
+    /// handles the message, so what verified is a prefix, not what is on screen.
+    bool bodyTruncated = false;
     QString detail; ///< short human-readable reason, for the tooltip
     /// Only filled in when it could change what the reader is told: a signature
     /// that already verifies and aligns needs no second opinion, and checking
     /// anyway would spend DNS queries to say the same thing.
     ArcResult arc;
 
-    bool trustworthy() const { return status == Pass && aligned; }
+    bool trustworthy() const { return status == Pass && aligned && !bodyTruncated; }
 };
 
 /**

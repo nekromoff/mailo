@@ -626,6 +626,17 @@ MailClient::MailClient(QObject *parent)
     if (m_refreshMinutes > 0)
         m_pollTimer.start(m_refreshMinutes * 60 * 1000);
 
+    // The open account syncs itself the moment it connects (listFolders, then
+    // the all-folders pass). Every *other* account only ever moves on a poll
+    // tick, so without this its unread counts are as old as the last session
+    // until the first interval elapses. Launch is a refresh point of its own:
+    // this runs even when the interval is disabled (refreshMinutes == 0), and
+    // it starts at once rather than on a delay. Queued rather than called
+    // directly only because the constructor has not returned yet; it is one
+    // short-lived login at a time, on connections of its own, so it does not
+    // queue behind the open account's first sync.
+    QTimer::singleShot(0, this, [this] { pollOtherAccounts(); });
+
     m_dateFormat = appSettings()
                        .value(QStringLiteral("ui/dateFormat"), QStringLiteral("yyyy-MM-dd"))
                        .toString();
@@ -1367,13 +1378,25 @@ void MailClient::importThunderbird(const QUrl &dir)
             // timestamp beats 1970 (and keeps the row out of ghost territory).
             const QDateTime fallbackDate = QFileInfo(src.filePath).lastModified();
             qint64 uid = 0;
+            // An archive's Sent mailbox is mail that was sent, so its To/Cc
+            // belong in the compose autocompletion exactly as a synced Sent
+            // folder's do — recorded per message here, at import time, rather
+            // than by a sweep over the folder afterwards.
+            static const QStringList sentNames = {
+                QStringLiteral("sent"), QStringLiteral("sent messages"),
+                QStringLiteral("sent items"), QStringLiteral("sent mail")};
+            const bool isSent =
+                sentNames.contains(src.mailBox.section(QChar(u'/'), -1).toLower());
             QList<MessageListModel::Header> headers;
             QList<MailStore::BodyWrite> bodies;
+            QList<MailStore::SentRecipient> recipients;
             auto flush = [&] {
                 MailStore::storeHeadersOn(db, scoped, headers, fts);
                 MailStore::writeBodiesOn(db, bodies);
+                MailStore::addSentRecipientsOn(db, storeKey, scoped, recipients);
                 headers.clear();
                 bodies.clear();
+                recipients.clear();
             };
             const bool completed = forEachMboxMessage(src.filePath, [&](QByteArray &&raw) {
                 if (m_importStop.loadRelaxed())
@@ -1420,6 +1443,21 @@ void MailClient::importThunderbird(const QUrl &dir)
                     w.raw = msg.encodedContent();
                 } else {
                     w.raw = raw;
+                }
+                if (isSent) {
+                    // Read before the parts are stripped above? No need: To/Cc
+                    // are headers, and stripping only touches the body.
+                    const auto note = [&](const auto *header) {
+                        if (!header)
+                            return;
+                        const auto mailboxes = header->mailboxes();
+                        for (const auto &mb : mailboxes) {
+                            recipients.append({h.uid, QString::fromLatin1(mb.address()),
+                                               mb.hasName() ? mb.name() : QString()});
+                        }
+                    };
+                    note(std::as_const(msg).to());
+                    note(std::as_const(msg).cc());
                 }
                 headers.append(h);
                 bodies.append(std::move(w));
@@ -2388,15 +2426,16 @@ void MailClient::appendScoredHeaders(QList<MessageListModel::Header> &out,
     out += batch;
 }
 
-void MailClient::harvestRecipients(const KMime::Message *msg)
+void MailClient::harvestRecipients(const KMime::Message *msg, const QString &folder,
+                                   qint64 uid)
 {
-    auto add = [this](const auto *header) {
+    auto add = [this, &folder, uid](const auto *header) {
         if (!header)
             return;
         const auto mailboxes = header->mailboxes();
         for (const auto &mb : mailboxes)
-            m_store.addRecipient(QString::fromLatin1(mb.address()),
-                                 mb.hasName() ? mb.name() : QString());
+            m_store.addSentRecipient(folder, uid, QString::fromLatin1(mb.address()),
+                                     mb.hasName() ? mb.name() : QString());
     };
     add(std::as_const(*msg).to());
     add(std::as_const(*msg).cc());
@@ -2876,8 +2915,6 @@ void MailClient::applyFolderListing(const QList<MailBackend::FolderInfo> &listed
     for (const auto &f : std::as_const(folders))
         names.append(f.mailBox);
     m_store.storeFolders(accountKey(), names);
-    // Seed the compose autocompletion from cached Sent bodies (once per account).
-    m_store.harvestSentRecipients(m_sentFolder);
     scheduleUnreadRecount(); // the tree just changed; so did which pills exist
     sweepOldSpam(); // needs junkFolderName(), which the listing just settled
     setStatus(countNoun(folders.size(), "folder", "folders"));
@@ -3593,7 +3630,7 @@ void MailClient::pollAccount(const QVariantMap &account, const std::function<voi
                 [finish](MailBackend::Error, const QString &) { finish(); });
         connect(backend, &MailBackend::connectionLost, this, finish);
         connect(backend, &MailBackend::connectedChanged, this,
-                [this, backend, key, finish](bool up) {
+                [this, backend, key, host, finish](bool up) {
             if (!up)
                 return;
             QStringList folders = m_store.cachedFolders(key);
@@ -3601,14 +3638,23 @@ void MailClient::pollAccount(const QVariantMap &account, const std::function<voi
                 // Never synced: INBOX is the one mailbox every server has.
                 folders.append(QStringLiteral("INBOX"));
             }
-            backend->folderUnreadCounts(folders, [this, key, finish](
+            backend->folderUnreadCounts(folders, [this, backend, key, host, folders, finish](
                     MailBackend::Error, const QHash<QString, int> &counts, const QString &) {
                 // Replace wholesale: a folder that has dropped to zero unread
                 // must lose its pill, which merging would never do.
                 m_unreadByAccount.insert(key, counts);
                 ++m_cachedFolderRevision;
                 Q_EMIT cachedFoldersChanged();
-                finish();
+                // The counts are the news; this is the mail behind them. The
+                // pill and the rows land in the same visit, so switching to
+                // the account shows what the badge already promised instead of
+                // having to sync it then.
+                QStringList known = folders;
+                for (auto it = counts.constBegin(); it != counts.constEnd(); ++it) {
+                    if (!known.contains(it.key()))
+                        known.append(it.key()); // a folder cached under another name
+                }
+                syncBackgroundFolders(backend, key, host, known, finish);
             });
         });
         backend->connectAccount(creds);
@@ -3660,6 +3706,128 @@ void MailClient::pollAccount(const QVariantMap &account, const std::function<voi
         connectWith(read->textData());
     });
     read->start();
+}
+
+/// \a folders with the inbox pulled to the front. Servers disagree on the
+/// spelling ("INBOX" over IMAP, "Inbox" over JMAP) and the cache holds whichever
+/// one this account reported, so match without case rather than assuming
+/// either; an account with nothing cached yet gets the IMAP spelling, which is
+/// the one mailbox every server has.
+static QStringList inboxFirst(const QStringList &folders)
+{
+    QStringList ordered;
+    ordered.reserve(folders.size() + 1);
+    for (const QString &folder : folders) {
+        if (folder.compare(QStringLiteral("INBOX"), Qt::CaseInsensitive) == 0)
+            ordered.prepend(folder);
+        else
+            ordered.append(folder);
+    }
+    if (ordered.isEmpty()
+        || ordered.constFirst().compare(QStringLiteral("INBOX"), Qt::CaseInsensitive) != 0) {
+        ordered.prepend(QStringLiteral("INBOX"));
+    }
+    return ordered;
+}
+
+void MailClient::syncBackgroundFolders(MailBackend *backend, const QString &key,
+                                       const QString &host, const QStringList &folders,
+                                       const std::function<void()> &done)
+{
+    auto queue = std::make_shared<QStringList>(inboxFirst(folders));
+    // Which folder the signals below belong to. A reply can arrive after this
+    // pass has moved on, and the folder it names is the only way to tell.
+    auto current = std::make_shared<QString>();
+    // Headers arrive as a stream of batches and are collected here rather than
+    // in SyncEngine: that engine holds the *open* account's cursors, and a
+    // background account writing into them would corrupt the folder the user
+    // is actually reading.
+    auto rows = std::make_shared<QList<MessageListModel::Header>>();
+    // A cache the server has voided (UIDVALIDITY changed) is not something a
+    // background pass can put right: clearing a folder touches attachment
+    // refcounts, the FTS rows and possibly the open list model, so it stays a
+    // foreground job. Merging fresh uids into rows that no longer mean anything
+    // would be worse than waiting, so that folder is skipped and left to the
+    // next switch to this account.
+    auto voided = std::make_shared<bool>(false);
+    const QStringList authDomains =
+        m_authVerification ? trustedAuthDomainsForHost(host) : QStringList();
+
+    connect(backend, &MailBackend::headersFetched, this,
+            [this, rows, current, authDomains](const QString &folder,
+                                               const QList<MailBackend::HeaderInfo> &infos) {
+                if (folder == *current)
+                    appendScoredHeaders(*rows, infos, authDomains);
+            });
+    connect(backend, &MailBackend::folderInvalidated, this,
+            [voided, current](const QString &folder) {
+                if (folder == *current)
+                    *voided = true;
+            });
+
+    // One step per folder, in order. Strictly sequential: the folders of a
+    // background account are worth keeping current, but not at the price of
+    // firing a mailbox's worth of requests at a server nobody is waiting on.
+    auto next = std::make_shared<std::function<void()>>();
+    *next = [this, backend, key, queue, current, rows, voided, done] {
+        if (queue->isEmpty()) {
+            done();
+            return;
+        }
+        rows->clear();
+        *voided = false;
+        *current = queue->takeFirst();
+        backend->openFolder(*current, m_store.syncStateIn(key, *current));
+    };
+
+    connect(backend, &MailBackend::folderOpened, this,
+            [this, backend, key, current, rows, voided, next](const QString &folder,
+                                                              qint64 messageCount,
+                                                              const QString &syncToken) {
+        if (folder != *current)
+            return;
+        // JMAP resumes its delta from this; the UPDATE is a no-op for a folder
+        // with nothing cached yet, which then simply pages the newest headers
+        // below instead of asking for a delta.
+        m_store.setSyncStateIn(key, folder, syncToken);
+        if (*voided || messageCount <= 0) {
+            (*next)();
+            return;
+        }
+        const qint64 maxUid = m_store.maxCachedUidIn(key, folder);
+        const int cached = m_store.cachedHeaderCountIn(key, folder);
+        const auto stored = [this, key, folder, rows, next](MailBackend::Error error,
+                                                            const QString &) {
+            if (error == MailBackend::Error::None && !rows->isEmpty()) {
+                m_store.storeHeadersIn(key, folder, *rows);
+                // Per folder rather than once at the end, so the inbox's new
+                // mail reaches the sidebar before the rest of the pass runs.
+                // The sidebar re-reads the cached tree on this; the message
+                // list of an account that is not open has nothing to update.
+                ++m_cachedFolderRevision;
+                Q_EMIT cachedFoldersChanged();
+            }
+            // A folder the server refused is one folder's loss, not the pass's:
+            // carry on rather than leaving everything behind it unsynced.
+            (*next)();
+        };
+        if (cached > 0 && maxUid > 0) {
+            // Only what arrived since — the whole point of polling cheaply.
+            // A folder that has not changed costs one open and an empty answer.
+            backend->fetchHeadersSince(folder, QString::number(maxUid), stored);
+        } else {
+            // Never synced: the newest page, same as opening it would give.
+            // Not marked background — this backend is this poll's alone, so
+            // there is no interactive work for it to queue in front of.
+            backend->fetchHeaderWindow(folder, 0, 100, /*background=*/false, stored);
+        }
+    });
+
+    // A folder that cannot even be opened reaches finish() through the
+    // errorOccurred wiring pollAccount() put on this backend, which ends the
+    // whole account's round. That is the pre-existing behaviour for a poll that
+    // hits a bad reply, and the next tick starts it over.
+    (*next)();
 }
 
 void MailClient::sweepOldSpam()
@@ -4745,7 +4913,7 @@ void MailClient::storeFetchedBody(const QString &folder, qint64 uid,
     refineAttachKind(folder, uid, msg);
     refineCrypto(folder, uid, msg);
     if (!m_sentFolder.isEmpty() && folder == m_sentFolder)
-        harvestRecipients(msg);
+        harvestRecipients(msg, folder, uid);
 }
 
 void MailClient::startDkimVerification(MessageContext *ctx)
@@ -4823,7 +4991,7 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     // A message in the Sent folder means its To/Cc were once our recipients —
     // feed them to the compose autocompletion.
     if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder)
-        harvestRecipients(msg);
+        harvestRecipients(msg, m_selectedFolder, ctx->m_uid);
     ctx->m_message = message; // keeps all parts alive
     ctx->m_raw = msg->encodedContent();
     ctx->m_decrypted.reset();

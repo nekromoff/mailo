@@ -896,15 +896,12 @@ void JmapBackend::downloadNextBody()
     QNetworkRequest request(m_session->downloadUrl(m_session->mailAccountId(), body.blobId,
                                                    QStringLiteral("message/rfc822"),
                                                    QStringLiteral("message.eml")));
-    const QByteArray authorization = m_session->authorization();
-    if (!authorization.isEmpty())
-        request.setRawHeader(QByteArrayLiteral("Authorization"), authorization);
-    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                         QVariant::fromValue(QNetworkRequest::NoLessSafeRedirectPolicy));
+    m_session->authorize(request);
     request.setTransferTimeout(kBodyTimeoutMs);
 
     ++m_bodiesInFlight;
     QNetworkReply *reply = m_net->get(request);
+    m_session->guardRedirects(reply);
     connect(reply, &QNetworkReply::finished, this, [this, reply, body] {
         reply->deleteLater();
         --m_bodiesInFlight;
@@ -1554,15 +1551,12 @@ void JmapBackend::uploadBlob(const QByteArray &raw, const QByteArray &contentTyp
         m_net = new QNetworkAccessManager(this);
 
     QNetworkRequest request(m_session->uploadUrl(m_session->mailAccountId()));
-    const QByteArray authorization = m_session->authorization();
-    if (!authorization.isEmpty())
-        request.setRawHeader(QByteArrayLiteral("Authorization"), authorization);
+    m_session->authorize(request);
     request.setHeader(QNetworkRequest::ContentTypeHeader, contentType);
-    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                         QVariant::fromValue(QNetworkRequest::NoLessSafeRedirectPolicy));
     request.setTransferTimeout(kBodyTimeoutMs);
 
     QNetworkReply *reply = m_net->post(request, raw);
+    m_session->guardRedirects(reply);
     connect(reply, &QNetworkReply::finished, this, [this, reply, done] {
         reply->deleteLater();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -2091,20 +2085,17 @@ void JmapBackend::openPushStream()
         m_net = new QNetworkAccessManager(this);
 
     QNetworkRequest request(url);
-    const QByteArray authorization = m_session->authorization();
-    if (!authorization.isEmpty())
-        request.setRawHeader(QByteArrayLiteral("Authorization"), authorization);
+    m_session->authorize(request);
     request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("text/event-stream"));
     if (!m_pushLastEventId.isEmpty())
         request.setRawHeader(QByteArrayLiteral("Last-Event-ID"), m_pushLastEventId.toUtf8());
-    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                         QVariant::fromValue(QNetworkRequest::NoLessSafeRedirectPolicy));
     // Deliberately no transfer timeout. Every other request here sets one; this
     // is the one whose whole purpose is to stay open and say nothing for
     // minutes at a time, and a timeout would tear it down on schedule.
     m_pushBuffer.clear();
 
     m_pushReply = m_net->get(request);
+    m_session->guardRedirects(m_pushReply);
     // The stream is established when the server answers 200, not when it first
     // has something to say — which may be minutes away, or a whole ping
     // interval. Waiting for data would leave pushActive() false (and the

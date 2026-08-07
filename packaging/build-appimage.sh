@@ -11,6 +11,10 @@
 #   packaging/build-appimage.sh            # release build, downloads tools if missing
 #   OUTPUT=mailo.AppImage packaging/build-appimage.sh
 #
+# The result is written to the project root as Mailo-<version>-x86_64.AppImage,
+# whatever directory the script is invoked from — the version comes from
+# project() in CMakeLists.txt via the file the configure step writes.
+#
 # The heavy lifting is done by linuxdeploy + its Qt plugin, but three things
 # need manual help because the plugin does not cover them for this app:
 #   1. QtWebEngine       — helper process, ICU data, *.pak resources, locales.
@@ -25,8 +29,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # project root
 build_dir="${BUILD_DIR:-$here/build-appimage}"
 appdir="$here/AppDir"
 tools_dir="$here/tools"
-output="${OUTPUT:-Mailo-x86_64.AppImage}"
 jobs="${JOBS:-$(nproc)}"
+# $output is settled after the configure step below, which is what writes the
+# version file the default name is built from.
 
 # linuxdeploy-plugin-qt queries qmake; the bare `qmake` wrapper may point at
 # Qt5, so force the Qt6 one unless the caller overrides it.
@@ -58,6 +63,22 @@ fetch() { # url dest
     chmod +x "$dest"
   fi
 }
+# linuxdeploy and its plugin are AppImages themselves and self-mount through
+# FUSE to run. Containers, CI images and hardened desktops routinely cannot,
+# where they fail with "Cannot mount AppImage" before doing any work — so fall
+# back to their built-in extract-and-run mode. Costs one unpack per tool; the
+# alternative is not building at all.
+#
+# /dev/fuse is checked as well as the binaries, and it is the one that actually
+# decides: a container image commonly ships fusermount while the kernel device
+# is not passed through, which looks like FUSE support right up to the mount.
+if [[ -z "${APPIMAGE_EXTRACT_AND_RUN:-}" ]] \
+   && { [[ ! -e /dev/fuse ]] \
+        || ! { command -v fusermount3 >/dev/null || command -v fusermount >/dev/null; }; }; then
+  log "No usable FUSE — running the packaging tools in extract-and-run mode"
+  export APPIMAGE_EXTRACT_AND_RUN=1
+fi
+
 base="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous"
 qtbase="https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous"
 fetch "$base/linuxdeploy-x86_64.AppImage"                 "$tools_dir/linuxdeploy"
@@ -69,6 +90,16 @@ log "Configuring (Release)"
 cmake -S "$here" -B "$build_dir" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/usr
+
+# Written by the configure step above, so the AppImage carries the same version
+# as the .deb and neither is a copy of the number kept somewhere else.
+version="$(cat "$build_dir/mailo-version.txt" 2>/dev/null || true)"
+[[ -n "$version" ]] || { echo "no version from $build_dir/mailo-version.txt" >&2; exit 1; }
+# Absolute: linuxdeploy writes into the working directory, and the artifact
+# belongs in the project root however the script was invoked. An OUTPUT that is
+# already a path is taken as given — the rooting is a default, not a rule.
+output="${OUTPUT:-Mailo-$version-x86_64.AppImage}"
+[[ "$output" == /* ]] || output="$here/$output"
 
 log "Building"
 # mailo-docs too: `install` pulls in the gzipped man page, and building only
@@ -161,6 +192,9 @@ log "Running linuxdeploy + Qt plugin"
 # QML so it can trace imports.
 export EXTRA_QT_MODULES="waylandcompositor"   # harmless if unused; helps on wayland
 export QML_SOURCES_PATHS="$here/src/qml"
+# linuxdeploy drops the AppImage in the working directory; make that the
+# project root rather than wherever the caller happened to be standing.
+cd "$here"
 "$tools_dir/linuxdeploy" \
   --appdir "$appdir" \
   --plugin qt \
@@ -168,8 +202,8 @@ export QML_SOURCES_PATHS="$here/src/qml"
   --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/org.mailo.Mailo.svg" \
   --output appimage
 
-# linuxdeploy names it from the desktop file; normalise to $output.
-produced="$(ls -t Mailo*.AppImage 2>/dev/null | head -1 || true)"
+# linuxdeploy names it from the desktop file, unversioned; normalise to $output.
+produced="$(ls -t "$here"/Mailo*.AppImage 2>/dev/null | head -1 || true)"
 if [[ -n "$produced" && "$produced" != "$output" ]]; then
   mv -f "$produced" "$output"
 fi

@@ -135,7 +135,13 @@ static QString escapeAndLinkify(const QString &text)
 
 static QByteArray preformattedPage(const QString &content, bool monospace, bool linkify = false)
 {
-    return QByteArrayLiteral("<html><head><meta charset=\"utf-8\"></head><body><pre style=\""
+    // Same CSP as the HTML view, minus the remote opt-in: these pages are built
+    // from escaped text and reference nothing, so the policy costs nothing and
+    // means the Text and Source views are not the two documents in the app
+    // running without one. Remote content is never allowed here — there is no
+    // per-message toggle behind a view whose whole content is escaped text.
+    return QByteArrayLiteral("<html><head><meta charset=\"utf-8\">") + messageCsp(false)
+        + QByteArrayLiteral("</head><body><pre style=\""
                              "white-space:pre-wrap;word-break:break-word;font-family:")
         + (monospace ? QByteArrayLiteral("monospace") : QByteArrayLiteral("sans-serif"))
         + QByteArrayLiteral(";\">")

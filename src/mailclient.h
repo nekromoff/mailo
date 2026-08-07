@@ -627,6 +627,19 @@ private:
     /// One account's check; \a done is called however it ends, so the queue
     /// keeps moving even when an account is unreachable.
     void pollAccount(const QVariantMap &account, const std::function<void()> &done);
+    /// Second half of one account's check: the mail behind the counts. Syncs
+    /// whatever is newer than the cache into every folder of a background
+    /// account, on the short-lived \a backend the poll already holds and under
+    /// the cache key \a key.
+    ///
+    /// The inbox goes first and the rest follow, one at a time on the one
+    /// connection — that ordering is the point, since the inbox is where mail
+    /// the user has not seen actually lands and it must not queue behind a
+    /// dozen archive folders. Sequential also bounds the cost: a round that
+    /// outlasts the refresh interval simply makes the next tick skip
+    /// (m_accountPollBusy) rather than piling logins on the server.
+    void syncBackgroundFolders(MailBackend *backend, const QString &key, const QString &host,
+                               const QStringList &folders, const std::function<void()> &done);
     /// Permanently removes messages older than spamRetentionDays() from the
     /// account's spam folder. Runs once per connection, on the background sync
     /// session so it never disturbs the folder being read.
@@ -763,7 +776,7 @@ private:
     void rememberRemoteContent(const QString &senderAddress, bool allow);
     /// Records the To/Cc addresses of a message from the Sent folder in the
     /// recipient-autocompletion store.
-    void harvestRecipients(const KMime::Message *msg);
+    void harvestRecipients(const KMime::Message *msg, const QString &folder, qint64 uid);
     /// Fills in the spam fields of \a h from its raw \a head. \a knownSenders is
     /// the pre-resolved allowlist for the batch (see appendScoredHeaders).
     void scoreHeader(MessageListModel::Header &h, const QByteArray &head,

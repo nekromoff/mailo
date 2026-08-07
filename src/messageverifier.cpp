@@ -300,7 +300,12 @@ void MessageVerifier::applyDkimResult(quint64 requestId, const DkimResult &resul
         ctx->m_dkimStatus = QStringLiteral("none");
         break;
     case DkimResult::Pass:
-        ctx->m_dkimStatus = QStringLiteral("pass");
+        // A signature that covered only the first l= bytes of the body is not
+        // the same claim as one that covered the message, and must not be
+        // reported with the same word — the rest of what is on screen came
+        // with no signature at all.
+        ctx->m_dkimStatus = result.bodyTruncated ? QStringLiteral("partial")
+                                                 : QStringLiteral("pass");
         break;
     case DkimResult::Fail:
         // The one case that earns an accusation: we fetched the key the

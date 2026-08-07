@@ -1,3 +1,18 @@
+mailo (2.1) unstable; urgency=medium
+
+  * Accounts other than the open one now sync their mail in the background,
+    not just their unread counts. Each refresh walks that account's folders —
+    the inbox first, the rest after — and caches everything that arrived since
+    the last visit, so switching to an account shows the mail its unread badge
+    already promised instead of fetching it then.
+  * Packaging: the .deb and the AppImage are both written to the project root,
+    named with the version, and CPack's staging directory is cleaned up after
+    itself. `cmake --build build --target packages` builds both.
+  * The AppImage build no longer requires FUSE on the build machine; where the
+    kernel device is missing the packaging tools run in extract-and-run mode.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Fri, 07 Aug 2026 12:00:00 +0200
+
 mailo (2.0) unstable; urgency=medium
 
   * JMAP support (RFC 8620/8621). An account now chooses its protocol: IMAP

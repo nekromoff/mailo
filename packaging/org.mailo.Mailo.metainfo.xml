@@ -33,6 +33,17 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.1" date="2026-08-07" type="stable">
+      <description>
+        <ul>
+          <li>Accounts other than the open one now sync their mail in the
+              background, not just their unread counts — inbox first, then the
+              rest of their folders.</li>
+          <li>Switching to an account shows the mail its unread badge already
+              promised, instead of fetching it at that point.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.0" date="2026-08-05" type="stable">
       <description>
         <ul>

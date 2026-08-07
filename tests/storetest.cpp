@@ -222,6 +222,80 @@ int main(int argc, char **argv)
     check(store.syncState(QStringLiteral("Nonexistent")).isEmpty(),
           QStringLiteral("an unknown folder has no sync state"));
 
+    out() << "sent recipients" << Qt::endl;
+
+    const QString sent = QStringLiteral("Sent");
+    const auto known = [&store](const char *needle) {
+        return store.recipientCompletions(QString::fromLatin1(needle), 8).size() == 1;
+    };
+    // Two messages to alice, one to bob — the case the whole refcount exists
+    // for: deleting one of alice's must not forget her.
+    store.addSentRecipient(sent, 1, QStringLiteral("alice@example.com"));
+    store.addSentRecipient(sent, 2, QStringLiteral("alice@example.com"));
+    store.addSentRecipient(sent, 1, QStringLiteral("bob@example.com"));
+    check(known("alice@") && known("bob@"),
+          QStringLiteral("a Sent message's recipients become completions"));
+
+    store.dropSentRecipients(sent, {1});
+    check(known("alice@"),
+          QStringLiteral("deleting one of two messages keeps the recipient"));
+    check(!known("bob@"),
+          QStringLiteral("deleting the only message holding an address forgets it"));
+
+    store.dropSentRecipients(sent, {2});
+    check(!known("alice@"),
+          QStringLiteral("deleting the last message forgets the recipient too"));
+
+    // Re-seeing the same message is not a second message: dropping the one
+    // message must still take the address with it.
+    store.addSentRecipient(sent, 3, QStringLiteral("dana@example.com"));
+    store.addSentRecipient(sent, 3, QStringLiteral("dana@example.com"));
+    store.dropSentRecipients(sent, {3});
+    check(!known("dana@"),
+          QStringLiteral("re-reading one message does not count as a second"));
+
+    // An address that never came from a message (typed into compose, or
+    // allowlisted out of spam) is not the delete path's business at all.
+    store.addRecipient(QStringLiteral("erin@example.com"));
+    store.dropSentRecipients(sent, {4, 5, 6});
+    check(known("erin@"),
+          QStringLiteral("an address no message ever held survives a delete"));
+
+    // Invalidation is not deletion: the folder cache is about to be re-synced.
+    store.addSentRecipient(sent, 7, QStringLiteral("frank@example.com"));
+    store.forgetRecipientRefs(sent);
+    check(known("frank@"),
+          QStringLiteral("invalidating the folder cache keeps its recipients"));
+
+    out() << "another account's rows" << Qt::endl;
+
+    // What the background account poll writes through: the scope stays on the
+    // open account throughout, and the other account's mail must land under its
+    // own key rather than in the folder the user is looking at.
+    const QString other = QStringLiteral("tester@other.example");
+    const QString otherInbox = QStringLiteral("INBOX");
+    store.storeFolders(other, {otherInbox});
+    const int before = store.cachedHeaderCount(folder);
+    store.storeHeadersIn(other, otherInbox,
+                         {makeHeader(9001, QStringLiteral("polled"),
+                                     QStringLiteral("9001"))});
+    check(store.accountKey() == account,
+          QStringLiteral("writing another account's rows does not move the scope"));
+    check(store.cachedHeaderCount(folder) == before,
+          QStringLiteral("another account's headers do not land in the open one"));
+    check(store.cachedHeaderCountIn(other, otherInbox) == 1,
+          QStringLiteral("they land under their own account key"));
+    check(store.maxCachedUidIn(other, otherInbox) == 9001,
+          QStringLiteral("the resume point is read per account, not per folder name"));
+    check(store.maxCachedUid(folder) != 9001,
+          QStringLiteral("the open account's resume point is untouched by the poll"));
+
+    store.setSyncStateIn(other, otherInbox, QStringLiteral("state-42"));
+    check(store.syncStateIn(other, otherInbox) == QLatin1String("state-42"),
+          QStringLiteral("a background folder's sync token round-trips"));
+    check(store.syncState(folder) != QLatin1String("state-42"),
+          QStringLiteral("and does not overwrite the open account's"));
+
     if (failures) {
         out() << failures << " check(s) failed" << Qt::endl;
         return 1;

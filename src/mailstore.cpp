@@ -170,6 +170,23 @@ bool MailStore::open()
                           " use_count INTEGER DEFAULT 0,"
                           " PRIMARY KEY(account, address))"));
 
+    // Which Sent messages each of those addresses came from. This is what
+    // makes a recipient removable: deleting one message the address appears in
+    // must not forget the address, deleting the last one must. use_count alone
+    // could never answer that — it counts sightings, not messages, so nothing
+    // could tell a second sighting of one message from a second message.
+    // A recipient with no rows here (typed into compose, allowlisted out of
+    // spam) is not message-derived and is never pruned.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS recipient_refs ("
+                          " account TEXT NOT NULL, folder TEXT NOT NULL,"
+                          " uid INTEGER NOT NULL, address TEXT NOT NULL,"
+                          " PRIMARY KEY(folder, uid, address))"));
+    // The primary key answers "which addresses does this message hold"; this
+    // index answers the opposite question, "is any message left holding this
+    // address", which is the one the prune asks per removed address.
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_recipient_refs_addr"
+                          " ON recipient_refs(account, address)"));
+
     // Schema upgrades for pre-existing databases; fail silently if present.
     q.exec(QStringLiteral("ALTER TABLE folders ADD COLUMN uidvalidity INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN suspicious INTEGER DEFAULT 0"));
@@ -380,9 +397,14 @@ void MailStore::setAccountKey(const QString &key)
 
 QString MailStore::scoped(const QString &folder) const
 {
-    if (m_accountKey.isEmpty())
+    return scopedIn(m_accountKey, folder);
+}
+
+QString MailStore::scopedIn(const QString &account, const QString &folder)
+{
+    if (account.isEmpty())
         return folder;
-    return m_accountKey + QChar(0x1f) + folder;
+    return account + QChar(0x1f) + folder;
 }
 
 void MailStore::adoptLegacyCache(const QString &account)
@@ -552,31 +574,47 @@ QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder,
 
 int MailStore::cachedHeaderCount(const QString &folder)
 {
+    return cachedHeaderCountIn(m_accountKey, folder);
+}
+
+int MailStore::cachedHeaderCountIn(const QString &account, const QString &folder)
+{
     if (!m_db.isOpen())
         return 0;
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT COUNT(*) FROM messages WHERE folder = ?"));
-    q.addBindValue(scoped(folder));
+    q.addBindValue(scopedIn(account, folder));
     return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
 }
 
 qint64 MailStore::maxCachedUid(const QString &folder)
 {
+    return maxCachedUidIn(m_accountKey, folder);
+}
+
+qint64 MailStore::maxCachedUidIn(const QString &account, const QString &folder)
+{
     if (!m_db.isOpen())
         return 0;
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT MAX(uid) FROM messages WHERE folder = ?"));
-    q.addBindValue(scoped(folder));
+    q.addBindValue(scopedIn(account, folder));
     return (q.exec() && q.next()) ? q.value(0).toLongLong() : 0;
 }
 
 void MailStore::storeHeaders(const QString &folder,
                              const QList<MessageListModel::Header> &headers)
 {
+    storeHeadersIn(m_accountKey, folder, headers);
+}
+
+void MailStore::storeHeadersIn(const QString &account, const QString &folder,
+                               const QList<MessageListModel::Header> &headers)
+{
     if (!m_db.isOpen())
         return;
     SlowGuard guard("storeHeaders");
-    storeHeadersOn(m_db, scoped(folder), headers, m_ftsAvailable);
+    storeHeadersOn(m_db, scopedIn(account, folder), headers, m_ftsAvailable);
 }
 
 void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
@@ -1276,9 +1314,15 @@ QList<MailStore::PendingBody> MailStore::pendingBodyIndex(int limit)
     if (!m_db.isOpen() || !m_ftsAvailable)
         return out;
     QSqlQuery q(m_db);
+    // CROSS JOIN, not JOIN: it is the one way to pin the join order. A plain
+    // JOIN lets SQLite drive from `bodies` and probe fts_pending per row, and
+    // it does — which with an empty queue means scanning every row of a
+    // quarter-million-row table to return nothing, on the GUI thread, on every
+    // tick of a 300 ms timer. Driving from fts_pending costs exactly as many
+    // primary-key lookups as there are queued rows (none, when there are none).
     q.prepare(QStringLiteral(
         "SELECT b.folder, b.uid, b.raw FROM fts_pending p"
-        " JOIN bodies b ON b.folder = p.folder AND b.uid = p.uid LIMIT ?"));
+        " CROSS JOIN bodies b ON b.folder = p.folder AND b.uid = p.uid LIMIT ?"));
     q.addBindValue(limit);
     if (q.exec()) {
         while (q.next()) {
@@ -1377,6 +1421,10 @@ void MailStore::removeMessages(const QString &folder, const QList<qint64> &uids)
     // Give back the attachment references first: once the part rows are gone
     // the payloads on disk would have no way of ever being freed.
     releaseParts(scoped(folder), uids);
+    // Same shape of bookkeeping for the compose autocompletion: an address is
+    // only forgotten once no Sent message holds it any more. A no-op for every
+    // folder but Sent, which is the only one with refs.
+    dropSentRecipients(folder, uids);
     // fts first (rowid-keyed via messages, which must still exist), then the
     // regular tables.
     if (m_ftsAvailable) {
@@ -1430,6 +1478,11 @@ void MailStore::setUidValidity(const QString &folder, qint64 validity)
 
 QString MailStore::syncState(const QString &folder)
 {
+    return syncStateIn(m_accountKey, folder);
+}
+
+QString MailStore::syncStateIn(const QString &account, const QString &folder)
+{
     if (!m_db.isOpen())
         return {};
     QSqlQuery q(m_db);
@@ -1441,12 +1494,18 @@ QString MailStore::syncState(const QString &folder)
     q.prepare(QStringLiteral(
         "SELECT IFNULL(NULLIF(sync_state, ''), NULLIF(CAST(uidvalidity AS TEXT), '0'))"
         " FROM account_folders WHERE account = ? AND mailbox = ?"));
-    q.addBindValue(m_accountKey);
+    q.addBindValue(account);
     q.addBindValue(folder);
     return (q.exec() && q.next()) ? q.value(0).toString() : QString();
 }
 
 void MailStore::setSyncState(const QString &folder, const QString &state)
+{
+    setSyncStateIn(m_accountKey, folder, state);
+}
+
+void MailStore::setSyncStateIn(const QString &account, const QString &folder,
+                               const QString &state)
 {
     if (!m_db.isOpen())
         return;
@@ -1454,7 +1513,7 @@ void MailStore::setSyncState(const QString &folder, const QString &state)
     q.prepare(QStringLiteral(
         "UPDATE account_folders SET sync_state = ? WHERE account = ? AND mailbox = ?"));
     q.addBindValue(state);
-    q.addBindValue(m_accountKey);
+    q.addBindValue(account);
     q.addBindValue(folder);
     q.exec();
 }
@@ -1479,6 +1538,10 @@ void MailStore::clearFolder(const QString &folder)
         }
         releaseParts(scoped(folder), uids);
     }
+    // The refs, but not the recipients: this is the cache being thrown away
+    // and re-synced, not mail being deleted. Nobody stopped being someone the
+    // user wrote to because the server reset its UIDVALIDITY.
+    forgetRecipientRefs(folder);
     // fts first: its rows are found via messages rowids, so the messages
     // rows must still be there.
     if (m_ftsAvailable) {
@@ -1666,6 +1729,14 @@ int MailStore::purgeChunkOn(QSqlDatabase &db, const QString &key, int limit)
     // fts may be absent on a build without FTS5; the DELETE then simply fails.
     q.exec(QStringLiteral("DELETE FROM fts WHERE rowid IN (%1)").arg(rowIn));
     q.prepare(QStringLiteral("DELETE FROM fts_pending WHERE folder = ? AND uid IN (%1)")
+                  .arg(uidIn));
+    q.addBindValue(key);
+    q.exec();
+    // The refs go with the rows they point at, but no recipient is pruned
+    // here: this is cache eviction, not deletion. Nobody threw the mail away,
+    // mailo just stopped keeping a copy of it, and forgetting who it was
+    // addressed to is not part of that bargain.
+    q.prepare(QStringLiteral("DELETE FROM recipient_refs WHERE folder = ? AND uid IN (%1)")
                   .arg(uidIn));
     q.addBindValue(key);
     q.exec();
@@ -1892,6 +1963,131 @@ void MailStore::addRecipient(const QString &address, const QString &name)
     q.exec();
 }
 
+void MailStore::addSentRecipient(const QString &folder, qint64 uid, const QString &address,
+                                 const QString &name)
+{
+    if (!m_db.isOpen() || m_accountKey.isEmpty() || uid < 0
+        || !address.contains(QLatin1Char('@')))
+        return;
+    QSqlQuery ref(m_db);
+    ref.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO recipient_refs (account, folder, uid, address)"
+        " VALUES (?, ?, ?, ?)"));
+    ref.addBindValue(m_accountKey);
+    ref.addBindValue(scoped(folder));
+    ref.addBindValue(uid);
+    ref.addBindValue(address.trimmed().toLower());
+    if (!ref.exec() || ref.numRowsAffected() <= 0)
+        return; // this message was already counted — opening it again is not
+                // a second use, and treating it as one is what made use_count
+                // drift away from anything a delete could undo.
+    addRecipient(address, name);
+}
+
+void MailStore::dropSentRecipients(const QString &folder, const QList<qint64> &uids)
+{
+    if (!m_db.isOpen() || uids.isEmpty())
+        return;
+    QStringList uidList;
+    uidList.reserve(uids.size());
+    for (qint64 u : uids)
+        uidList << QString::number(u);
+    dropRecipientRefs(QStringLiteral("folder = ? AND uid IN (%1)").arg(uidList.join(
+                          QLatin1Char(','))),
+                      scoped(folder));
+}
+
+void MailStore::forgetRecipientRefs(const QString &folder)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM recipient_refs WHERE folder = ?"));
+    q.addBindValue(scoped(folder));
+    q.exec();
+}
+
+void MailStore::dropRecipientRefs(const QString &where, const QString &scopedFolder)
+{
+    // Which addresses are at stake has to be read before the refs go — the
+    // whole question afterwards is whether any *other* message still holds
+    // them, and the answer changes as soon as these rows are deleted.
+    QStringList addresses;
+    {
+        QSqlQuery pick(m_db);
+        pick.prepare(QStringLiteral("SELECT DISTINCT address FROM recipient_refs WHERE ")
+                     + where);
+        pick.addBindValue(scopedFolder);
+        if (pick.exec()) {
+            while (pick.next())
+                addresses.append(pick.value(0).toString());
+        }
+    }
+    if (addresses.isEmpty())
+        return;
+
+    QSqlQuery del(m_db);
+    del.prepare(QStringLiteral("DELETE FROM recipient_refs WHERE ") + where);
+    del.addBindValue(scopedFolder);
+    del.exec();
+
+    // Only addresses that just lost a ref are considered, so an address that
+    // never had one (typed into compose, allowlisted out of spam) cannot be
+    // reached by this at all.
+    QSqlQuery prune(m_db);
+    prune.prepare(QStringLiteral(
+        "DELETE FROM recipients WHERE account = ? AND address = ?"
+        " AND NOT EXISTS (SELECT 1 FROM recipient_refs"
+        "                 WHERE account = ? AND address = ?)"));
+    for (const QString &address : std::as_const(addresses)) {
+        prune.addBindValue(m_accountKey);
+        prune.addBindValue(address);
+        prune.addBindValue(m_accountKey);
+        prune.addBindValue(address);
+        prune.exec();
+    }
+}
+
+void MailStore::addSentRecipientsOn(QSqlDatabase &db, const QString &account,
+                                    const QString &scopedFolder,
+                                    const QList<SentRecipient> &batch)
+{
+    if (!db.isOpen() || batch.isEmpty())
+        return;
+    db.transaction();
+    QSqlQuery ref(db);
+    ref.prepare(QStringLiteral(
+        "INSERT OR IGNORE INTO recipient_refs (account, folder, uid, address)"
+        " VALUES (?, ?, ?, ?)"));
+    QSqlQuery rcpt(db);
+    rcpt.prepare(QStringLiteral(
+        "INSERT INTO recipients (account, address, addr_norm, name, last_used, use_count)"
+        " VALUES (?, ?, ?, ?, ?, 1)"
+        " ON CONFLICT(account, address) DO UPDATE SET"
+        "  use_count = use_count + 1, last_used = excluded.last_used,"
+        "  addr_norm = excluded.addr_norm,"
+        "  name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END"));
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    for (const SentRecipient &r : batch) {
+        const QString address = r.address.trimmed().toLower();
+        if (!address.contains(QLatin1Char('@')))
+            continue;
+        ref.addBindValue(account);
+        ref.addBindValue(scopedFolder);
+        ref.addBindValue(r.uid);
+        ref.addBindValue(address);
+        if (!ref.exec() || ref.numRowsAffected() <= 0)
+            continue;
+        rcpt.addBindValue(account);
+        rcpt.addBindValue(address);
+        rcpt.addBindValue(SpamHeuristics::normalizeAddress(address));
+        rcpt.addBindValue(r.name.trimmed());
+        rcpt.addBindValue(now);
+        rcpt.exec();
+    }
+    db.commit();
+}
+
 bool MailStore::isKnownCorrespondent(const QString &address)
 {
     if (!m_db.isOpen())
@@ -1972,54 +2168,6 @@ QStringList MailStore::recipientCompletions(const QString &prefix, int limit)
             out.append(q.value(0).toString());
     }
     return out;
-}
-
-void MailStore::harvestSentRecipients(const QString &sentFolder)
-{
-    if (!m_db.isOpen() || m_accountKey.isEmpty() || sentFolder.isEmpty())
-        return;
-    const QString flag = QStringLiteral("recipient_harvest\x1f") + m_accountKey;
-    QSqlQuery q(m_db);
-    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS meta_flags (flag TEXT PRIMARY KEY)"));
-    q.prepare(QStringLiteral("SELECT 1 FROM meta_flags WHERE flag = ?"));
-    q.addBindValue(flag);
-    if (q.exec() && q.next())
-        return;
-
-    // Pull To/Cc addresses out of the raw heads with a plain regex — good
-    // enough for seeding, and avoids a full MIME parse per cached body.
-    static const QRegularExpression addrRe(
-        QStringLiteral("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"));
-    QSqlQuery bodies(m_db);
-    bodies.prepare(QStringLiteral("SELECT raw FROM bodies WHERE folder = ?"));
-    bodies.addBindValue(scoped(sentFolder));
-    m_db.transaction();
-    if (bodies.exec()) {
-        while (bodies.next()) {
-            const QByteArray raw = bodies.value(0).toByteArray();
-            int headEnd = raw.indexOf("\r\n\r\n");
-            if (headEnd < 0)
-                headEnd = raw.indexOf("\n\n");
-            QString head = QString::fromUtf8(headEnd > 0 ? raw.left(headEnd) : raw);
-            // Unfold, then keep only the To/Cc header lines.
-            head.replace(QRegularExpression(QStringLiteral("\r?\n[ \t]+")),
-                         QStringLiteral(" "));
-            const QStringList lines =
-                head.split(QRegularExpression(QStringLiteral("\r?\n")));
-            for (const QString &line : lines) {
-                if (!line.startsWith(QLatin1String("To:"), Qt::CaseInsensitive)
-                    && !line.startsWith(QLatin1String("Cc:"), Qt::CaseInsensitive))
-                    continue;
-                auto it = addrRe.globalMatch(line);
-                while (it.hasNext())
-                    addRecipient(it.next().captured(0));
-            }
-        }
-    }
-    q.prepare(QStringLiteral("INSERT OR IGNORE INTO meta_flags (flag) VALUES (?)"));
-    q.addBindValue(flag);
-    q.exec();
-    m_db.commit();
 }
 
 QList<MessageListModel::Header> MailStore::search(const QString &folder,

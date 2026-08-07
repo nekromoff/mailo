@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailo VERSION 2.0 LANGUAGES CXX)
+project(mailo VERSION 2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -215,7 +215,8 @@ install(FILES packaging/copyright
               ${CMAKE_CURRENT_BINARY_DIR}/changelog.gz
         DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/mailo)
 
-# Debian packaging: `cmake --build build && (cd build && cpack -G DEB)`.
+# Debian packaging: `cmake --build build --target package-deb`, which leaves
+# mailo_<version>_<arch>.deb in the project root (see the target below).
 # Shared-library Depends are computed by dpkg-shlibdeps; the extra Depends
 # below are runtime-only QML/data packages the linker can't see (QML modules
 # are loaded by name, the org.kde.desktop style is forced in main.cpp, and
@@ -235,7 +236,16 @@ Licensed under the LGPL-3.0-or-later; see /usr/share/doc/mailo/copyright.")
 set(CPACK_STRIP_FILES ON)
 set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
 set(CPACK_DEBIAN_PACKAGE_SECTION mail)
-set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+# Spelled out rather than DEB-DEFAULT, which produces this exact name but never
+# tells us what it was — and package-deb below has to know which file to move.
+execute_process(COMMAND dpkg --print-architecture
+                OUTPUT_VARIABLE MAILO_DEB_ARCH
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+if(NOT MAILO_DEB_ARCH)
+    set(MAILO_DEB_ARCH amd64)
+endif()
+set(CPACK_DEBIAN_FILE_NAME "mailo_${PROJECT_VERSION}_${MAILO_DEB_ARCH}.deb")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
 qml6-module-org-kde-kirigami, \
@@ -252,6 +262,50 @@ qml6-module-qtwebengine")
 # is named rather than left to gnupg's own dependencies.
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "gnupg, gpg-agent")
 include(CPack)
+
+# The version, for anything outside CMake that needs it — packaging/build-appimage.sh
+# names the AppImage from this rather than parsing project() out of this file.
+file(WRITE "${CMAKE_BINARY_DIR}/mailo-version.txt" "${PROJECT_VERSION}\n")
+
+# Every release artifact lands in the project root, named with its version, so
+# builds are never hunted for inside a build tree:
+#
+#   cmake --build build --target package-deb   → mailo_<version>_<arch>.deb
+#   cmake --build build --target packages      → both, via build-appimage.sh
+#
+# Named "packages", not "package": include(CPack) above already defines that
+# one, and it is the plain cpack run these targets wrap.
+#
+# CPack is run here rather than by hand because it also leaves _CPack_Packages
+# behind — a staging tree it repopulates from scratch every run, worth nothing
+# once the .deb exists. Removing it before and after keeps a stale layout from
+# a previous version out of the package and the build tree tidy afterwards.
+set(MAILO_CPACK_SCRATCH "${CMAKE_BINARY_DIR}/_CPack_Packages")
+add_custom_target(package-deb
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILO_CPACK_SCRATCH}"
+    COMMAND ${CMAKE_CPACK_COMMAND} --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
+    COMMAND ${CMAKE_COMMAND} -E rename
+            "${CMAKE_BINARY_DIR}/${CPACK_DEBIAN_FILE_NAME}"
+            "${CMAKE_SOURCE_DIR}/${CPACK_DEBIAN_FILE_NAME}"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILO_CPACK_SCRATCH}"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Packaging ${CPACK_DEBIAN_FILE_NAME} into the project root"
+    VERBATIM)
+add_dependencies(package-deb mailo mailo-docs)
+
+# The AppImage has its own build tree (build-appimage/, a Release configure of
+# its own) because it bundles Qt and must not inherit this one's flags. The
+# script is the whole recipe; this target only makes it reachable the same way.
+add_custom_target(package-appimage
+    COMMAND ${CMAKE_COMMAND} -E env
+            "${CMAKE_SOURCE_DIR}/packaging/build-appimage.sh"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building the AppImage into the project root"
+    USES_TERMINAL
+    VERBATIM)
+
+add_custom_target(packages)
+add_dependencies(packages package-deb package-appimage)
 
 qt_add_executable(attachmenttest tests/attachmenttest.cpp
     src/attachmentstore.cpp src/attachmentstore.h)
@@ -321,6 +375,7 @@ target_link_libraries(storetest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql
 # right boundary. Exit 0 = every check passed.
 qt_add_executable(jmapsessiontest tests/jmapsessiontest.cpp
     src/jmapsession.cpp src/jmapsession.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
     src/mailbackend.h)
 target_include_directories(jmapsessiontest PRIVATE src)
 target_compile_definitions(jmapsessiontest PRIVATE
@@ -333,6 +388,7 @@ target_link_libraries(jmapsessiontest PRIVATE Qt6::Core Qt6::Network)
 qt_add_executable(jmaprequesttest tests/jmaprequesttest.cpp
     src/jmaprequest.cpp src/jmaprequest.h
     src/jmapsession.cpp src/jmapsession.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
     src/mailbackend.h)
 target_include_directories(jmaprequesttest PRIVATE src)
 target_compile_definitions(jmaprequesttest PRIVATE
@@ -346,6 +402,7 @@ qt_add_executable(jmapbackendtest tests/jmapbackendtest.cpp
     src/jmapbackend.cpp src/jmapbackend.h
     src/jmaprequest.cpp src/jmaprequest.h
     src/jmapsession.cpp src/jmapsession.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
     src/mailbackend.h)
 target_include_directories(jmapbackendtest PRIVATE src)
 target_compile_definitions(jmapbackendtest PRIVATE

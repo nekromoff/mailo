@@ -418,6 +418,24 @@ bool DkimVerifier::prepare(const QByteArray &head, const QByteArray &body, const
     QList<Field> fields = splitFields(head);
     QByteArray data;
     const QByteArrayList wanted = tagValue(sig.tags, "h").split(':');
+    // From MUST be among them (RFC 6376 §5.4), and a verifier that does not
+    // insist is not verifying the thing the reader is being shown. A signature
+    // that leaves From out says only that *some* header set was signed by the
+    // d= domain: anyone holding such a message can rewrite From to any address
+    // at that domain and still show an aligned, valid signature.
+    bool signsFrom = false;
+    for (const QByteArray &rawName : wanted) {
+        if (rawName.trimmed().toLower() == "from") {
+            signsFrom = true;
+            break;
+        }
+    }
+    if (!signsFrom) {
+        out->status = DkimResult::PermError;
+        out->detail = QObject::tr("the signature does not cover the From header, so it says "
+                                  "nothing about who sent this");
+        return false;
+    }
     for (const QByteArray &rawName : wanted) {
         const QByteArray name = rawName.trimmed().toLower();
         if (name.isEmpty())
@@ -445,9 +463,14 @@ bool DkimVerifier::prepare(const QByteArray &head, const QByteArray &body, const
     data += sigCanon;
 
     *signedData = data;
-    if (truncated)
+    if (truncated) {
+        // Recorded, not just described: trustworthy() has to know, or a
+        // message with unsigned text appended below the signed prefix reads as
+        // verified — which is exactly what l= is abused for.
+        out->bodyTruncated = true;
         out->detail = QObject::tr("only the first %1 bytes of the body are signed")
                           .arg(QString::fromLatin1(lengthTag));
+    }
     return true;
 }
 

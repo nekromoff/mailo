@@ -113,15 +113,12 @@ void JmapRequest::post(bool isRetry)
     request.setHeader(QNetworkRequest::ContentTypeHeader,
                       QStringLiteral("application/json; charset=utf-8"));
     request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
-    const QByteArray authorization = m_session->authorization();
-    if (!authorization.isEmpty())
-        request.setRawHeader(QByteArrayLiteral("Authorization"), authorization);
-    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
-                         QVariant::fromValue(QNetworkRequest::NoLessSafeRedirectPolicy));
+    m_session->authorize(request);
     request.setTransferTimeout(kRequestTimeoutMs);
 
     const QByteArray body = QJsonDocument(requestObject()).toJson(QJsonDocument::Compact);
     m_reply = m_net->post(request, body);
+    m_session->guardRedirects(m_reply);
     connect(m_reply, &QNetworkReply::finished, this, [this, isRetry] {
         QNetworkReply *reply = m_reply;
         if (!reply)

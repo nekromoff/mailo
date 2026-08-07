@@ -145,7 +145,7 @@ static const char *kDanglingPrimarySession = R"json({
     }
   },
   "primaryAccounts": { "urn:ietf:params:jmap:mail": "vanished-account" },
-  "apiUrl": "https://example.net/jmap/"
+  "apiUrl": "https://example.com/jmap/"
 })json";
 
 /// Authenticated, but to something that is not mail — a calendar-only server.
@@ -159,7 +159,7 @@ static const char *kNoMailSession = R"json({
     }
   },
   "primaryAccounts": {},
-  "apiUrl": "https://example.net/jmap/"
+  "apiUrl": "https://example.com/jmap/"
 })json";
 
 /// Reads \a path, or returns an empty array and counts a failure.
@@ -433,6 +433,47 @@ int main(int argc, char *argv[])
         error.clear();
         check(!session.ingest(QByteArray(), hostedFrom, &error),
               QStringLiteral("an empty body is rejected"));
+    }
+
+    // Every request to these endpoints carries the account's password or access
+    // token, so a session object that names a host with no relation to the one
+    // it came from is a session object trying to collect credentials.
+    out() << "endpoints that point somewhere else" << Qt::endl;
+    {
+        const auto sessionNaming = [](const char *key, const char *url) {
+            return QByteArray("{ \"capabilities\": { \"urn:ietf:params:jmap:mail\": {} },"
+                              " \"accounts\": { \"a1\": { \"name\": \"a\","
+                              "   \"accountCapabilities\": {"
+                              "     \"urn:ietf:params:jmap:mail\": {} } } },"
+                              " \"primaryAccounts\": {"
+                              "   \"urn:ietf:params:jmap:mail\": \"a1\" },"
+                              " \"apiUrl\": \"https://example.com/jmap/\", \"")
+                + key + "\": \"" + url + "\" }";
+        };
+        JmapSession session;
+        QString error;
+        for (const char *key : {"apiUrl", "downloadUrl", "uploadUrl", "eventSourceUrl"}) {
+            error.clear();
+            check(!session.ingest(sessionNaming(key, "https://evil.example/x"), hostedFrom,
+                                  &error),
+                  QStringLiteral("%1 on an unrelated host is refused").arg(
+                      QString::fromLatin1(key)));
+            check(error.contains(QLatin1String("evil.example")),
+                  QStringLiteral("the refusal names the host"));
+        }
+
+        // A sibling host under the same registrable domain is how hosted
+        // providers are actually deployed, and stays allowed.
+        error.clear();
+        check(session.ingest(sessionNaming("downloadUrl", "https://api.example.com/dl/"),
+                             hostedFrom, &error),
+              QStringLiteral("a sibling host under the same domain is allowed"));
+
+        // An https session may not be talked out of its scheme.
+        error.clear();
+        check(!session.ingest(sessionNaming("downloadUrl", "http://example.com/dl/"),
+                              hostedFrom, &error),
+              QStringLiteral("the same host over plain http is refused"));
     }
 
     out() << "a failed refresh leaves the working session alone" << Qt::endl;

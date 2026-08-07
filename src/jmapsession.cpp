@@ -3,6 +3,8 @@
 
 #include "jmapsession.h"
 
+#include "publicsuffixlist.h"
+
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -46,6 +48,56 @@ QUrl sessionUrl(const QJsonObject &obj, const char *key, const QUrl &base)
     return parsed.isRelative() ? base.resolved(parsed) : parsed;
 }
 
+/// Same scheme, same host, same effective port. Ports are compared resolved
+/// rather than as written, so ":443" and an omitted port are one origin.
+bool sameOrigin(const QUrl &a, const QUrl &b)
+{
+    if (a.scheme().compare(b.scheme(), Qt::CaseInsensitive) != 0)
+        return false;
+    if (a.host().compare(b.host(), Qt::CaseInsensitive) != 0 || a.host().isEmpty())
+        return false;
+    const int defaultPort = a.scheme().compare(QLatin1String("http"), Qt::CaseInsensitive) == 0
+        ? 80
+        : 443;
+    return a.port(defaultPort) == b.port(defaultPort);
+}
+
+/// Same site: the same origin, or two hosts under one registrable domain.
+///
+/// Same-origin alone would be the tighter rule, and it is the wrong one here:
+/// RFC 8620 §2 lets a session object name absolute URLs, and a hosted provider
+/// legitimately answers `example.com/.well-known/jmap` with endpoints on
+/// `api.example.com`. What must not be allowed is an endpoint on a domain the
+/// account has nothing to do with, because the credential goes with it.
+///
+/// The registrable domain comes from the Public Suffix List, so when that has
+/// not loaded yet this falls back to exact or parent/child matching — stricter,
+/// never looser, which is the safe way to be wrong. The scheme must match
+/// either way: an https session may not send its credential over http.
+bool sameSite(const QUrl &a, const QUrl &b)
+{
+    if (sameOrigin(a, b))
+        return true;
+    if (a.scheme().compare(b.scheme(), Qt::CaseInsensitive) != 0)
+        return false;
+    const QString ha = a.host().toLower();
+    const QString hb = b.host().toLower();
+    if (ha.isEmpty() || hb.isEmpty())
+        return false;
+    if (ha == hb)
+        return true;
+
+    const PublicSuffixList &psl = PublicSuffixList::instance();
+    if (psl.isLoaded()) {
+        const QString orgA = psl.organizationalDomain(ha);
+        const QString orgB = psl.organizationalDomain(hb);
+        // Empty means the host is itself a public suffix; "somewhere under
+        // .co.uk" is not a relationship worth trusting a credential to.
+        return !orgA.isEmpty() && orgA == orgB;
+    }
+    return ha.endsWith(QLatin1Char('.') + hb) || hb.endsWith(QLatin1Char('.') + ha);
+}
+
 /// JSON numbers arrive as doubles; the limits are byte counts and object
 /// counts that a double represents exactly at any size a server will state.
 qint64 limitValue(const QJsonObject &obj, const char *key)
@@ -77,9 +129,41 @@ JmapSession::JmapSession(QObject *parent)
 
 JmapSession::~JmapSession() = default;
 
+void JmapSession::authorize(QNetworkRequest &request) const
+{
+    if (!m_authorization.isEmpty())
+        request.setRawHeader(QByteArrayLiteral("Authorization"), m_authorization);
+    // Not NoLessSafeRedirectPolicy: that one only refuses the https-to-http
+    // downgrade and follows everything else, raw headers and all. Verified
+    // means Qt stops and asks — guardRedirects() is what answers.
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                         QVariant::fromValue(QNetworkRequest::UserVerifiedRedirectPolicy));
+}
+
+void JmapSession::guardRedirects(QNetworkReply *reply) const
+{
+    if (!reply)
+        return;
+    const QUrl origin = m_origin;
+    connect(reply, &QNetworkReply::redirected, reply, [reply, origin](const QUrl &target) {
+        if (sameSite(target, origin)) {
+            Q_EMIT reply->redirectAllowed();
+            return;
+        }
+        // Aborting rather than following without the header: a request the
+        // server answers with somebody else's URL is not one whose answer can
+        // be trusted either, and the caller's error path already knows what to
+        // do with a connection that ended early.
+        qWarning() << "mailo: refusing JMAP redirect off-origin:" << target.host()
+                   << "is not" << origin.host();
+        reply->abort();
+    });
+}
+
 void JmapSession::clear()
 {
     m_valid = false;
+    m_origin.clear();
     m_apiUrl.clear();
     m_downloadUrl.clear();
     m_uploadUrl.clear();
@@ -157,7 +241,10 @@ void JmapSession::discover(const MailBackend::Credentials &credentials)
     if (!m_authorization.isEmpty())
         request.setRawHeader(QByteArrayLiteral("Authorization"), m_authorization);
     // RFC 8620 §2.2: /.well-known/jmap may redirect to where the session
-    // object actually lives. Qt's default policy follows that, but not from
+    // object actually lives — including onto another host, which is how hosted
+    // providers autodiscover. So this one request follows redirects across
+    // origins, and the URL it ends on becomes the origin every later request is
+    // pinned to (see ingest()). Qt's default policy follows that, but not from
     // https down to http, which would leak the credential above.
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QVariant::fromValue(QNetworkRequest::NoLessSafeRedirectPolicy));
@@ -258,7 +345,32 @@ bool JmapSession::ingest(const QByteArray &json, const QUrl &from, QString *erro
 
     // Parsed into locals throughout: a refresh that turns out to be nonsense
     // must leave the session that is already working untouched.
-    const QUrl apiUrl = sessionUrl(root, "apiUrl", from);
+    // Every endpoint here is a URL the *server* chose, and every request to one
+    // carries the account's password or access token. An absolute URL naming
+    // another host would therefore hand the credential to that host, so the
+    // session may only point at the origin it was itself served from — which,
+    // after any .well-known redirect, is `from`. Relative URLs (what RFC 8620
+    // §2 expects, and what Cyrus emits) resolve to it by definition and always
+    // pass. `wrongOrigin` is empty for a URL that may be used.
+    QString wrongOrigin;
+    const auto endpoint = [&](const char *key) {
+        const QUrl url = sessionUrl(root, key, from);
+        if (!url.isEmpty() && !sameSite(url, from) && wrongOrigin.isEmpty()) {
+            wrongOrigin =
+                tr("The JMAP session object points %1 at %2, which belongs to neither the "
+                   "server it came from nor that server's domain. Refusing to send this "
+                   "account's credentials there.")
+                    .arg(QString::fromLatin1(key), url.host());
+            return QUrl();
+        }
+        return url;
+    };
+    const QUrl apiUrl = endpoint("apiUrl");
+    const QUrl downloadUrl = endpoint("downloadUrl");
+    const QUrl uploadUrl = endpoint("uploadUrl");
+    const QUrl eventSourceUrl = endpoint("eventSourceUrl");
+    if (!wrongOrigin.isEmpty())
+        return fail(wrongOrigin);
     if (!apiUrl.isValid() || apiUrl.isEmpty())
         return fail(tr("The JMAP session object names no apiUrl."));
 
@@ -331,10 +443,13 @@ bool JmapSession::ingest(const QByteArray &json, const QUrl &from, QString *erro
         submissionAccountId.clear();
     }
 
+    // Origin first: it is what authorize() and guardRedirects() enforce, and
+    // every endpoint below has just been checked against it.
+    m_origin = from;
     m_apiUrl = apiUrl;
-    m_downloadUrl = sessionUrl(root, "downloadUrl", from);
-    m_uploadUrl = sessionUrl(root, "uploadUrl", from);
-    m_eventSourceUrl = sessionUrl(root, "eventSourceUrl", from);
+    m_downloadUrl = downloadUrl;
+    m_uploadUrl = uploadUrl;
+    m_eventSourceUrl = eventSourceUrl;
     m_state = root.value(QLatin1String("state")).toString();
     m_username = root.value(QLatin1String("username")).toString();
     m_capabilities = capabilities;

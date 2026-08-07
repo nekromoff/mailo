@@ -93,6 +93,23 @@ public:
     /// The Authorization header value every request to this session carries.
     QByteArray authorization() const { return m_authorization; }
 
+    /// Puts the credential and the redirect policy on a request to one of this
+    /// session's own endpoints. Every authenticated JMAP request goes through
+    /// here rather than setting the header itself: the credential must reach
+    /// this session's origin and nowhere else, and that is two decisions — what
+    /// the request is addressed to (checked when the session object is
+    /// ingested) and where a redirect may take it (guardRedirects(), below).
+    void authorize(QNetworkRequest &request) const;
+    /// Refuses redirects that leave the session's origin. Qt re-sends raw
+    /// headers to the redirect target and only stops at an https-to-http
+    /// downgrade, so without this a 302 from the server hands the account's
+    /// token to whatever host the Location names. Call on every reply whose
+    /// request went through authorize().
+    void guardRedirects(QNetworkReply *reply) const;
+    /// Scheme, host and effective port of the URL the session object came
+    /// from — the one origin this session's credential is for.
+    QUrl origin() const { return m_origin; }
+
     /// Parses a session object. \a from is the URL the bytes were served from,
     /// against which relative endpoint URLs are resolved (RFC 8620 §2 permits
     /// them, and Cyrus emits them). Returns false and sets \a error without
@@ -178,6 +195,7 @@ private:
     bool m_haveCredentials = false;
 
     bool m_valid = false;
+    QUrl m_origin; ///< where the session object came from; see authorize()
     QUrl m_apiUrl;
     QUrl m_downloadUrl;
     QUrl m_uploadUrl;

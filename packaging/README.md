@@ -5,9 +5,13 @@
 CPack is configured in the top-level `CMakeLists.txt`:
 
 ```sh
-cmake -B build -S . && cmake --build build -j$(nproc)
-cd build && cpack -G DEB        # → mailo_1.0_amd64.deb
+cmake -B build -S . && cmake --build build --target package-deb
 ```
+
+That leaves `mailo_<version>_<arch>.deb` — the version being the one in
+`project()` — in the **project root**, not inside the build tree, and removes
+CPack's `_CPack_Packages` staging directory afterwards. `cd build && cpack -G DEB`
+still works and produces the same package, but leaves both where CPack put them.
 
 Shared-library `Depends` are computed by `dpkg-shlibdeps` from the machine
 that builds the package, so the .deb targets distros with the same-or-newer
@@ -57,8 +61,14 @@ All three data files are installed by CMake into the standard XDG locations
 ## Build
 
 ```sh
-packaging/build-appimage.sh          # → Mailo-x86_64.AppImage
+packaging/build-appimage.sh          # → <project root>/Mailo-<version>-x86_64.AppImage
+cmake --build build --target packages   # both the .deb and the AppImage
 ```
+
+The version comes from `project()` in `CMakeLists.txt`, which the configure step
+writes to `mailo-version.txt` in the AppImage build tree — the script reads it
+from there rather than keeping a second copy of the number. The artifact lands
+in the project root whichever directory the script is run from.
 
 Environment overrides: `OUTPUT`, `BUILD_DIR`, `JOBS`, and the Qt path vars
 (`QML_DIR`, `QT_LIBEXEC`, `QT_RESOURCES`, `QT_TRANSLATIONS`) if autodetection is

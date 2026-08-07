@@ -36,6 +36,7 @@ public:
 
     /// Scopes all folder-keyed operations below to this account ("user@host").
     void setAccountKey(const QString &key);
+    QString accountKey() const { return m_accountKey; }
     /// One-time migration: claims cache rows written before accounts were
     /// separated (unscoped folder keys, global folder list) for \a account.
     /// No-op once the legacy rows are gone.
@@ -60,6 +61,22 @@ public:
     static void storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
                                const QList<MessageListModel::Header> &headers,
                                bool ftsAvailable);
+
+    // --- Another account's rows ---------------------------------------------
+    //
+    // Everything above addresses the account setAccountKey() named — the one
+    // the user has open. The background poll syncs the inbox of accounts that
+    // are *not* open, so these name the account instead. Deliberately not a
+    // temporary swap of the scope: the poll and the open account's own sync
+    // interleave on the same event loop, and a swapped scope that outlived a
+    // callback would file one account's mail under the other.
+    int cachedHeaderCountIn(const QString &account, const QString &folder);
+    qint64 maxCachedUidIn(const QString &account, const QString &folder);
+    void storeHeadersIn(const QString &account, const QString &folder,
+                        const QList<MessageListModel::Header> &headers);
+    QString syncStateIn(const QString &account, const QString &folder);
+    void setSyncStateIn(const QString &account, const QString &folder, const QString &state);
+
     void removeMessages(const QString &folder, const QList<qint64> &uids);
     /// Refined attachment kind (MessageListModel::AttachKind) learned from the
     /// full body — "single .ics calendar invite", or "no attachment after all"
@@ -341,10 +358,33 @@ public:
     /// Known recipient addresses matching \a prefix (substring of the address
     /// or display name), best-ranked first.
     QStringList recipientCompletions(const QString &prefix, int limit = 8);
-    /// One-time sweep of the cached raw bodies of \a sentFolder, seeding the
-    /// recipient list with every To/Cc address found there. Remembers per
-    /// account that it ran, so later calls are no-ops.
-    void harvestSentRecipients(const QString &sentFolder);
+    /// Remembers a recipient of one specific Sent message, so that removing
+    /// that message can undo it (see recipient_refs). The pair (message,
+    /// address) is recorded once however often the message is seen again, so
+    /// re-opening a Sent message no longer inflates its use counter.
+    void addSentRecipient(const QString &folder, qint64 uid, const QString &address,
+                          const QString &name = {});
+    /// Undoes the above for messages that are going away. An address survives
+    /// as long as any other Sent message still holds it; the last one taking
+    /// it away is what removes it. Addresses that came from somewhere other
+    /// than a message are untouched.
+    void dropSentRecipients(const QString &folder, const QList<qint64> &uids);
+    /// Drops \a folder's refs *without* forgetting anybody. For the paths
+    /// where the mail is not gone, only mailo's copy of it: an invalidated
+    /// folder cache is about to be re-synced, and a UIDVALIDITY reset renumbers
+    /// the messages, so refs naming the old uids have to go — but the people
+    /// those messages were addressed to have not changed.
+    void forgetRecipientRefs(const QString &folder);
+    /// One (message, address) pair for the batched import path below.
+    struct SentRecipient {
+        qint64 uid = 0;
+        QString address;
+        QString name;
+    };
+    /// addSentRecipient() for a worker connection, a batch per transaction.
+    static void addSentRecipientsOn(QSqlDatabase &db, const QString &account,
+                                    const QString &scopedFolder,
+                                    const QList<SentRecipient> &batch);
 
     /// True when mail has ever been sent to \a address from any account —
     /// the spam filter's Rule 0. Matches on the address alone, ignoring any
@@ -377,6 +417,11 @@ public:
 private:
     /// Folder key as stored in messages/bodies/fts: "account\x1ffolder".
     QString scoped(const QString &folder) const;
+    /// scoped() against an account named outright rather than the open one.
+    static QString scopedIn(const QString &account, const QString &folder);
+    /// Shared body of both dropSentRecipients() overloads: \a where is a
+    /// recipient_refs predicate whose single bind is \a scopedFolder.
+    void dropRecipientRefs(const QString &where, const QString &scopedFolder);
 
     QSqlDatabase m_db;
     QString m_accountKey;
