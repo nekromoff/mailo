@@ -65,6 +65,8 @@ Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailo/r
 | Rich-text editing | QTextDocument/QTextCursor exposed to QML (`DocumentHandler`) |
 | Build | CMake + Ninja |
 
+Computer-assisted development was used in the process.
+
 ## Building
 
 ```bash
